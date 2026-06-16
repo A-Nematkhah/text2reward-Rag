@@ -65,7 +65,7 @@ _ALLOWED_NODES = frozenset({
     # Literals & names
     ast.Constant, ast.Name, ast.Load,
     # Subscript (for state["key"])
-    ast.Subscript, ast.Index,
+    ast.Subscript,
     # Assignment (for local variables inside function)
     ast.Assign, ast.AugAssign, ast.AnnAssign,
     ast.Store,
@@ -151,6 +151,9 @@ def _make_safe_namespace() -> dict[str, Any]:
 
 # ── AST validation ────────────────────────────────────────────────────────────
 
+_MAX_POW_EXPONENT = 1000  # guards against pathological `x ** 10_000_000` DoS
+
+
 def validate_reward_code(code: str) -> tuple[bool, str]:
     """
     Validates LLM-generated reward code before execution.
@@ -165,6 +168,7 @@ def validate_reward_code(code: str) -> tuple[bool, str]:
       5. No attribute access (obj.method → filesystem, network)
       6. All function calls use only whitelisted names
       7. Function takes exactly one parameter
+      8. No pathologically large exponents (Pow DoS guard)
     """
     # ── 1. Syntax ──────────────────────────────────────────────────────────────
     try:
@@ -220,6 +224,16 @@ def validate_reward_code(code: str) -> tuple[bool, str]:
             else:
                 return False, "Only direct function calls allowed (no method calls)"
 
+        # Pow DoS guard: reject `x ** N` / `N ** x` where N is a huge literal
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            for operand in (node.left, node.right):
+                if isinstance(operand, ast.Constant) and isinstance(operand.value, (int, float)):
+                    if abs(operand.value) > _MAX_POW_EXPONENT:
+                        return False, (
+                            f"Exponent magnitude {operand.value} exceeds limit "
+                            f"({_MAX_POW_EXPONENT}) — possible DoS via huge power"
+                        )
+
     # ── 4. Must contain at least one Return ───────────────────────────────────
     has_return = any(isinstance(n, ast.Return) for n in ast.walk(func))
     if not has_return:
@@ -254,6 +268,16 @@ def execute_reward(
     ──────
     RuntimeError  : execution error or timeout
     TypeError     : function returned non-numeric value
+
+    Note on timeout enforcement
+    ────────────────────────────
+    The timeout is enforced via a daemon thread join, which does NOT kill the
+    underlying thread if it is still running CPU-bound code -- Python has no
+    safe cross-platform way to forcibly terminate a thread. In practice this
+    is acceptable here because validate_reward_code() forbids loops,
+    recursion, and unbounded exponents (see _MAX_POW_EXPONENT), so a
+    validated reward program cannot run indefinitely; the timeout mainly
+    guards against unexpectedly slow math on pathological inputs.
     """
     namespace = _make_safe_namespace()
     result_container: list[Any] = []
