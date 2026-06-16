@@ -141,6 +141,28 @@ Learn from the archive: adopt what worked, fix what was critiqued.
 Return ONLY the Python function source. No explanation, no markdown.
 """
 
+_REPAIR_USER_TEMPLATE = """\
+Your previous compute_reward(state) submission was REJECTED by the sandbox validator.
+
+=== REJECTED CODE ===
+```python
+{rejected_code}
+```
+
+=== VALIDATOR ERROR ===
+{error}
+
+=== TASK ===
+Fix ONLY this specific issue and resubmit the COMPLETE corrected
+compute_reward(state) function. Common causes of this error:
+  - Using a method call like state.get(...) or x.something(...) instead of
+    a plain subscript state["key"] or a whitelisted function call.
+  - Using a builtin or function name that is not in the approved list.
+Re-read the HARD RULES from the original instructions and remove the
+offending construct. Return ONLY the corrected Python function source.
+No explanation, no markdown.
+"""
+
 _CRITIQUE_USER_TEMPLATE = """\
 === REWARD PROGRAM (Generation {generation}) ===
 ```python
@@ -332,7 +354,17 @@ class RewardDesigner:
                 if self.verbose:
                     print(f"[designer] Critique stored for generation {latest['generation']}")
 
-        # Store current reward if not already archived
+        # Store current reward if not already archived.
+        # NOTE: self._generation tracks "which generation is currently
+        # loaded in reward_path", while len(archive.entries) tracks "how
+        # many generations have been archived". These must be resynced
+        # right after add_entry -- previously self._generation was only
+        # incremented later, on a *successful* new-code generation below,
+        # so if that generation attempt failed validation, the two counters
+        # would permanently diverge: every later call would skip archiving
+        # (since self._generation != len(entries) anymore) and the same
+        # "Generation N" label would be reused in logs even though the
+        # archive had already moved on to N+1, N+2, etc.
         if self._generation == len(self.archive.entries):
             current_code = self._load_current_code()
             if current_code:
@@ -341,20 +373,23 @@ class RewardDesigner:
                     metrics     = metrics,
                     critique    = critique,
                 )
+                self._generation = len(self.archive.entries)
 
-        # Generate new reward function
+        # Generate new reward function, with up to 2 repair attempts that
+        # feed the validator's error back to the LLM. Previously a
+        # validation failure (e.g. "Only direct function calls allowed")
+        # silently discarded the whole generation attempt and kept the old
+        # reward program -- but since the goal/context barely changes
+        # between evolve cycles, the LLM tended to reproduce the *same*
+        # mistake on the next cycle too (observed in production logs as
+        # two consecutive "Validation failed" messages for what the logs
+        # labelled as the same generation). Showing the model its own
+        # error lets it correct the specific issue instead of guessing.
         archive_context = self.archive.format_for_llm(k=3)
-        new_code = self._call_generate(archive_context)
+        new_code, err = self._call_generate_with_repair(archive_context, max_repair_rounds=2)
 
         if new_code is None:
-            print("[designer] LLM generation failed -- keeping current reward.")
-            self._episode_stats.clear()
-            return False
-
-        ok, err = validate_reward_code(new_code)
-        if not ok:
-            print(f"[designer] Validation failed: {err}")
-            print("[designer] Keeping current reward program.")
+            print(f"[designer] LLM generation failed -- keeping current reward. ({err})")
             self._episode_stats.clear()
             return False
 
@@ -363,7 +398,87 @@ class RewardDesigner:
         self._episode_stats.clear()
         return True
 
-    # ── LLM: generate ---------------------------------------------------------
+    # ── LLM: generate -----------------------------------------------------
+
+    def _call_generate_with_repair(
+        self,
+        archive_context: str,
+        max_repair_rounds: int = 2,
+    ) -> tuple[str | None, str]:
+        """
+        Generates a reward program and validates it. If validation fails,
+        sends the specific validator error back to the LLM and asks it to
+        fix just that issue, up to `max_repair_rounds` times, before giving
+        up and keeping the previous reward program.
+
+        Returns (code, error) -- code is None on total failure, and error
+        holds the last failure reason for logging.
+        """
+        code = self._call_generate(archive_context)
+        if code is None:
+            return None, "LLM call failed (see logs above)"
+
+        ok, err = validate_reward_code(code)
+        if ok:
+            return code, ""
+
+        print(f"[designer] Validation failed: {err}")
+
+        for round_n in range(1, max_repair_rounds + 1):
+            print(f"[designer] Requesting repair (attempt {round_n}/{max_repair_rounds})...")
+            repaired = self._call_repair(rejected_code=code, error=err)
+            if repaired is None:
+                continue
+
+            ok, err = validate_reward_code(repaired)
+            if ok:
+                print(f"[designer] Repair succeeded on attempt {round_n}")
+                return repaired, ""
+
+            print(f"[designer] Repair attempt {round_n} still invalid: {err}")
+            code = repaired
+
+        return None, f"Validation failed after {max_repair_rounds} repair attempts: {err}"
+
+    def _call_repair(
+        self,
+        rejected_code: str,
+        error: str,
+        max_retries: int = 2,
+    ) -> str | None:
+        system = _GENERATION_SYSTEM.format(state_schema=_STATE_SCHEMA)
+        user   = _REPAIR_USER_TEMPLATE.format(rejected_code=rejected_code, error=error)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                client = _get_client()
+                resp = client.chat.completions.create(
+                    model    = MODEL,
+                    messages = [
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": user},
+                    ],
+                    temperature = 0.2,
+                    max_tokens  = 800,
+                )
+                raw = resp.choices[0].message.content.strip()
+                raw = re.sub(r"```python\n?|```\n?", "", raw).strip()
+                if "def compute_reward" in raw:
+                    idx = raw.index("def compute_reward")
+                    raw = raw[idx:]
+                if self.verbose:
+                    print(f"[designer] Repair generated ({len(raw)} chars)")
+                return raw
+
+            except Exception as exc:
+                print(
+                    f"[designer] Repair attempt {attempt}/{max_retries} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+
+        return None
 
     def _call_generate(
         self,
