@@ -27,7 +27,6 @@ Arguments new in this version
 from __future__ import annotations
 
 import os
-import shutil
 import gymnasium as gym
 import highway_env                              # noqa: F401
 from stable_baselines3 import PPO
@@ -166,53 +165,6 @@ class RewardEvolutionCallback(BaseCallback):
             )
 
 
-# ── DriveSyncCallback ─────────────────────────────────────────────────────────
-
-class DriveSyncCallback(BaseCallback):
-    """Syncs checkpoints and archive to Google Drive periodically."""
-
-    def __init__(
-        self,
-        drive_dir: str,
-        logger: TrainingLogger,
-        archive_path: str = "reward_archive.json",
-        reward_path: str = REWARD_PROGRAM_PATH,
-        sync_freq: int = 10_000,
-        verbose: int = 0,
-    ):
-        super().__init__(verbose)
-        self.drive_dir    = drive_dir
-        self.training_logger = logger
-        self.archive_path = archive_path
-        self.reward_path  = reward_path
-        self.sync_freq    = sync_freq
-
-    def _on_step(self) -> bool:
-        if self.num_timesteps % self.sync_freq == 0:
-            self._sync()
-        return True
-
-    def _sync(self) -> None:
-        os.makedirs(self.drive_dir, exist_ok=True)
-
-        for fname in os.listdir("."):
-            if fname.startswith("ppo_highway") and fname.endswith(".zip"):
-                shutil.copy(fname, os.path.join(self.drive_dir, fname))
-
-        for fpath in [self.archive_path, self.reward_path]:
-            if os.path.exists(fpath):
-                shutil.copy(fpath, os.path.join(self.drive_dir, os.path.basename(fpath)))
-
-        self.training_logger.save()
-        if os.path.exists(self.training_logger.log_path):
-            shutil.copy(
-                self.training_logger.log_path,
-                os.path.join(self.drive_dir, self.training_logger.log_path),
-            )
-
-        print(f"[drive] Synced at step {self.num_timesteps:,} → {self.drive_dir}")
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -237,9 +189,6 @@ if __name__ == "__main__":
         metavar="PATH", help="Checkpoint .zip to resume from")
     parser.add_argument("--reward-path",     type=str,   default=REWARD_PROGRAM_PATH)
     parser.add_argument("--archive-file",    type=str,   default="reward_archive.json")
-    parser.add_argument("--drive-dir",       type=str,
-        default="/content/drive/MyDrive/txt2reward",
-        help="Google Drive folder for checkpoints")
     parser.add_argument("--checkpoint-freq", type=int,   default=10_000)
     parser.add_argument("--log-file",        type=str,   default="training_log.json")
     parser.add_argument("--plot-dir",        type=str,   default="plots")
@@ -247,6 +196,10 @@ if __name__ == "__main__":
     parser.add_argument("--no-plots",        action="store_true")
     parser.add_argument("--bootstrap",       action="store_true",
         help="Generate first reward program before training starts")
+    parser.add_argument("--fresh",           action="store_true",
+        help="Force a clean run: delete any existing log file, archive file, "
+             "reward program and ppo_highway*.zip checkpoints before starting, "
+             "instead of silently resuming.")
 
     args = parser.parse_args()
 
@@ -254,14 +207,17 @@ if __name__ == "__main__":
     print(f"[train] Using device: {device}")
     print(f"[train] Driving goal: {args.goal[:80]}...")
 
-    # ── Restore from Drive FIRST (must happen before bootstrap, otherwise a
-    #    freshly-bootstrapped reward_program.py / empty local archive could be
-    #    silently overwritten by stale Drive files right after creation) ──────
-    for fname in [args.archive_file, args.reward_path, args.log_file]:
-        drive_path = os.path.join(args.drive_dir, os.path.basename(fname))
-        if not os.path.exists(fname) and os.path.exists(drive_path):
-            shutil.copy(drive_path, fname)
-            print(f"[train] Restored {fname} from {args.drive_dir}")
+    # ── Fresh start: wipe any local state so nothing gets resumed ────────────
+    if args.fresh:
+        targets = [args.log_file, args.archive_file, args.reward_path]
+        for fname in targets:
+            if os.path.exists(fname):
+                os.remove(fname)
+                print(f"[train] --fresh: removed {fname}")
+        for f in os.listdir("."):
+            if f.startswith("ppo_highway") and f.endswith(".zip"):
+                os.remove(f)
+                print(f"[train] --fresh: removed checkpoint {f}")
 
     # ── Build the single RewardDesigner used for the whole run ────────────────
     # (Previously a separate throwaway `bootstrap_designer` was constructed
@@ -281,9 +237,9 @@ if __name__ == "__main__":
     )
 
     # ── Bootstrap: generate initial reward program if needed ──────────────────
-    # Runs AFTER the Drive restore, so it only fires when neither a local nor
-    # a Drive-restored reward_program.py exists (or the user explicitly asked
-    # for a fresh one via --bootstrap).
+    # Runs AFTER --fresh (if passed), so it only fires when no local
+    # reward_program.py exists, or the user explicitly asked for a new one
+    # via --bootstrap.
     if args.bootstrap or not os.path.exists(args.reward_path):
         print("[train] Bootstrapping initial reward program...")
         ok = designer.generate_reward()
@@ -336,14 +292,6 @@ if __name__ == "__main__":
         verbose  = 1,
     )
 
-    drive_sync_cb = DriveSyncCallback(
-        drive_dir    = args.drive_dir,
-        logger       = training_log,
-        archive_path = args.archive_file,
-        reward_path  = args.reward_path,
-        sync_freq    = args.checkpoint_freq,
-    )
-
     # ── Train ─────────────────────────────────────────────────────────────────
     print(
         f"\n[train] Starting — {args.timesteps:,} timesteps | "
@@ -354,7 +302,7 @@ if __name__ == "__main__":
     model.learn(
         total_timesteps     = args.timesteps,
         reset_num_timesteps = args.resume is None,
-        callback            = [checkpoint_cb, evolution_cb, drive_sync_cb],
+        callback            = [checkpoint_cb, evolution_cb],
     )
 
     # ── Final save ────────────────────────────────────────────────────────────
@@ -363,14 +311,9 @@ if __name__ == "__main__":
 
     print(f"\n[designer] Archive summary: {designer.archive.summary()}")
 
-    os.makedirs(args.drive_dir, exist_ok=True)
-    for fname in ["ppo_highway_txt2reward.zip", args.reward_path,
-                  args.archive_file, args.log_file]:
-        if os.path.exists(fname):
-            shutil.copy(fname, os.path.join(args.drive_dir, os.path.basename(fname)))
-
     vec_env.close()
-    print(f"\n[train] Done. Model + archive + log saved to {args.drive_dir}")
+    print(f"\n[train] Done. Model + archive + log saved locally "
+          f"(ppo_highway_txt2reward.zip, {args.archive_file}, {args.log_file}).")
 
     # ── Auto-generate plots ───────────────────────────────────────────────────
     if not args.no_plots:
@@ -382,14 +325,6 @@ if __name__ == "__main__":
                 out_dir  = args.plot_dir,
                 smooth   = args.smooth,
             )
-            drive_plots = os.path.join(args.drive_dir, args.plot_dir)
-            os.makedirs(drive_plots, exist_ok=True)
-            for pf in [
-                os.path.join(args.plot_dir, f)
-                for f in os.listdir(args.plot_dir)
-                if f.endswith(".png")
-            ]:
-                shutil.copy(pf, os.path.join(drive_plots, os.path.basename(pf)))
-            print(f"[train] Plots synced to {drive_plots}")
+            print(f"[train] Plots saved to {args.plot_dir}/")
         except Exception as e:
             print(f"[train] Plot generation failed: {e}")
