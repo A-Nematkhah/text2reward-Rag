@@ -141,28 +141,6 @@ Learn from the archive: adopt what worked, fix what was critiqued.
 Return ONLY the Python function source. No explanation, no markdown.
 """
 
-_REPAIR_USER_TEMPLATE = """\
-Your previous compute_reward(state) submission was REJECTED by the sandbox validator.
-
-=== REJECTED CODE ===
-```python
-{rejected_code}
-```
-
-=== VALIDATOR ERROR ===
-{error}
-
-=== TASK ===
-Fix ONLY this specific issue and resubmit the COMPLETE corrected
-compute_reward(state) function. Common causes of this error:
-  - Using a method call like state.get(...) or x.something(...) instead of
-    a plain subscript state["key"] or a whitelisted function call.
-  - Using a builtin or function name that is not in the approved list.
-Re-read the HARD RULES from the original instructions and remove the
-offending construct. Return ONLY the corrected Python function source.
-No explanation, no markdown.
-"""
-
 _CRITIQUE_USER_TEMPLATE = """\
 === REWARD PROGRAM (Generation {generation}) ===
 ```python
@@ -181,10 +159,17 @@ _CRITIQUE_USER_TEMPLATE = """\
   total_lc         : {total_lane_changes} lane changes
   fitness          : {fitness:.4f}
 
+=== TREND VS PREVIOUS GENERATION ===
+{trend_summary}
+
 === EPISODE TRAJECTORY SAMPLES ===
 {trajectory_summary}
 
 Identify reward hacking, failure modes, and propose 3 specific improvements.
+If mean_speed or mean_overtakes is DECREASING while crash_rate also decreases,
+treat this as a strong reward-hacking signal (the agent is likely slowing down
+or refusing to overtake just to avoid crashing, instead of driving well) and
+say so explicitly.
 """
 
 
@@ -236,25 +221,54 @@ class RewardDesigner:
 
         self._episode_stats: list[dict] = []
         self._episode_count  = 0
-        self._generation     = len(self.archive.entries)
+        # NOTE: generation is NEVER tracked as an independent counter.
+        # It is always derived from len(self.archive.entries) — this is the
+        # single source of truth, fixing a bug where an independent counter
+        # could drift out of sync with the archive (e.g. if add_entry was
+        # skipped once, the counter would keep incrementing forever while
+        # the archive silently stopped growing).
 
         _WIN = 10
         self._policy_buf: Deque[dict] = deque(maxlen=_WIN)
 
         self._current_code: str = self._load_current_code()
 
+        # ── Reconcile disk vs archive ───────────────────────────────────────
+        # Covers the case where Drive restore brought back an archive with
+        # entries but the reward_program.py file is missing or doesn't match
+        # the latest archived code (e.g. only one of the two files was
+        # restored, or the file was wiped between runs). Without this check,
+        # the wrapper would keep running stale/placeholder code while the
+        # archive thinks a different program is "current", silently
+        # reintroducing the same kind of drift this refactor fixes.
+        latest_entry = self.archive.get_latest()
+        if latest_entry is not None and self._current_code != latest_entry["reward_code"]:
+            if self.verbose:
+                print(
+                    "[designer] reward_program.py is missing or out of sync "
+                    f"with archive generation {latest_entry['generation']} — "
+                    "restoring it from the archive."
+                )
+            self._save_reward_program(latest_entry["reward_code"])
+
         if self.verbose:
             print(
                 f"[designer] Text-to-Reward | goal='{goal[:60]}' | "
                 f"evolve_every={evolve_every} | warmup={warmup_episodes} | "
-                f"archive={len(self.archive.entries)} entries"
+                f"archive={len(self.archive.entries)} entries | "
+                f"generation={self.generation}"
             )
+
+    @property
+    def generation(self) -> int:
+        """Current generation number — always derived from the archive length."""
+        return len(self.archive.entries)
 
     # ── Backward-compat shim so train.py get_weights() still works ------------
 
     def get_weights(self) -> dict:
         """Compatibility stub. Returns generation info instead of weights."""
-        return {"generation": self._generation, "reward_path": self.reward_path}
+        return {"generation": self.generation, "reward_path": self.reward_path}
 
     # ── Code management -------------------------------------------------------
 
@@ -268,16 +282,25 @@ class RewardDesigner:
         return ""
 
     def _save_reward_program(self, code: str) -> None:
+        """
+        Writes `code` to disk as the reward program currently in effect.
+
+        The header always reflects the NEXT generation number that will be
+        produced once this program is evaluated and archived (i.e. the
+        program about to run is generation `self.generation`, since the
+        archive has not yet grown to include it).
+        """
+        gen_label = self.generation
         tmp = self.reward_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(
-                f'"""\nreward_program.py -- Generation {self._generation}\n'
+                f'"""\nreward_program.py -- Generation {gen_label}\n'
                 f'Auto-generated by RewardDesigner. DO NOT EDIT MANUALLY.\n"""\n\n'
             )
             f.write(code)
         os.replace(tmp, self.reward_path)
         self._current_code = code
-        print(f"[designer] reward_program.py updated (generation {self._generation})")
+        print(f"[designer] reward_program.py updated (generation {gen_label})")
 
     # ── PPO policy metrics ----------------------------------------------------
 
@@ -323,162 +346,107 @@ class RewardDesigner:
         return False
 
     def _evolve(self) -> bool:
+        """
+        One evolutionary step. Order of operations matters:
+
+          1. Aggregate metrics for the reward program that JUST RAN
+             (self._current_code, currently on disk as reward_path).
+          2. Archive it UNCONDITIONALLY (add_entry). This is the only
+             place generations are created — there is no separate counter
+             that can drift out of sync with the archive.
+          3. Critique the entry just archived (always the latest one —
+             never a stale reference captured before the archive write).
+          4. Store the critique back onto that same entry.
+          5. Generate + validate an improved reward program using the
+             now-updated archive as RAG context.
+          6. Only on successful validation, save the new program to disk.
+             On any failure, the previous program stays in effect and the
+             archive already has a clean, critiqued record of it.
+        """
         if not self._episode_stats:
             return False
 
         metrics = self._aggregate_metrics(self._episode_stats)
+        current_gen = self.generation   # generation index BEFORE this archive write
 
         if self.verbose:
             print(
-                f"\n[designer] Generation {self._generation} | "
+                f"\n[designer] Generation {current_gen} | "
                 f"episodes={len(self._episode_stats)} | "
                 f"speed={metrics.get('mean_speed', 0):.2f} m/s | "
                 f"crash={metrics.get('crash_rate', 0):.1%} | "
                 f"overtakes={metrics.get('mean_overtakes', 0):.2f}/ep"
             )
 
-        # Critique current reward
-        critique = ""
-        latest = self.archive.get_latest()
-        if latest is not None:
-            traj_summary = self._format_trajectory_samples(self._episode_stats[-5:])
-            critique = self._call_critique(
-                reward_code        = latest["reward_code"],
-                metrics            = metrics,
-                trajectory_summary = traj_summary,
-                generation         = latest["generation"],
-                fitness            = latest["fitness"],
+        # ── 1+2. Archive the program that just ran — unconditional ────────────
+        current_code = self._current_code or self._load_current_code()
+        if not current_code:
+            # This should never happen in practice (reward_program.py is
+            # always written before training starts), but fail loudly
+            # instead of silently skipping the archive write, which is
+            # exactly the bug that previously caused the archive to stop
+            # growing while the on-disk generation label kept incrementing.
+            print(
+                "[designer] WARNING: no current reward code found to archive "
+                "(reward_program.py missing or unreadable) — using fallback "
+                "placeholder so the archive stays in sync."
             )
-            if critique:
-                self.archive.update_critique(latest["generation"], critique)
-                if self.verbose:
-                    print(f"[designer] Critique stored for generation {latest['generation']}")
+            current_code = (
+                "def compute_reward(state):\n"
+                "    return 0.0  # placeholder: original code was unavailable\n"
+            )
 
-        # Store current reward if not already archived.
-        # NOTE: self._generation tracks "which generation is currently
-        # loaded in reward_path", while len(archive.entries) tracks "how
-        # many generations have been archived". These must be resynced
-        # right after add_entry -- previously self._generation was only
-        # incremented later, on a *successful* new-code generation below,
-        # so if that generation attempt failed validation, the two counters
-        # would permanently diverge: every later call would skip archiving
-        # (since self._generation != len(entries) anymore) and the same
-        # "Generation N" label would be reused in logs even though the
-        # archive had already moved on to N+1, N+2, etc.
-        if self._generation == len(self.archive.entries):
-            current_code = self._load_current_code()
-            if current_code:
-                self.archive.add_entry(
-                    reward_code = current_code,
-                    metrics     = metrics,
-                    critique    = critique,
-                )
-                self._generation = len(self.archive.entries)
+        # Capture the previous entry BEFORE add_entry mutates the archive,
+        # so the trend comparison is against the generation that actually
+        # preceded this one.
+        previous_entry = self.archive.get_latest()
+        trend_summary   = self._format_trend(metrics, previous_entry)
 
-        # Generate new reward function, with up to 2 repair attempts that
-        # feed the validator's error back to the LLM. Previously a
-        # validation failure (e.g. "Only direct function calls allowed")
-        # silently discarded the whole generation attempt and kept the old
-        # reward program -- but since the goal/context barely changes
-        # between evolve cycles, the LLM tended to reproduce the *same*
-        # mistake on the next cycle too (observed in production logs as
-        # two consecutive "Validation failed" messages for what the logs
-        # labelled as the same generation). Showing the model its own
-        # error lets it correct the specific issue instead of guessing.
+        entry = self.archive.add_entry(
+            reward_code = current_code,
+            metrics     = metrics,
+            critique    = "",
+        )
+
+        # ── 3+4. Critique the entry we just archived ───────────────────────────
+        traj_summary = self._format_trajectory_samples(self._episode_stats[-5:])
+        critique = self._call_critique(
+            reward_code        = entry["reward_code"],
+            metrics            = metrics,
+            trajectory_summary = traj_summary,
+            generation          = entry["generation"],
+            fitness             = entry["fitness"],
+            trend_summary        = trend_summary,
+        )
+        if critique:
+            self.archive.update_critique(entry["generation"], critique)
+            if self.verbose:
+                print(f"[designer] Critique stored for generation {entry['generation']}")
+
+        # ── 5. Generate an improved reward function ─────────────────────────────
         archive_context = self.archive.format_for_llm(k=3)
-        new_code, err = self._call_generate_with_repair(archive_context, max_repair_rounds=2)
+        new_code = self._call_generate(archive_context)
 
         if new_code is None:
-            print(f"[designer] LLM generation failed -- keeping current reward. ({err})")
+            print("[designer] LLM generation failed -- keeping current reward.")
             self._episode_stats.clear()
             return False
 
-        self._generation += 1
+        ok, err = validate_reward_code(new_code)
+        if not ok:
+            print(f"[designer] Validation failed: {err}")
+            print("[designer] Keeping current reward program.")
+            self._episode_stats.clear()
+            return False
+
+        # ── 6. Save the new program. self.generation is now len(entries),
+        #      which already reflects the entry we just archived above —
+        #      no separate counter to increment or risk drifting out of sync.
         self._save_reward_program(new_code)
         self._episode_stats.clear()
         return True
 
-    # ── LLM: generate -----------------------------------------------------
-
-    def _call_generate_with_repair(
-        self,
-        archive_context: str,
-        max_repair_rounds: int = 2,
-    ) -> tuple[str | None, str]:
-        """
-        Generates a reward program and validates it. If validation fails,
-        sends the specific validator error back to the LLM and asks it to
-        fix just that issue, up to `max_repair_rounds` times, before giving
-        up and keeping the previous reward program.
-
-        Returns (code, error) -- code is None on total failure, and error
-        holds the last failure reason for logging.
-        """
-        code = self._call_generate(archive_context)
-        if code is None:
-            return None, "LLM call failed (see logs above)"
-
-        ok, err = validate_reward_code(code)
-        if ok:
-            return code, ""
-
-        print(f"[designer] Validation failed: {err}")
-
-        for round_n in range(1, max_repair_rounds + 1):
-            print(f"[designer] Requesting repair (attempt {round_n}/{max_repair_rounds})...")
-            repaired = self._call_repair(rejected_code=code, error=err)
-            if repaired is None:
-                continue
-
-            ok, err = validate_reward_code(repaired)
-            if ok:
-                print(f"[designer] Repair succeeded on attempt {round_n}")
-                return repaired, ""
-
-            print(f"[designer] Repair attempt {round_n} still invalid: {err}")
-            code = repaired
-
-        return None, f"Validation failed after {max_repair_rounds} repair attempts: {err}"
-
-    def _call_repair(
-        self,
-        rejected_code: str,
-        error: str,
-        max_retries: int = 2,
-    ) -> str | None:
-        system = _GENERATION_SYSTEM.format(state_schema=_STATE_SCHEMA)
-        user   = _REPAIR_USER_TEMPLATE.format(rejected_code=rejected_code, error=error)
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                client = _get_client()
-                resp = client.chat.completions.create(
-                    model    = MODEL,
-                    messages = [
-                        {"role": "system", "content": system},
-                        {"role": "user",   "content": user},
-                    ],
-                    temperature = 0.2,
-                    max_tokens  = 800,
-                )
-                raw = resp.choices[0].message.content.strip()
-                raw = re.sub(r"```python\n?|```\n?", "", raw).strip()
-                if "def compute_reward" in raw:
-                    idx = raw.index("def compute_reward")
-                    raw = raw[idx:]
-                if self.verbose:
-                    print(f"[designer] Repair generated ({len(raw)} chars)")
-                return raw
-
-            except Exception as exc:
-                print(
-                    f"[designer] Repair attempt {attempt}/{max_retries} failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                if attempt < max_retries:
-                    time.sleep(2 ** attempt)
-
-        return None
+    # ── LLM: generate ---------------------------------------------------------
 
     def _call_generate(
         self,
@@ -531,6 +499,7 @@ class RewardDesigner:
         trajectory_summary: str,
         generation: int,
         fitness: float,
+        trend_summary: str = "(no previous generation to compare against)",
         max_retries: int = 2,
     ) -> str:
         user = _CRITIQUE_USER_TEMPLATE.format(
@@ -546,6 +515,7 @@ class RewardDesigner:
             mean_accel         = metrics.get("mean_accel",         0.0),
             total_lane_changes = metrics.get("total_lane_changes", 0),
             fitness            = fitness,
+            trend_summary       = trend_summary,
             trajectory_summary = trajectory_summary,
         )
 
@@ -573,9 +543,22 @@ class RewardDesigner:
 
         return "(critique unavailable)"
 
-    # ── Manual generation (CLI / bootstrap) -----------------------------------
+    # ── Manual generation (CLI / bootstrap) -------------------------------------
 
     def generate_reward(self, goal: str | None = None) -> bool:
+        """
+        Bootstraps an initial reward program before any training/evaluation
+        has happened. Used by train.py's --bootstrap step.
+
+        Deliberately does NOT call archive.add_entry() here: there are no
+        real metrics yet (no episodes have run), so archiving now would
+        create a generation 0 entry with fake/empty metrics. Instead this
+        only updates reward_program.py on disk and self._current_code; the
+        FIRST call to _evolve() (after warmup_episodes) will archive this
+        exact code together with its real, measured metrics. This keeps
+        len(archive.entries) as the single source of truth for `generation`
+        with no separate counter that could drift out of sync.
+        """
         if goal:
             self.goal = goal
         archive_context = self.archive.format_for_llm(k=3)
@@ -612,6 +595,48 @@ class RewardDesigner:
             "total_lane_changes": sum(s.get("total_lane_changes", 0) for s in episode_stats),
             "max_steps":          300,
         }
+
+    @staticmethod
+    def _format_trend(current_metrics: dict, previous_entry: dict | None) -> str:
+        """
+        Compares current metrics to the previous archived generation, making
+        speed/overtake/crash trends explicit so the LLM can catch the
+        "slow down to avoid crashing" reward-hacking pattern even when each
+        individual generation's metrics look reasonable in isolation.
+        """
+        if previous_entry is None:
+            return "(no previous generation to compare against — this is generation 0)"
+
+        prev = previous_entry["metrics"]
+
+        def _delta(key: str, fmt: str = "{:+.2f}") -> str:
+            cur_v  = current_metrics.get(key, 0.0)
+            prev_v = prev.get(key, 0.0)
+            return fmt.format(cur_v - prev_v)
+
+        speed_delta     = _delta("mean_speed")
+        overtake_delta  = _delta("mean_overtakes")
+        crash_delta     = _delta("crash_rate", "{:+.1%}")
+
+        warning = ""
+        speed_dropped    = current_metrics.get("mean_speed", 0.0)     < prev.get("mean_speed", 0.0)
+        overtakes_dropped = current_metrics.get("mean_overtakes", 0.0) < prev.get("mean_overtakes", 0.0)
+        crash_improved   = current_metrics.get("crash_rate", 1.0)     < prev.get("crash_rate", 1.0)
+        if (speed_dropped or overtakes_dropped) and crash_improved:
+            warning = (
+                "\n  !! WARNING: crash_rate improved but speed and/or overtakes "
+                "DECREASED vs the previous generation. This is the classic "
+                "'slow down to stay safe' reward-hacking pattern — the agent "
+                "may be avoiding risk by driving passively rather than driving well.\n"
+            )
+
+        return (
+            f"  previous generation : {previous_entry['generation']}\n"
+            f"  mean_speed     delta: {speed_delta} m/s\n"
+            f"  mean_overtakes delta: {overtake_delta} per episode\n"
+            f"  crash_rate     delta: {crash_delta}"
+            f"{warning}"
+        )
 
     @staticmethod
     def _format_trajectory_samples(episode_stats: list[dict]) -> str:

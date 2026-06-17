@@ -254,28 +254,43 @@ if __name__ == "__main__":
     print(f"[train] Using device: {device}")
     print(f"[train] Driving goal: {args.goal[:80]}...")
 
-    # ── Bootstrap: generate initial reward if needed ──────────────────────────
-    if args.bootstrap or not os.path.exists(args.reward_path):
-        print("[train] Bootstrapping initial reward program...")
-        from reward_designer import RewardDesigner
-        bootstrap_designer = RewardDesigner(
-            goal         = args.goal,
-            reward_path  = args.reward_path,
-            archive_path = args.archive_file,
-            verbose      = True,
-        )
-        ok = bootstrap_designer.generate_reward()
-        if ok:
-            print("[train] Initial reward program generated successfully.")
-        else:
-            print("[train] Bootstrap failed — using default reward_program.py")
-
-    # ── Restore from Drive if available ──────────────────────────────────────
+    # ── Restore from Drive FIRST (must happen before bootstrap, otherwise a
+    #    freshly-bootstrapped reward_program.py / empty local archive could be
+    #    silently overwritten by stale Drive files right after creation) ──────
     for fname in [args.archive_file, args.reward_path, args.log_file]:
         drive_path = os.path.join(args.drive_dir, os.path.basename(fname))
         if not os.path.exists(fname) and os.path.exists(drive_path):
             shutil.copy(drive_path, fname)
             print(f"[train] Restored {fname} from {args.drive_dir}")
+
+    # ── Build the single RewardDesigner used for the whole run ────────────────
+    # (Previously a separate throwaway `bootstrap_designer` was constructed
+    # for the bootstrap step and a second one for training. Two instances
+    # reading/writing the same files is unnecessary and was a contributing
+    # factor to generation-tracking confusion. One instance, one source of
+    # truth: self.archive.entries.)
+    from reward_designer import RewardDesigner
+
+    designer = RewardDesigner(
+        goal            = args.goal,
+        evolve_every    = args.evolve_every,
+        warmup_episodes = args.warmup_episodes,
+        reward_path     = args.reward_path,
+        archive_path    = args.archive_file,
+        verbose         = True,
+    )
+
+    # ── Bootstrap: generate initial reward program if needed ──────────────────
+    # Runs AFTER the Drive restore, so it only fires when neither a local nor
+    # a Drive-restored reward_program.py exists (or the user explicitly asked
+    # for a fresh one via --bootstrap).
+    if args.bootstrap or not os.path.exists(args.reward_path):
+        print("[train] Bootstrapping initial reward program...")
+        ok = designer.generate_reward()
+        if ok:
+            print("[train] Initial reward program generated successfully.")
+        else:
+            print("[train] Bootstrap failed — using default reward_program.py")
 
     # ── Build environments ────────────────────────────────────────────────────
     env_fns = [
@@ -305,18 +320,6 @@ if __name__ == "__main__":
             n_epochs=5,
             tensorboard_log="./tb_logs/",
         )
-
-    # ── Build RewardDesigner ──────────────────────────────────────────────────
-    from reward_designer import RewardDesigner
-
-    designer = RewardDesigner(
-        goal            = args.goal,
-        evolve_every    = args.evolve_every,
-        warmup_episodes = args.warmup_episodes,
-        reward_path     = args.reward_path,
-        archive_path    = args.archive_file,
-        verbose         = True,
-    )
 
     training_log = TrainingLogger(log_path=args.log_file)
 

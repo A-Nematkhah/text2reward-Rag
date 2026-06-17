@@ -49,7 +49,7 @@ import sys
 import numpy as np
 import gymnasium as gym
 
-from reward_sandbox import build_state, validate_reward_code
+from reward_sandbox import build_state, execute_reward, validate_reward_code
 
 # ── Observation column indices ────────────────────────────────────────────────
 _IDX_PRESENCE = 0
@@ -112,19 +112,6 @@ def _fallback_reward(state: dict) -> float:
     return 0.8 * speed_norm + collision
 
 
-def _direct_execute(reward_fn, state: dict) -> float:
-    """Calls an already-loaded, pre-validated reward function directly.
-
-    Used on the hot path (every env step) to avoid the extra exec/compile
-    overhead that reward_sandbox.execute_reward() incurs when re-running
-    code from a string inside a fresh namespace + watchdog thread. The
-    function object here was already produced by _load_reward_fn(), which
-    only loads code from reward_program.py (itself only ever written after
-    passing validate_reward_code()).
-    """
-    return float(reward_fn(state))
-
-
 class LLMRewardWrapper(gym.Wrapper):
     """
     Gym wrapper that executes the dynamically generated reward function.
@@ -182,7 +169,7 @@ class LLMRewardWrapper(gym.Wrapper):
         self._prev_accel_ms2: float        = 0.0
         self._prev_lat_vel_ms: float       = 0.0
         self._prev_lane: int | None        = None
-        self._prev_trailing: dict[int, float] = {}
+        self._prev_trailing: set[tuple[int, int]] = set()
 
     def reset(self, **kwargs):
         self._reset_episode_accum()
@@ -215,10 +202,9 @@ class LLMRewardWrapper(gym.Wrapper):
         # Build canonical state dict
         state = build_state(parsed, collided)
 
-        # Execute reward function directly (already validated/loaded; no
-        # sandbox re-validation overhead needed on the hot path).
+        # Execute reward function in sandbox
         try:
-            shaped_reward = _direct_execute(self._reward_fn, state)
+            shaped_reward = execute_reward.__wrapped__(self._reward_fn, state)
         except Exception as e:
             # Fallback if execution fails
             if self._global_step % 1000 == 1:
@@ -308,6 +294,17 @@ class LLMRewardWrapper(gym.Wrapper):
         return obs, shaped_reward, terminated, truncated, info
 
 
+# ── Reward execution helper (direct call, no sandbox overhead) ────────────────
+
+def _direct_execute(reward_fn, state: dict) -> float:
+    """Calls the reward function directly (pre-validated, low overhead)."""
+    return float(reward_fn(state))
+
+
+# Monkey-patch for the wrapper so it uses direct call
+execute_reward.__wrapped__ = _direct_execute
+
+
 # ── Full observation parser ───────────────────────────────────────────────────
 
 def _parse_full_obs(
@@ -317,40 +314,10 @@ def _parse_full_obs(
     prev_accel_ms2: float,
     prev_lat_vel_ms: float,
     prev_lane: int | None,
-    prev_trailing: dict[int, float],
+    prev_trailing: set[tuple[int, int]],
     density_radius_m: float,
 ) -> dict:
-    """Parses KinematicObservation into state signals.
-
-    Overtake detection (fixed)
-    ───────────────────────────
-    The previous fingerprint scheme tracked vehicles by
-    (distance_bucket, speed_bucket) and flagged an overtake whenever any
-    previously-seen fingerprint vanished from the current set. That produced
-    false positives whenever a vehicle simply changed speed bucket,
-    drifted out of the ~30 m observation window, or changed lane -- none of
-    which is an overtake. It also ignored lane (dy), so a vehicle in a
-    different lane at a similar distance could be mistaken for "passed".
-
-    The fixed scheme instead tracks, per *slot index* (a stable per-step
-    identity from the fixed-size KinematicObservation array, which is
-    consistent across consecutive steps for HighwayEnv's nearest-vehicles
-    ordering), the longitudinal offset (dx_m) of every vehicle that is
-    directly ahead of ego and within one lane width. An overtake is only
-    counted when a vehicle that was ahead (dx > 0, same lane) in the
-    previous step is now behind (dx <= 0) in the current step -- i.e. ego's
-    position relative to that specific vehicle actually flipped sign.
-
-    Known remaining limitation: highway-env re-sorts the observed vehicles
-    by proximity each step, so "slot index" is not a perfect vehicle ID --
-    if two nearby vehicles swap relative order between steps, the slot
-    fingerprint can momentarily point at a different physical vehicle. This
-    is a heuristic improvement over the old scheme (which ignored lane
-    entirely and false-triggered on any speed-bucket change or vehicle
-    leaving sensor range), not a perfect fix. A fully correct solution would
-    require per-vehicle IDs from the underlying simulator, which
-    KinematicObservation does not expose.
-    """
+    """Unchanged from original — parses KinematicObservation into state signals."""
     ego = obs[0]
 
     vx_raw    = float(ego[_IDX_VX])
@@ -373,9 +340,7 @@ def _parse_full_obs(
     front_vx_ms  = speed_ms
     nearby_count = 0
 
-    # slot index -> longitudinal offset, for vehicles currently in-lane
-    # (within 1.5 lane widths laterally), regardless of ahead/behind.
-    current_inline: dict[int, float] = {}
+    current_trailing: set[tuple[int, int]] = set()
 
     for i in range(1, len(obs)):
         row = obs[i]
@@ -391,17 +356,16 @@ def _parse_full_obs(
         veh_y_raw = float(row[_IDX_Y])
         dy_m      = (veh_y_raw * _LANE_WIDTH * (num_lanes - 1)) if normalised else veh_y_raw
 
-        in_lane = abs(dy_m) < _LANE_WIDTH * 1.5
-
-        if 0.0 < dx_m < front_dist and in_lane:
+        if 0.0 < dx_m < front_dist and abs(dy_m) < _LANE_WIDTH * 1.5:
             front_dist  = dx_m
             front_vx_ms = veh_vx_ms
 
-        if abs(dx_m) < density_radius_m and in_lane:
+        if abs(dx_m) < density_radius_m and abs(dy_m) < _LANE_WIDTH * 1.5:
             nearby_count += 1
 
-        if in_lane:
-            current_inline[i] = dx_m
+        if dx_m > 0.0:
+            fp = (int(dx_m / 5.0), int(veh_vx_ms / 2.0))
+            current_trailing.add(fp)
 
     front_dist = float(np.clip(front_dist, 0.0, _DIST_MAX))
     rel_vel_ms = front_vx_ms - speed_ms
@@ -416,21 +380,12 @@ def _parse_full_obs(
     accel_ms2 = 0.0 if prev_speed_ms is None else (speed_ms - prev_speed_ms) / _DT
     long_jerk = (accel_ms2 - prev_accel_ms2) / _DT
     lat_jerk  = (lat_vel_ms - prev_lat_vel_ms) / _DT
-
-    # An overtake = a slot that was ahead (dx>0) last step and is now
-    # behind (dx<=0) this step. A slot that simply disappeared (vehicle
-    # left the observation window) does NOT count -- we can't confirm it
-    # was actually passed rather than just falling out of sensor range.
-    overtook = False
-    for slot, prev_dx in prev_trailing.items():
-        if prev_dx > 0.0 and slot in current_inline and current_inline[slot] <= 0.0:
-            overtook = True
-            break
+    overtook  = bool(prev_trailing - current_trailing)
 
     return {
         "speed_ms":        speed_ms,
         "lat_vel_ms":      lat_vel_ms,
-        "trailing_ids":    current_inline,
+        "trailing_ids":    current_trailing,
         "lane":            lane,
         "front_dist":      front_dist,
         "rel_vel_ms":      rel_vel_ms,

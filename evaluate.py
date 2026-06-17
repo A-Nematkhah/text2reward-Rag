@@ -22,7 +22,7 @@ import highway_env  # noqa: F401
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 
-from reward_wrapper import LLMRewardWrapper, REWARD_PROGRAM_PATH, _SPEED_SCALE
+from reward_wrapper import LLMRewardWrapper, REWARD_PROGRAM_PATH
 from reward_archive import RewardArchive, compute_fitness
 
 ENV_CONFIG = {
@@ -43,7 +43,7 @@ ENV_CONFIG = {
     },
     "reward_speed_range": [20, 30],
     "collision_reward":   -1.0,
-    "high_speed_reward":   0.0,   # must match train.py so env_reward is comparable
+    "high_speed_reward":   0.1,
     "right_lane_reward":   0.0,
     "lane_change_reward":  0.0,
 }
@@ -90,11 +90,8 @@ def run_episode(model, env, deterministic: bool = True, render: bool = False) ->
         if info.get("crashed", False):
             crashed = True
 
-        # Speed normalization must match reward_wrapper._parse_full_obs
-        # exactly (same threshold/scale) -- importing the constant instead
-        # of re-deriving it here avoids the two copies silently diverging.
         vx_raw   = float(obs[0][3])
-        speed_ms = max(0.0, vx_raw * _SPEED_SCALE) if abs(vx_raw) <= 1.5 else max(0.0, vx_raw)
+        speed_ms = max(0.0, vx_raw * 40.0) if abs(vx_raw) <= 1.5 else max(0.0, vx_raw)
         speed_sum += speed_ms
 
         # collect from episode_stats if available

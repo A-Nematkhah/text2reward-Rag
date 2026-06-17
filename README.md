@@ -243,7 +243,50 @@ state is the `reward_program.py` file on disk:
 
 ---
 
-## Migration From the Weight-Based System
+## Bug Fixes (Generation-Tracking & Reward-Hacking Detection)
+
+A real training run surfaced four related issues, all fixed in this version:
+
+1. **Archive stopped growing after generation 0.** `_evolve()` used an
+   independent `self._generation` counter alongside `len(archive.entries)`.
+   If `add_entry()` was ever skipped (e.g. because the on-disk reward file
+   was momentarily empty), the counter kept incrementing forever while the
+   archive silently froze at 1 entry — so critiques were always written
+   against a stale generation 0, and RAG context never improved.
+   **Fix:** `generation` is now a property derived solely from
+   `len(self.archive.entries)`. `_evolve()` archives the program that just
+   ran unconditionally (with a loud warning + safe placeholder if the code
+   is somehow missing, instead of silently skipping), then critiques the
+   entry it just created — never a stale reference.
+
+2. **Bootstrap reward was never archived.** `train.py`'s bootstrap step
+   generated `reward_program.py` via a throwaway `bootstrap_designer` that
+   never called `archive.add_entry()`. **Fix:** there is now a single
+   `RewardDesigner` instance for the whole run; the first real `_evolve()`
+   call archives the bootstrap code together with its first real measured
+   metrics.
+
+3. **Drive restore ran after bootstrap.** This meant a freshly-bootstrapped
+   `reward_program.py` could be immediately overwritten by a stale Drive
+   copy. **Fix:** restore-from-Drive now runs first; bootstrap only fires if
+   no usable reward program exists locally or on Drive. A new reconciliation
+   step in `RewardDesigner.__init__` also self-heals partial restores (e.g.
+   archive restored but `reward_program.py` missing) by rewriting the reward
+   file from the archive's latest entry.
+
+4. **Undetected reward hacking ("slow down to avoid crashing").** Because
+   critiques were stuck on generation 0, the LLM never saw that mean speed
+   and overtakes were declining release-over-release while crash rate
+   improved — a classic reward-hacking pattern where the agent learns
+   passive/stationary behaviour instead of driving well. **Fix:** the
+   critique prompt now includes an explicit `TREND VS PREVIOUS GENERATION`
+   section with deltas, and a hard-coded warning fires whenever speed or
+   overtakes drop while crash rate improves, telling the LLM to call this
+   out explicitly.
+
+---
+
+
 
 If you used the previous (weight-tuning) version of this project:
 
