@@ -11,7 +11,7 @@ Natural Language Goal
         ↓
   Generated reward_program.py (Python source)
         ↓
-  [Sandbox validation: AST check + type check]
+  [Sandbox validation: AST check + type check + SMOKE TEST execution]
         ↓
   PPO Training (uses LLMRewardWrapper → reward_program.py)
         ↓
@@ -40,6 +40,14 @@ The critique prompt explicitly asks the LLM to look for:
   * brake-acceleration exploits (alternating accel cycles)
   * stationary behaviour (mean_speed very low)
   * reward farming loops (shaped_reward high but env_reward low)
+
+Smoke-test validation (NEW)
+────────────────────────────
+After structural AST validation, every generated reward function is
+executed against two representative sample states before being written
+to disk. This catches runtime errors (e.g. KeyError: 'overtake' instead
+of the correct key 'overtook') that structural checks cannot detect.
+Failures are fed back through the same repair-loop as structural errors.
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ import os
 import re
 import json
 import time
+import math
 from collections import deque
 from typing import Deque
 
@@ -55,8 +64,10 @@ from groq import Groq
 
 from reward_sandbox import validate_reward_code
 from reward_archive import RewardArchive
+from key_manager import call_with_rotation   # ← چرخش خودکار کلید
 
 # ── Groq client ───────────────────────────────────────────────────────────────
+# _client دیگه استفاده نمیشه — key_manager مدیریت می‌کنه
 _client: Groq | None = None
 MODEL = "llama-3.3-70b-versatile"
 
@@ -69,13 +80,17 @@ State keys available inside compute_reward(state):
   ttc             : float   time-to-collision [s] (0-30, 30 = no threat)
   rel_vel_ms      : float   v_front - v_ego [m/s] (negative = approaching)
   lane            : int     lane index, 0 = rightmost
-  overtook        : bool    completed an overtake this step
+  overtook        : bool    completed an overtake this step   ← NOTE: "overtook", NOT "overtake"
   lane_changed    : bool    lane changed since last step
   collided        : bool    collision detected
   nearby_vehicles : int     vehicles within ~30 m radius
   accel_ms2       : float   longitudinal acceleration [m/s2]
   long_jerk       : float   longitudinal jerk [m/s3]
   lat_jerk        : float   lateral jerk [m/s3]
+
+CRITICAL: The only valid state keys are EXACTLY the ones listed above.
+  * Use state["overtook"]  ← correct (past tense, with k)
+  * NEVER use state["overtake"]  ← this key does NOT exist and will crash
 
 Safe math available (no imports, just use by name):
   min, max, abs, round, float, int, bool
@@ -172,21 +187,152 @@ or refusing to overtake just to avoid crashing, instead of driving well) and
 say so explicitly.
 """
 
+_REPAIR_USER_TEMPLATE = """\
+The reward function you generated failed validation with this error:
+
+  {error}
+
+Common causes:
+  * Using a state key that does not exist, e.g. state["overtake"] — the correct
+    key is state["overtook"] (past tense, with k). Other valid keys are:
+    speed_ms, front_dist, ttc, rel_vel_ms, lane, overtook, lane_changed,
+    collided, nearby_vehicles, accel_ms2, long_jerk, lat_jerk.
+    DO NOT invent new key names.
+  * Using a disallowed builtin or math function
+  * Syntax errors, loops, or import statements
+
+Here is the rejected code:
+```python
+{rejected_code}
+```
+
+Fix ALL issues and return ONLY the corrected compute_reward(state) function.
+No explanation, no markdown fences.
+"""
+
+
+# ── Smoke-test helper ─────────────────────────────────────────────────────────
+
+# Two representative sample states:
+#   _SAMPLE_STATE_NORMAL   — typical mid-episode state, no crash, no overtake
+#   _SAMPLE_STATE_COLLIDED — collision state to exercise the penalty branch
+_SAMPLE_STATE_NORMAL: dict = {
+    "speed_ms":        20.0,
+    "front_dist":      40.0,
+    "ttc":             10.0,
+    "rel_vel_ms":      -2.0,
+    "lane":            1,
+    "overtook":        False,
+    "lane_changed":    False,
+    "collided":        False,
+    "nearby_vehicles": 2,
+    "accel_ms2":       0.5,
+    "long_jerk":       0.1,
+    "lat_jerk":        0.0,
+}
+
+_SAMPLE_STATE_OVERTAKE: dict = {
+    "speed_ms":        28.0,
+    "front_dist":      60.0,
+    "ttc":             20.0,
+    "rel_vel_ms":      5.0,
+    "lane":            2,
+    "overtook":        True,
+    "lane_changed":    True,
+    "collided":        False,
+    "nearby_vehicles": 1,
+    "accel_ms2":       1.2,
+    "long_jerk":       0.3,
+    "lat_jerk":        0.2,
+}
+
+_SAMPLE_STATE_COLLIDED: dict = {
+    "speed_ms":        15.0,
+    "front_dist":      0.0,
+    "ttc":             0.0,
+    "rel_vel_ms":      -10.0,
+    "lane":            0,
+    "overtook":        False,
+    "lane_changed":    False,
+    "collided":        True,
+    "nearby_vehicles": 3,
+    "accel_ms2":       -8.0,
+    "long_jerk":       -5.0,
+    "lat_jerk":        0.5,
+}
+
+
+def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
+    """
+    Execute the generated compute_reward(state) against representative sample
+    states to catch runtime errors that structural AST validation cannot catch,
+    such as KeyError from a wrong state key (e.g. state['overtake'] instead of
+    the correct state['overtook']).
+
+    Returns (ok, error_message).  ok=True means all samples ran cleanly.
+    """
+    # Build a safe execution namespace with the math builtins the generated
+    # code is allowed to use (mirrors the whitelist in reward_sandbox.py).
+    def _clip(val, lo, hi):
+        return max(lo, min(hi, val))
+
+    safe_globals = {
+        "__builtins__": {},
+        "min": min, "max": max, "abs": abs, "round": round,
+        "float": float, "int": int, "bool": bool,
+        "sqrt": math.sqrt, "exp": math.exp, "log": math.log,
+        "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "atan": math.atan, "atan2": math.atan2,
+        "floor": math.floor, "ceil": math.ceil,
+        "clip": _clip,
+        "pi": math.pi, "e": math.e, "inf": math.inf,
+    }
+
+    local_ns: dict = {}
+    try:
+        exec(compile(code, "<generated>", "exec"), safe_globals, local_ns)  # noqa: S102
+    except Exception as exc:
+        return False, f"Compile error: {type(exc).__name__}: {exc}"
+
+    fn = local_ns.get("compute_reward")
+    if fn is None:
+        return False, "compute_reward function not found after exec"
+
+    for name, sample in [
+        ("normal",    _SAMPLE_STATE_NORMAL),
+        ("overtake",  _SAMPLE_STATE_OVERTAKE),
+        ("collision", _SAMPLE_STATE_COLLIDED),
+    ]:
+        try:
+            result = fn(sample)
+            if not isinstance(result, (int, float)):
+                return False, (
+                    f"Runtime error on sample state '{name}': "
+                    f"compute_reward returned {type(result).__name__} instead of float"
+                )
+        except KeyError as exc:
+            key = str(exc)
+            valid_keys = ", ".join(sorted(_SAMPLE_STATE_NORMAL.keys()))
+            return False, (
+                f"Runtime error on sample state '{name}': KeyError {key} — "
+                f"this key does not exist in the state dict. "
+                f"Valid keys are: {valid_keys}"
+            )
+        except Exception as exc:
+            return False, (
+                f"Runtime error on sample state '{name}': "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    return True, ""
+
+
+# ── Groq client ───────────────────────────────────────────────────────────────
 
 def _get_client() -> Groq:
-    global _client
-    if _client is None:
-        api_key = os.environ.get("GROQ_API_KEY", "")
-        if not api_key:
-            raise EnvironmentError(
-                "\n[ERROR] GROQ_API_KEY is not set.\n"
-                "Set it before starting training:\n"
-                "  Linux   : export GROQ_API_KEY=gsk_xxxxxxxx\n"
-                "  Windows : set GROQ_API_KEY=gsk_xxxxxxxx\n"
-                "  Colab   : import os; os.environ['GROQ_API_KEY'] = 'gsk_xxxxxxxx'"
-            )
-        _client = Groq(api_key=api_key)
-    return _client
+    """Deprecated: از call_with_rotation استفاده کنید."""
+    from key_manager import get_groq_client
+    return get_groq_client()
 
 
 class RewardDesigner:
@@ -224,9 +370,7 @@ class RewardDesigner:
         # NOTE: generation is NEVER tracked as an independent counter.
         # It is always derived from len(self.archive.entries) — this is the
         # single source of truth, fixing a bug where an independent counter
-        # could drift out of sync with the archive (e.g. if add_entry was
-        # skipped once, the counter would keep incrementing forever while
-        # the archive silently stopped growing).
+        # could drift out of sync with the archive.
 
         _WIN = 10
         self._policy_buf: Deque[dict] = deque(maxlen=_WIN)
@@ -234,13 +378,6 @@ class RewardDesigner:
         self._current_code: str = self._load_current_code()
 
         # ── Reconcile disk vs archive ───────────────────────────────────────
-        # Covers the case where Drive restore brought back an archive with
-        # entries but the reward_program.py file is missing or doesn't match
-        # the latest archived code (e.g. only one of the two files was
-        # restored, or the file was wiped between runs). Without this check,
-        # the wrapper would keep running stale/placeholder code while the
-        # archive thinks a different program is "current", silently
-        # reintroducing the same kind of drift this refactor fixes.
         latest_entry = self.archive.get_latest()
         if latest_entry is not None and self._current_code != latest_entry["reward_code"]:
             if self.verbose:
@@ -349,25 +486,19 @@ class RewardDesigner:
         """
         One evolutionary step. Order of operations matters:
 
-          1. Aggregate metrics for the reward program that JUST RAN
-             (self._current_code, currently on disk as reward_path).
-          2. Archive it UNCONDITIONALLY (add_entry). This is the only
-             place generations are created — there is no separate counter
-             that can drift out of sync with the archive.
-          3. Critique the entry just archived (always the latest one —
-             never a stale reference captured before the archive write).
+          1. Aggregate metrics for the reward program that JUST RAN.
+          2. Archive it UNCONDITIONALLY (add_entry).
+          3. Critique the entry just archived.
           4. Store the critique back onto that same entry.
-          5. Generate + validate an improved reward program using the
-             now-updated archive as RAG context.
-          6. Only on successful validation, save the new program to disk.
-             On any failure, the previous program stays in effect and the
-             archive already has a clean, critiqued record of it.
+          5. Generate + validate + smoke-test an improved reward program.
+          6. Only on successful validation AND smoke-test, save to disk.
+             On any failure, the previous program stays in effect.
         """
         if not self._episode_stats:
             return False
 
         metrics = self._aggregate_metrics(self._episode_stats)
-        current_gen = self.generation   # generation index BEFORE this archive write
+        current_gen = self.generation
 
         if self.verbose:
             print(
@@ -378,14 +509,9 @@ class RewardDesigner:
                 f"overtakes={metrics.get('mean_overtakes', 0):.2f}/ep"
             )
 
-        # ── 1+2. Archive the program that just ran — unconditional ────────────
+        # ── 1+2. Archive the program that just ran ───────────────────────────
         current_code = self._current_code or self._load_current_code()
         if not current_code:
-            # This should never happen in practice (reward_program.py is
-            # always written before training starts), but fail loudly
-            # instead of silently skipping the archive write, which is
-            # exactly the bug that previously caused the archive to stop
-            # growing while the on-disk generation label kept incrementing.
             print(
                 "[designer] WARNING: no current reward code found to archive "
                 "(reward_program.py missing or unreadable) — using fallback "
@@ -396,11 +522,8 @@ class RewardDesigner:
                 "    return 0.0  # placeholder: original code was unavailable\n"
             )
 
-        # Capture the previous entry BEFORE add_entry mutates the archive,
-        # so the trend comparison is against the generation that actually
-        # preceded this one.
         previous_entry = self.archive.get_latest()
-        trend_summary   = self._format_trend(metrics, previous_entry)
+        trend_summary  = self._format_trend(metrics, previous_entry)
 
         entry = self.archive.add_entry(
             reward_code = current_code,
@@ -408,7 +531,7 @@ class RewardDesigner:
             critique    = "",
         )
 
-        # ── 3+4. Critique the entry we just archived ───────────────────────────
+        # ── 3+4. Critique the entry we just archived ─────────────────────────
         traj_summary = self._format_trajectory_samples(self._episode_stats[-5:])
         critique = self._call_critique(
             reward_code        = entry["reward_code"],
@@ -423,51 +546,61 @@ class RewardDesigner:
             if self.verbose:
                 print(f"[designer] Critique stored for generation {entry['generation']}")
 
-        # ── 5. Generate an improved reward function ─────────────────────────────
+        # ── 5+6. Generate, validate, smoke-test, and save ────────────────────
         archive_context = self.archive.format_for_llm(k=3)
-        new_code = self._call_generate(archive_context)
+        new_code = self._call_generate_with_repair(archive_context)
 
         if new_code is None:
             print("[designer] LLM generation failed -- keeping current reward.")
             self._episode_stats.clear()
             return False
 
-        ok, err = validate_reward_code(new_code)
-        if not ok:
-            print(f"[designer] Validation failed: {err}")
-            print("[designer] Keeping current reward program.")
-            self._episode_stats.clear()
-            return False
-
-        # ── 6. Save the new program. self.generation is now len(entries),
-        #      which already reflects the entry we just archived above —
-        #      no separate counter to increment or risk drifting out of sync.
         self._save_reward_program(new_code)
         self._episode_stats.clear()
         return True
 
-    # ── LLM: generate ---------------------------------------------------------
+    # ── LLM: generate with validation + smoke-test repair loop ───────────────
 
-    def _call_generate(
+    def _call_generate_with_repair(
         self,
         archive_context: str,
         max_retries: int = 3,
     ) -> str | None:
+        """
+        Generate a reward function, then validate (AST) + smoke-test (execution).
+        If either check fails, send the error back to the LLM for repair.
+        Returns the first code that passes both checks, or None on total failure.
+        """
         system = _GENERATION_SYSTEM.format(state_schema=_STATE_SCHEMA)
         user   = _GENERATION_USER_TEMPLATE.format(
             goal            = self.goal,
             archive_context = archive_context,
         )
 
+        raw: str | None = None
+
         for attempt in range(1, max_retries + 1):
+            # On attempt 1, use the standard generation prompt.
+            # On later attempts, use the repair prompt with the previous error.
+            if attempt == 1 or raw is None:
+                messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                    {"role": "assistant", "content": raw},
+                    {"role": "user",      "content": _REPAIR_USER_TEMPLATE.format(
+                        error=repair_error, rejected_code=raw,
+                    )},
+                ]
+
             try:
-                client = _get_client()
-                resp = client.chat.completions.create(
-                    model    = MODEL,
-                    messages = [
-                        {"role": "system", "content": system},
-                        {"role": "user",   "content": user},
-                    ],
+                resp = call_with_rotation(
+                    model       = MODEL,
+                    messages    = messages,
                     temperature = 0.5,
                     max_tokens  = 800,
                 )
@@ -476,10 +609,6 @@ class RewardDesigner:
                 if "def compute_reward" in raw:
                     idx = raw.index("def compute_reward")
                     raw = raw[idx:]
-                if self.verbose:
-                    print(f"[designer] Generated reward ({len(raw)} chars)")
-                return raw
-
             except Exception as exc:
                 print(
                     f"[designer] Generate attempt {attempt}/{max_retries} failed: "
@@ -487,8 +616,38 @@ class RewardDesigner:
                 )
                 if attempt < max_retries:
                     time.sleep(2 ** attempt)
+                raw = None
+                repair_error = f"API error: {exc}"
+                continue
 
+            if self.verbose:
+                print(f"[designer] Generated reward ({len(raw)} chars)")
+
+            # ── Structural validation (AST) ───────────────────────────────
+            ok, err = validate_reward_code(raw)
+            if not ok:
+                print(f"[designer] Validation failed (attempt {attempt}): {err}")
+                repair_error = f"Structural validation error: {err}"
+                continue
+
+            # ── Smoke-test: actually execute against sample states ────────
+            smoke_ok, smoke_err = _smoke_test_reward_code(raw)
+            if not smoke_ok:
+                print(f"[designer] Smoke-test failed (attempt {attempt}): {smoke_err}")
+                repair_error = smoke_err
+                continue
+
+            # Both checks passed — return the valid code.
+            return raw
+
+        print(f"[designer] All {max_retries} attempts failed — keeping current reward.")
         return None
+
+    # ── LLM: legacy generate (kept for internal use; routes to repair loop) ──
+
+    def _call_generate(self, archive_context: str, max_retries: int = 3) -> str | None:
+        """Thin wrapper around _call_generate_with_repair for backward compat."""
+        return self._call_generate_with_repair(archive_context, max_retries)
 
     # ── LLM: critique ---------------------------------------------------------
 
@@ -521,8 +680,7 @@ class RewardDesigner:
 
         for attempt in range(1, max_retries + 1):
             try:
-                client = _get_client()
-                resp = client.chat.completions.create(
+                resp = call_with_rotation(
                     model    = MODEL,
                     messages = [
                         {"role": "system", "content": _CRITIQUE_SYSTEM},
@@ -543,7 +701,7 @@ class RewardDesigner:
 
         return "(critique unavailable)"
 
-    # ── Manual generation (CLI / bootstrap) -------------------------------------
+    # ── Manual generation (CLI / bootstrap) -----------------------------------
 
     def generate_reward(self, goal: str | None = None) -> bool:
         """
@@ -552,23 +710,23 @@ class RewardDesigner:
 
         Deliberately does NOT call archive.add_entry() here: there are no
         real metrics yet (no episodes have run), so archiving now would
-        create a generation 0 entry with fake/empty metrics. Instead this
-        only updates reward_program.py on disk and self._current_code; the
-        FIRST call to _evolve() (after warmup_episodes) will archive this
-        exact code together with its real, measured metrics. This keeps
-        len(archive.entries) as the single source of truth for `generation`
-        with no separate counter that could drift out of sync.
+        create a generation 0 entry with fake/empty metrics.
+
+        Uses the same validate + smoke-test pipeline as _evolve() so a bad
+        bootstrap reward program never gets written to disk silently.
         """
         if goal:
             self.goal = goal
+
         archive_context = self.archive.format_for_llm(k=3)
-        new_code = self._call_generate(archive_context)
+        new_code = self._call_generate_with_repair(archive_context)
+
         if new_code is None:
+            print("[designer] Bootstrap generation failed — no reward program written.")
             return False
-        ok, err = validate_reward_code(new_code)
-        if not ok:
-            print(f"[designer] Validation failed: {err}")
-            return False
+
+        # Both structural validation and smoke-test passed inside
+        # _call_generate_with_repair, so it's safe to write to disk.
         self._save_reward_program(new_code)
         return True
 
@@ -619,9 +777,9 @@ class RewardDesigner:
         crash_delta     = _delta("crash_rate", "{:+.1%}")
 
         warning = ""
-        speed_dropped    = current_metrics.get("mean_speed", 0.0)     < prev.get("mean_speed", 0.0)
+        speed_dropped     = current_metrics.get("mean_speed",     0.0) < prev.get("mean_speed",     0.0)
         overtakes_dropped = current_metrics.get("mean_overtakes", 0.0) < prev.get("mean_overtakes", 0.0)
-        crash_improved   = current_metrics.get("crash_rate", 1.0)     < prev.get("crash_rate", 1.0)
+        crash_improved    = current_metrics.get("crash_rate",     1.0) < prev.get("crash_rate",     1.0)
         if (speed_dropped or overtakes_dropped) and crash_improved:
             warning = (
                 "\n  !! WARNING: crash_rate improved but speed and/or overtakes "
