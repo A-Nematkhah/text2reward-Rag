@@ -64,8 +64,10 @@ from groq import Groq
 
 from reward_sandbox import validate_reward_code
 from reward_archive import RewardArchive
+from key_manager import call_with_rotation   # ← چرخش خودکار کلید
 
 # ── Groq client ───────────────────────────────────────────────────────────────
+# _client دیگه استفاده نمیشه — key_manager مدیریت می‌کنه
 _client: Groq | None = None
 MODEL = "llama-3.3-70b-versatile"
 
@@ -328,19 +330,9 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
 # ── Groq client ───────────────────────────────────────────────────────────────
 
 def _get_client() -> Groq:
-    global _client
-    if _client is None:
-        api_key = os.environ.get("GROQ_API_KEY", "")
-        if not api_key:
-            raise EnvironmentError(
-                "\n[ERROR] GROQ_API_KEY is not set.\n"
-                "Set it before starting training:\n"
-                "  Linux   : export GROQ_API_KEY=gsk_xxxxxxxx\n"
-                "  Windows : set GROQ_API_KEY=gsk_xxxxxxxx\n"
-                "  Colab   : import os; os.environ['GROQ_API_KEY'] = 'gsk_xxxxxxxx'"
-            )
-        _client = Groq(api_key=api_key)
-    return _client
+    """Deprecated: از call_with_rotation استفاده کنید."""
+    from key_manager import get_groq_client
+    return get_groq_client()
 
 
 class RewardDesigner:
@@ -606,8 +598,7 @@ class RewardDesigner:
                 ]
 
             try:
-                client = _get_client()
-                resp = client.chat.completions.create(
+                resp = call_with_rotation(
                     model       = MODEL,
                     messages    = messages,
                     temperature = 0.5,
@@ -689,8 +680,7 @@ class RewardDesigner:
 
         for attempt in range(1, max_retries + 1):
             try:
-                client = _get_client()
-                resp = client.chat.completions.create(
+                resp = call_with_rotation(
                     model    = MODEL,
                     messages = [
                         {"role": "system", "content": _CRITIQUE_SYSTEM},
