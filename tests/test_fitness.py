@@ -1,5 +1,13 @@
-from fitness import compute_fitness
+from reward_archive import compute_fitness
+
 
 def test_collision_reduces_fitness():
-    metrics={'collision_rate':1.0,'efficiency_score':1.0,'comfort_score':1.0}
+    metrics = {
+        "crash_rate": 1.0,
+        "mean_speed": 0.0,
+        "mean_overtakes": 0.0,
+        "mean_long_jerk": 1.0,
+        "mean_ttc": 1.0,
+        "completion_rate": 0.0,
+    }
     assert compute_fitness(metrics) < 0.1

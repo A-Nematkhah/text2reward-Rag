@@ -54,8 +54,8 @@ LOG_FILE = "training_log.json"
 class TrainingLogger:
 
     def __init__(self, log_path: str = LOG_FILE):
-        self.log_path    = log_path
-        self._episode_n  = 0
+        self.log_path = log_path
+        self._episode_n = 0
         self.per_episode: list[dict] = []
         self.llm_updates: list[dict] = []
         self._start_time = time.time()
@@ -80,36 +80,33 @@ class TrainingLogger:
         self,
         stats: dict,
         timestep: int,
-        weights: dict[str, Any],   # now: {"generation": int, "reward_path": str}
+        weights: dict[str, Any],  # now: {"generation": int, "reward_path": str}
         policy_snap: dict | None = None,
     ) -> None:
         self._episode_n += 1
 
         record: dict[str, Any] = {
-            "episode":   self._episode_n,
-            "timestep":  timestep,
+            "episode": self._episode_n,
+            "timestep": timestep,
             "generation": weights.get("generation", 0),
-
-            "env_reward":      stats.get("total_env_reward",    0.0),
-            "shaped_reward":   stats.get("total_shaped_reward", 0.0),
-            "mean_speed":      stats.get("mean_speed",          0.0),
-            "mean_front_dist": stats.get("mean_front_dist",     0.0),
-            "collisions":      stats.get("collisions",          0),
-            "steps":           stats.get("steps",               0),
-            "crashed":         stats.get("collisions",          0) > 0,
-
-            "mean_ttc":           stats.get("mean_ttc",           0.0),
-            "mean_rel_vel":       stats.get("mean_rel_vel",       0.0),
-            "mean_long_jerk":     stats.get("mean_long_jerk",     0.0),
-            "mean_lat_jerk":      stats.get("mean_lat_jerk",      0.0),
-            "mean_accel":         stats.get("mean_accel",         0.0),
-            "mean_density":       stats.get("mean_density",       0.0),
-            "total_overtakes":    stats.get("total_overtakes",    0),
+            "env_reward": stats.get("total_env_reward", 0.0),
+            "shaped_reward": stats.get("total_shaped_reward", 0.0),
+            "mean_speed": stats.get("mean_speed", 0.0),
+            "mean_front_dist": stats.get("mean_front_dist", 0.0),
+            "collisions": stats.get("collisions", 0),
+            "steps": stats.get("steps", 0),
+            "crashed": stats.get("collisions", 0) > 0,
+            "mean_ttc": stats.get("mean_ttc", 0.0),
+            "mean_rel_vel": stats.get("mean_rel_vel", 0.0),
+            "mean_long_jerk": stats.get("mean_long_jerk", 0.0),
+            "mean_lat_jerk": stats.get("mean_lat_jerk", 0.0),
+            "mean_accel": stats.get("mean_accel", 0.0),
+            "mean_density": stats.get("mean_density", 0.0),
+            "total_overtakes": stats.get("total_overtakes", 0),
             "total_lane_changes": stats.get("total_lane_changes", 0),
-
-            "policy_entropy":            policy_snap["entropy"]            if policy_snap else None,
-            "policy_value_loss":         policy_snap["value_loss"]         if policy_snap else None,
-            "policy_loss":               policy_snap["policy_loss"]        if policy_snap else None,
+            "policy_entropy": policy_snap["entropy"] if policy_snap else None,
+            "policy_value_loss": policy_snap["value_loss"] if policy_snap else None,
+            "policy_loss": policy_snap["policy_loss"] if policy_snap else None,
             "policy_explained_variance": policy_snap["explained_variance"] if policy_snap else None,
         }
 
@@ -125,21 +122,21 @@ class TrainingLogger:
         policy_snap: dict | None = None,
     ) -> None:
         record: dict[str, Any] = {
-            "episode":           episode,
-            "timestep":          timestep,
+            "episode": episode,
+            "timestep": timestep,
             "generation_before": weights_before.get("generation", 0),
-            "generation_after":  weights_after.get("generation",  0),
-            "stats_window":      dict(stats_window),
-            "policy_snap":       dict(policy_snap) if policy_snap else None,
+            "generation_after": weights_after.get("generation", 0),
+            "stats_window": dict(stats_window),
+            "policy_snap": dict(policy_snap) if policy_snap else None,
         }
         self.llm_updates.append(record)
 
     def save(self) -> None:
         data = {
             "meta": {
-                "start_time":        self._start_time,
-                "elapsed_sec":       round(time.time() - self._start_time, 1),
-                "total_episodes":    len(self.per_episode),
+                "start_time": self._start_time,
+                "elapsed_sec": round(time.time() - self._start_time, 1),
+                "total_episodes": len(self.per_episode),
                 "total_llm_updates": len(self.llm_updates),
             },
             "per_episode": self.per_episode,

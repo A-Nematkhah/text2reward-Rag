@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import os
 import gymnasium as gym
-import highway_env                              # noqa: F401
+import highway_env  # noqa: F401
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
@@ -39,26 +39,26 @@ from training_logger import TrainingLogger
 
 # ── Environment configuration ─────────────────────────────────────────────────
 ENV_CONFIG = {
-    "vehicles_count":       30,
+    "vehicles_count": 30,
     "simulation_frequency": 15,
-    "policy_frequency":      5,
-    "duration":             60,
-    "lanes_count":           4,
+    "policy_frequency": 5,
+    "duration": 60,
+    "lanes_count": 4,
     "observation": {
-        "type":           "Kinematics",
+        "type": "Kinematics",
         "vehicles_count": 10,
-        "features":       ["presence", "x", "y", "vx", "vy"],
-        "normalize":      True,
-        "absolute":       False,
+        "features": ["presence", "x", "y", "vx", "vy"],
+        "normalize": True,
+        "absolute": False,
     },
     "action": {
         "type": "DiscreteMetaAction",
     },
     "reward_speed_range": [20, 30],
-    "collision_reward":   -1.0,
-    "high_speed_reward":   0.0,
-    "right_lane_reward":   0.0,
-    "lane_change_reward":  0.0,
+    "collision_reward": -1.0,
+    "high_speed_reward": 0.0,
+    "right_lane_reward": 0.0,
+    "lane_change_reward": 0.0,
 }
 
 
@@ -67,18 +67,20 @@ def make_env(rank: int = 0, reload_interval: int = 200, reward_path: str = REWAR
         env = gym.make("highway-v0", config=ENV_CONFIG)
         env = LLMRewardWrapper(
             env,
-            reload_interval = reload_interval,
-            num_lanes       = ENV_CONFIG["lanes_count"],
-            reward_path     = reward_path,
+            reload_interval=reload_interval,
+            num_lanes=ENV_CONFIG["lanes_count"],
+            reward_path=reward_path,
         )
         env = Monitor(env)
         return env
+
     return _init
 
 
 def _detect_device() -> str:
     try:
         import torch
+
         if torch.cuda.is_available():
             return "cuda"
         if torch.backends.mps.is_available():
@@ -97,6 +99,7 @@ def _read_sb3_scalar(model, key: str, default: float = 0.0) -> float:
 
 # ── RewardEvolutionCallback ───────────────────────────────────────────────────
 
+
 class RewardEvolutionCallback(BaseCallback):
     """
     SB3 callback — main process only.
@@ -112,7 +115,7 @@ class RewardEvolutionCallback(BaseCallback):
         verbose: int = 0,
     ):
         super().__init__(verbose)
-        self.designer        = designer
+        self.designer = designer
         self.training_logger = logger
 
     def _on_step(self) -> bool:
@@ -123,26 +126,26 @@ class RewardEvolutionCallback(BaseCallback):
                 continue
 
             meta_before = self.designer.get_weights()
-            updated     = self.designer.record_episode(stats)
-            meta_after  = self.designer.get_weights()
+            updated = self.designer.record_episode(stats)
+            meta_after = self.designer.get_weights()
 
             policy_snap = self.designer.get_policy_snapshot()
 
             self.training_logger.log_episode(
-                stats       = stats,
-                timestep    = self.num_timesteps,
-                weights     = meta_after,
-                policy_snap = policy_snap,
+                stats=stats,
+                timestep=self.num_timesteps,
+                weights=meta_after,
+                policy_snap=policy_snap,
             )
 
             if updated:
                 self.training_logger.log_llm_update(
-                    episode        = self.training_logger._episode_n,
-                    timestep       = self.num_timesteps,
-                    weights_before = meta_before,
-                    weights_after  = meta_after,
-                    stats_window   = {"generation": meta_after.get("generation")},
-                    policy_snap    = policy_snap,
+                    episode=self.training_logger._episode_n,
+                    timestep=self.num_timesteps,
+                    weights_before=meta_before,
+                    weights_after=meta_after,
+                    stats_window={"generation": meta_after.get("generation")},
+                    policy_snap=policy_snap,
                 )
 
             self.training_logger.save_periodically(every_n=10)
@@ -151,17 +154,17 @@ class RewardEvolutionCallback(BaseCallback):
 
     def _on_rollout_end(self) -> None:
         """Harvest PPO policy health after each gradient-update round."""
-        entropy  = -_read_sb3_scalar(self.model, "train/entropy_loss", 0.0)
-        val_loss =  _read_sb3_scalar(self.model, "train/value_loss",   0.0)
-        pol_loss =  _read_sb3_scalar(self.model, "train/policy_gradient_loss", 0.0)
-        expl_var =  _read_sb3_scalar(self.model, "train/explained_variance",  0.0)
+        entropy = -_read_sb3_scalar(self.model, "train/entropy_loss", 0.0)
+        val_loss = _read_sb3_scalar(self.model, "train/value_loss", 0.0)
+        pol_loss = _read_sb3_scalar(self.model, "train/policy_gradient_loss", 0.0)
+        expl_var = _read_sb3_scalar(self.model, "train/explained_variance", 0.0)
 
         if entropy != 0.0 or val_loss != 0.0:
             self.designer.push_policy_metrics(
-                entropy            = entropy,
-                value_loss         = val_loss,
-                policy_loss        = pol_loss,
-                explained_variance = expl_var,
+                entropy=entropy,
+                value_loss=val_loss,
+                policy_loss=pol_loss,
+                explained_variance=expl_var,
             )
 
 
@@ -170,36 +173,39 @@ class RewardEvolutionCallback(BaseCallback):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Train PPO on highway-v0 with Text-to-Reward evolution"
+    parser = argparse.ArgumentParser(description="Train PPO on highway-v0 with Text-to-Reward evolution")
+    parser.add_argument("--timesteps", type=int, default=200_000)
+    parser.add_argument("--n-envs", type=int, default=4)
+    parser.add_argument(
+        "--reload-interval", type=int, default=200, help="Steps between reward_program.py reloads in each worker"
     )
-    parser.add_argument("--timesteps",       type=int,   default=200_000)
-    parser.add_argument("--n-envs",          type=int,   default=4)
-    parser.add_argument("--reload-interval", type=int,   default=200,
-        help="Steps between reward_program.py reloads in each worker")
-    parser.add_argument("--evolve-every",    type=int,   default=20,
-        help="Generate new reward every N episodes (after warmup)")
-    parser.add_argument("--warmup-episodes", type=int,   default=40,
-        help="Episodes before first LLM reward generation")
-    parser.add_argument("--goal",            type=str,
+    parser.add_argument(
+        "--evolve-every", type=int, default=20, help="Generate new reward every N episodes (after warmup)"
+    )
+    parser.add_argument("--warmup-episodes", type=int, default=40, help="Episodes before first LLM reward generation")
+    parser.add_argument(
+        "--goal",
+        type=str,
         default="Drive fast and safely on a 4-lane highway. Overtake slow vehicles. "
-                "Avoid collisions. Prefer speeds above 25 m/s. Minimise harsh braking.",
-        help="Natural language driving goal sent to the LLM")
-    parser.add_argument("--resume",          type=str,   default=None,
-        metavar="PATH", help="Checkpoint .zip to resume from")
-    parser.add_argument("--reward-path",     type=str,   default=REWARD_PROGRAM_PATH)
-    parser.add_argument("--archive-file",    type=str,   default="reward_archive.json")
-    parser.add_argument("--checkpoint-freq", type=int,   default=10_000)
-    parser.add_argument("--log-file",        type=str,   default="training_log.json")
-    parser.add_argument("--plot-dir",        type=str,   default="plots")
-    parser.add_argument("--smooth",          type=int,   default=10)
-    parser.add_argument("--no-plots",        action="store_true")
-    parser.add_argument("--bootstrap",       action="store_true",
-        help="Generate first reward program before training starts")
-    parser.add_argument("--fresh",           action="store_true",
+        "Avoid collisions. Prefer speeds above 25 m/s. Minimise harsh braking.",
+        help="Natural language driving goal sent to the LLM",
+    )
+    parser.add_argument("--resume", type=str, default=None, metavar="PATH", help="Checkpoint .zip to resume from")
+    parser.add_argument("--reward-path", type=str, default=REWARD_PROGRAM_PATH)
+    parser.add_argument("--archive-file", type=str, default="reward_archive.json")
+    parser.add_argument("--checkpoint-freq", type=int, default=10_000)
+    parser.add_argument("--log-file", type=str, default="training_log.json")
+    parser.add_argument("--plot-dir", type=str, default="plots")
+    parser.add_argument("--smooth", type=int, default=10)
+    parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument("--bootstrap", action="store_true", help="Generate first reward program before training starts")
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
         help="Force a clean run: delete any existing log file, archive file, "
-             "reward program and ppo_highway*.zip checkpoints before starting, "
-             "instead of silently resuming.")
+        "reward program and ppo_highway*.zip checkpoints before starting, "
+        "instead of silently resuming.",
+    )
 
     args = parser.parse_args()
 
@@ -228,12 +234,12 @@ if __name__ == "__main__":
     from reward_designer import RewardDesigner
 
     designer = RewardDesigner(
-        goal            = args.goal,
-        evolve_every    = args.evolve_every,
-        warmup_episodes = args.warmup_episodes,
-        reward_path     = args.reward_path,
-        archive_path    = args.archive_file,
-        verbose         = True,
+        goal=args.goal,
+        evolve_every=args.evolve_every,
+        warmup_episodes=args.warmup_episodes,
+        reward_path=args.reward_path,
+        archive_path=args.archive_file,
+        verbose=True,
     )
 
     # ── Bootstrap: generate initial reward program if needed ──────────────────
@@ -250,8 +256,7 @@ if __name__ == "__main__":
 
     # ── Build environments ────────────────────────────────────────────────────
     env_fns = [
-        make_env(rank=i, reload_interval=args.reload_interval, reward_path=args.reward_path)
-        for i in range(args.n_envs)
+        make_env(rank=i, reload_interval=args.reload_interval, reward_path=args.reward_path) for i in range(args.n_envs)
     ]
 
     try:
@@ -281,15 +286,15 @@ if __name__ == "__main__":
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     checkpoint_cb = CheckpointCallback(
-        save_freq   = max(args.checkpoint_freq // args.n_envs, 1),
-        save_path   = ".",
-        name_prefix = "ppo_highway",
+        save_freq=max(args.checkpoint_freq // args.n_envs, 1),
+        save_path=".",
+        name_prefix="ppo_highway",
     )
 
     evolution_cb = RewardEvolutionCallback(
-        designer = designer,
-        logger   = training_log,
-        verbose  = 1,
+        designer=designer,
+        logger=training_log,
+        verbose=1,
     )
 
     # ── Train ─────────────────────────────────────────────────────────────────
@@ -300,9 +305,9 @@ if __name__ == "__main__":
     )
 
     model.learn(
-        total_timesteps     = args.timesteps,
-        reset_num_timesteps = args.resume is None,
-        callback            = [checkpoint_cb, evolution_cb],
+        total_timesteps=args.timesteps,
+        reset_num_timesteps=args.resume is None,
+        callback=[checkpoint_cb, evolution_cb],
     )
 
     # ── Final save ────────────────────────────────────────────────────────────
@@ -312,18 +317,21 @@ if __name__ == "__main__":
     print(f"\n[designer] Archive summary: {designer.archive.summary()}")
 
     vec_env.close()
-    print(f"\n[train] Done. Model + archive + log saved locally "
-          f"(ppo_highway_txt2reward.zip, {args.archive_file}, {args.log_file}).")
+    print(
+        f"\n[train] Done. Model + archive + log saved locally "
+        f"(ppo_highway_txt2reward.zip, {args.archive_file}, {args.log_file})."
+    )
 
     # ── Auto-generate plots ───────────────────────────────────────────────────
     if not args.no_plots:
         print(f"\n[train] Generating plots → '{args.plot_dir}/' ...")
         try:
             from plot_training import generate_all_plots
+
             generate_all_plots(
-                log_path = args.log_file,
-                out_dir  = args.plot_dir,
-                smooth   = args.smooth,
+                log_path=args.log_file,
+                out_dir=args.plot_dir,
+                smooth=args.smooth,
             )
             print(f"[train] Plots saved to {args.plot_dir}/")
         except Exception as e:

@@ -50,106 +50,200 @@ import threading
 from typing import Any
 
 # ── Whitelist of allowed AST node types ──────────────────────────────────────
-_ALLOWED_NODES = frozenset({
-    # Structural
-    ast.Module, ast.FunctionDef, ast.Return, ast.Expr,
-    ast.If, ast.IfExp, ast.BoolOp, ast.Compare,
-    ast.arguments, ast.arg,   # function signature: def compute_reward(state):
-    # Arithmetic
-    ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult, ast.Div,
-    ast.FloorDiv, ast.Mod, ast.Pow, ast.USub, ast.UAdd,
-    # Boolean ops
-    ast.And, ast.Or, ast.Not,
-    # Comparisons
-    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
-    # Literals & names
-    ast.Constant, ast.Name, ast.Load,
-    # Subscript (for state["key"])
-    ast.Subscript, ast.Index,
-    # Assignment (for local variables inside function)
-    ast.Assign, ast.AugAssign, ast.AnnAssign,
-    ast.Store,
-    # Function calls (only whitelisted functions)
-    ast.Call,
-    # Tuple/list literals (e.g. for min/max with multiple args)
-    ast.Tuple, ast.List,
-})
+_ALLOWED_NODES = frozenset(
+    {
+        # Structural
+        ast.Module,
+        ast.FunctionDef,
+        ast.Return,
+        ast.Expr,
+        ast.If,
+        ast.IfExp,
+        ast.BoolOp,
+        ast.Compare,
+        ast.arguments,
+        ast.arg,  # function signature: def compute_reward(state):
+        # Arithmetic
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.FloorDiv,
+        ast.Mod,
+        ast.Pow,
+        ast.USub,
+        ast.UAdd,
+        # Boolean ops
+        ast.And,
+        ast.Or,
+        ast.Not,
+        # Comparisons
+        ast.Eq,
+        ast.NotEq,
+        ast.Lt,
+        ast.LtE,
+        ast.Gt,
+        ast.GtE,
+        # Literals & names
+        ast.Constant,
+        ast.Name,
+        ast.Load,
+        # Subscript (for state["key"])
+        ast.Subscript,
+        ast.Index,
+        # Assignment (for local variables inside function)
+        ast.Assign,
+        ast.AugAssign,
+        ast.AnnAssign,
+        ast.Store,
+        # Function calls (only whitelisted functions)
+        ast.Call,
+        # Tuple/list literals (e.g. for min/max with multiple args)
+        ast.Tuple,
+        ast.List,
+    }
+)
 
 # ── Forbidden AST node types (explicit blacklist as extra guard) ──────────────
-_FORBIDDEN_NODES = frozenset({
-    ast.Import, ast.ImportFrom,
-    ast.Global, ast.Nonlocal,
-    ast.ClassDef,
-    ast.AsyncFunctionDef, ast.AsyncFor, ast.AsyncWith,
-    ast.Await, ast.Yield, ast.YieldFrom,
-    ast.With, ast.Delete,
-    ast.Raise, ast.Try,
-    ast.For, ast.While,           # loops forbidden to prevent infinite loops
-    ast.Lambda,                   # could hide imports
-    ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp,
-    ast.JoinedStr,                # f-strings can call functions
-    ast.Attribute,                # no obj.method access
-})
+_FORBIDDEN_NODES = frozenset(
+    {
+        ast.Import,
+        ast.ImportFrom,
+        ast.Global,
+        ast.Nonlocal,
+        ast.ClassDef,
+        ast.AsyncFunctionDef,
+        ast.AsyncFor,
+        ast.AsyncWith,
+        ast.Await,
+        ast.Yield,
+        ast.YieldFrom,
+        ast.With,
+        ast.Delete,
+        ast.Raise,
+        ast.Try,
+        ast.For,
+        ast.While,  # loops forbidden to prevent infinite loops
+        ast.Lambda,  # could hide imports
+        ast.GeneratorExp,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.JoinedStr,  # f-strings can call functions
+        ast.Attribute,  # no obj.method access
+    }
+)
 
 # ── Allowed function call names ───────────────────────────────────────────────
-_ALLOWED_CALLS = frozenset({
-    "min", "max", "abs", "round", "float", "int", "bool",
-    "sqrt", "exp", "log", "log2", "log10",
-    "sin", "cos", "tan", "atan", "atan2",
-    "floor", "ceil",
-    "clip",   # we provide a safe clip() in the namespace
-})
+_ALLOWED_CALLS = frozenset(
+    {
+        "min",
+        "max",
+        "abs",
+        "round",
+        "float",
+        "int",
+        "bool",
+        "sqrt",
+        "exp",
+        "log",
+        "log2",
+        "log10",
+        "sin",
+        "cos",
+        "tan",
+        "atan",
+        "atan2",
+        "floor",
+        "ceil",
+        "clip",  # we provide a safe clip() in the namespace
+    }
+)
 
 # ── Forbidden names (explicit) ────────────────────────────────────────────────
-_FORBIDDEN_NAMES = frozenset({
-    "__import__", "__builtins__", "__class__", "__dict__",
-    "exec", "eval", "compile", "open", "input",
-    "print", "breakpoint", "exit", "quit",
-    "globals", "locals", "vars", "dir",
-    "getattr", "setattr", "delattr", "hasattr",
-    "isinstance", "issubclass", "type",
-    "object", "super", "classmethod", "staticmethod",
-    "memoryview", "bytearray", "bytes",
-    "os", "sys", "subprocess", "socket", "urllib",
-})
+_FORBIDDEN_NAMES = frozenset(
+    {
+        "__import__",
+        "__builtins__",
+        "__class__",
+        "__dict__",
+        "exec",
+        "eval",
+        "compile",
+        "open",
+        "input",
+        "print",
+        "breakpoint",
+        "exit",
+        "quit",
+        "globals",
+        "locals",
+        "vars",
+        "dir",
+        "getattr",
+        "setattr",
+        "delattr",
+        "hasattr",
+        "isinstance",
+        "issubclass",
+        "type",
+        "object",
+        "super",
+        "classmethod",
+        "staticmethod",
+        "memoryview",
+        "bytearray",
+        "bytes",
+        "os",
+        "sys",
+        "subprocess",
+        "socket",
+        "urllib",
+    }
+)
+
 
 # ── Safe execution namespace ──────────────────────────────────────────────────
 def _make_safe_namespace() -> dict[str, Any]:
     """Creates a sandboxed namespace with only approved symbols."""
+
     def clip(val: float, lo: float, hi: float) -> float:
         return float(max(lo, min(hi, val)))
 
     return {
-        "__builtins__": {},   # no builtins
-        "min":   min,
-        "max":   max,
-        "abs":   abs,
+        "__builtins__": {},  # no builtins
+        "min": min,
+        "max": max,
+        "abs": abs,
         "round": round,
         "float": float,
-        "int":   int,
-        "bool":  bool,
+        "int": int,
+        "bool": bool,
         # math functions
-        "sqrt":  math.sqrt,
-        "exp":   math.exp,
-        "log":   math.log,
-        "log2":  math.log2,
+        "sqrt": math.sqrt,
+        "exp": math.exp,
+        "log": math.log,
+        "log2": math.log2,
         "log10": math.log10,
-        "sin":   math.sin,
-        "cos":   math.cos,
-        "tan":   math.tan,
-        "atan":  math.atan,
+        "sin": math.sin,
+        "cos": math.cos,
+        "tan": math.tan,
+        "atan": math.atan,
         "atan2": math.atan2,
         "floor": math.floor,
-        "ceil":  math.ceil,
-        "pi":    math.pi,
-        "e":     math.e,
-        "inf":   math.inf,
+        "ceil": math.ceil,
+        "pi": math.pi,
+        "e": math.e,
+        "inf": math.inf,
         # safe clip utility
-        "clip":  clip,
+        "clip": clip,
     }
 
 
 # ── AST validation ────────────────────────────────────────────────────────────
+
 
 def validate_reward_code(code: str) -> tuple[bool, str]:
     """
@@ -178,8 +272,7 @@ def validate_reward_code(code: str) -> tuple[bool, str]:
 
     if len(func_defs) != 1:
         return False, (
-            f"Expected exactly one function definition named 'compute_reward', "
-            f"found {len(func_defs)} function(s)"
+            f"Expected exactly one function definition named 'compute_reward', " f"found {len(func_defs)} function(s)"
         )
 
     func = func_defs[0]
@@ -187,10 +280,7 @@ def validate_reward_code(code: str) -> tuple[bool, str]:
         return False, f"Function must be named 'compute_reward', got '{func.name}'"
 
     if len(func.args.args) != 1:
-        return False, (
-            f"Function must take exactly one parameter (state), "
-            f"got {len(func.args.args)}"
-        )
+        return False, (f"Function must take exactly one parameter (state), " f"got {len(func.args.args)}")
 
     param_name = func.args.args[0].arg
     if param_name != "state":
@@ -229,6 +319,7 @@ def validate_reward_code(code: str) -> tuple[bool, str]:
 
 
 # ── Safe execution ────────────────────────────────────────────────────────────
+
 
 class _TimeoutError(Exception):
     pass
@@ -277,8 +368,7 @@ def execute_reward(
 
     if t.is_alive():
         raise RuntimeError(
-            f"Reward function timed out after {timeout_sec}s "
-            "(possible infinite loop or too-complex computation)"
+            f"Reward function timed out after {timeout_sec}s " "(possible infinite loop or too-complex computation)"
         )
 
     if exc_container:
@@ -289,14 +379,13 @@ def execute_reward(
 
     val = result_container[0]
     if not isinstance(val, (int, float)):
-        raise TypeError(
-            f"compute_reward must return a float, got {type(val).__name__}: {val!r}"
-        )
+        raise TypeError(f"compute_reward must return a float, got {type(val).__name__}: {val!r}")
 
     return float(val)
 
 
 # ── State builder (from observation parser output) ────────────────────────────
+
 
 def build_state(parsed_obs: dict, collided: bool) -> dict[str, Any]:
     """
@@ -306,16 +395,16 @@ def build_state(parsed_obs: dict, collided: bool) -> dict[str, Any]:
     every generated reward function.
     """
     return {
-        "speed_ms":        float(parsed_obs.get("speed_ms",        0.0)),
-        "front_dist":      float(parsed_obs.get("front_dist",     200.0)),
-        "ttc":             float(parsed_obs.get("ttc",             30.0)),
-        "rel_vel_ms":      float(parsed_obs.get("rel_vel_ms",       0.0)),
-        "lane":            int(parsed_obs.get("lane",               0)),
-        "overtook":        bool(parsed_obs.get("overtook",         False)),
-        "lane_changed":    bool(parsed_obs.get("lane_changed",     False)),
-        "collided":        bool(collided),
-        "nearby_vehicles": int(parsed_obs.get("nearby_vehicles",    0)),
-        "accel_ms2":       float(parsed_obs.get("accel_ms2",        0.0)),
-        "long_jerk":       float(parsed_obs.get("long_jerk",        0.0)),
-        "lat_jerk":        float(parsed_obs.get("lat_jerk",         0.0)),
+        "speed_ms": float(parsed_obs.get("speed_ms", 0.0)),
+        "front_dist": float(parsed_obs.get("front_dist", 200.0)),
+        "ttc": float(parsed_obs.get("ttc", 30.0)),
+        "rel_vel_ms": float(parsed_obs.get("rel_vel_ms", 0.0)),
+        "lane": int(parsed_obs.get("lane", 0)),
+        "overtook": bool(parsed_obs.get("overtook", False)),
+        "lane_changed": bool(parsed_obs.get("lane_changed", False)),
+        "collided": bool(collided),
+        "nearby_vehicles": int(parsed_obs.get("nearby_vehicles", 0)),
+        "accel_ms2": float(parsed_obs.get("accel_ms2", 0.0)),
+        "long_jerk": float(parsed_obs.get("long_jerk", 0.0)),
+        "lat_jerk": float(parsed_obs.get("lat_jerk", 0.0)),
     }

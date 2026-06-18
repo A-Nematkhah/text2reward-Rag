@@ -5,7 +5,7 @@ LEGACY MODULE — kept for backward compatibility with evaluate.py and
 training_logger.py. New code should use reward_program.py + reward_sandbox.py.
 
 In the new Text-to-Reward architecture:
-  OLD: LLM -> reward_weights.json -> compute_shaped_reward(weights, ...) 
+  OLD: LLM -> reward_weights.json -> compute_shaped_reward(weights, ...)
   NEW: LLM -> reward_program.py  -> compute_reward(state)
 
 This file now re-exports only the symbols still referenced by older modules.
@@ -29,34 +29,32 @@ import os
 WEIGHTS_FILE = "reward_weights.json"
 
 DEFAULT_WEIGHTS: dict[str, float] = {
-    "w_env":           0.2,
-    "w_speed":         0.8,
-    "speed_target":   28.0,
-    "speed_min":      10.0,
-    "w_safety":        0.0,
-    "safe_dist":      10.0,
-    "w_lane":          0.0,
-    "w_collision":    20.0,
-    "w_ttc":           0.3,
-    "ttc_threshold":   3.0,
-    "w_rel_vel":       0.0,
-    "w_comfort":       0.02,
-    "jerk_threshold":  2.0,
-    "w_jerk":          0.02,
-    "w_accel":         0.02,
+    "w_env": 0.2,
+    "w_speed": 0.8,
+    "speed_target": 28.0,
+    "speed_min": 10.0,
+    "w_safety": 0.0,
+    "safe_dist": 10.0,
+    "w_lane": 0.0,
+    "w_collision": 20.0,
+    "w_ttc": 0.3,
+    "ttc_threshold": 3.0,
+    "w_rel_vel": 0.0,
+    "w_comfort": 0.02,
+    "jerk_threshold": 2.0,
+    "w_jerk": 0.02,
+    "w_accel": 0.02,
     "accel_threshold": 3.0,
-    "w_density":       0.0,
+    "w_density": 0.0,
     "density_radius": 30.0,
-    "density_max":     5.0,
-    "w_overtake":      2.0,
-    "w_lc_quality":    0.05,
-    "w_progress":      0.5,
-    "max_speed":      40.0,
+    "density_max": 5.0,
+    "w_overtake": 2.0,
+    "w_lc_quality": 0.05,
+    "w_progress": 0.5,
+    "max_speed": 40.0,
 }
 
-WEIGHT_BOUNDS: dict[str, tuple[float, float]] = {
-    k: (v * 0.1, v * 5.0 + 1.0) for k, v in DEFAULT_WEIGHTS.items()
-}
+WEIGHT_BOUNDS: dict[str, tuple[float, float]] = {k: (v * 0.1, v * 5.0 + 1.0) for k, v in DEFAULT_WEIGHTS.items()}
 
 
 def load_weights(path: str = WEIGHTS_FILE) -> dict[str, float]:
@@ -90,6 +88,7 @@ def clamp_weights(weights: dict[str, float]) -> dict[str, float]:
 
 # ── Legacy component functions (preserved for evaluate.py --no-shaped) ────────
 
+
 def _speed_component(speed_ms: float, target: float, speed_min: float) -> float:
     span = max(target - speed_min, 1e-6)
     return float(max(0.0, min(1.0, (speed_ms - speed_min) / span)))
@@ -117,7 +116,7 @@ def _rel_vel_component(rel_vel_ms: float) -> float:
 
 
 def _comfort_component(long_jerk: float, lat_jerk: float, jerk_threshold: float) -> float:
-    combined = math.sqrt(long_jerk ** 2 + lat_jerk ** 2)
+    combined = math.sqrt(long_jerk**2 + lat_jerk**2)
     if combined <= jerk_threshold:
         return 0.0
     excess = (combined - jerk_threshold) / max(jerk_threshold, 1e-6)
@@ -152,9 +151,7 @@ def _progress_component(speed_ms: float, max_speed: float) -> float:
     return float(max(0.0, min(1.0, speed_ms / max(max_speed, 1e-6))))
 
 
-def _lc_quality_component(
-    lane_changed: bool, rel_vel_ms: float, front_dist: float, safe_dist: float
-) -> float:
+def _lc_quality_component(lane_changed: bool, rel_vel_ms: float, front_dist: float, safe_dist: float) -> float:
     if not lane_changed:
         return 0.0
     justified = (front_dist < safe_dist * 1.5) or (rel_vel_ms < 0.0)
@@ -183,21 +180,19 @@ def compute_shaped_reward(
     New code uses compute_reward(state) from reward_program.py.
     """
     w = weights
-    r  = w["w_env"] * env_reward
-    r += w["w_speed"]  * _speed_component(speed_ms, w["speed_target"], w["speed_min"])
+    r = w["w_env"] * env_reward
+    r += w["w_speed"] * _speed_component(speed_ms, w["speed_target"], w["speed_min"])
     r += w["w_safety"] * _safety_component(front_dist, w["safe_dist"])
-    r += w["w_lane"]   * _lane_component(lane, num_lanes)
+    r += w["w_lane"] * _lane_component(lane, num_lanes)
     if collided:
         r -= w["w_collision"]
-    r += w["w_ttc"]     * _ttc_component(ttc, w["ttc_threshold"])
+    r += w["w_ttc"] * _ttc_component(ttc, w["ttc_threshold"])
     r += w["w_rel_vel"] * _rel_vel_component(rel_vel_ms)
     r += w["w_comfort"] * _comfort_component(long_jerk, lat_jerk, w["jerk_threshold"])
-    r += w["w_jerk"]    * _jerk_component(long_jerk, w["jerk_threshold"])
-    r += w["w_accel"]   * _accel_component(accel_ms2, w["accel_threshold"])
+    r += w["w_jerk"] * _jerk_component(long_jerk, w["jerk_threshold"])
+    r += w["w_accel"] * _accel_component(accel_ms2, w["accel_threshold"])
     r += w["w_density"] * _density_component(nearby_vehicles, w["density_max"])
     r += w["w_overtake"] * _overtake_component(overtook)
-    r += w["w_lc_quality"] * _lc_quality_component(
-        lane_changed, rel_vel_ms, front_dist, w["safe_dist"]
-    )
+    r += w["w_lc_quality"] * _lc_quality_component(lane_changed, rel_vel_ms, front_dist, w["safe_dist"])
     r += w["w_progress"] * _progress_component(speed_ms, w["max_speed"])
     return float(r)

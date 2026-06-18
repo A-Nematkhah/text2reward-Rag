@@ -1,7 +1,6 @@
-import gymnasium as gym
-from reward_wrapper import RewardWrapper
+from reward_wrapper import _fallback_reward
 
-def test_wrapper_reset():
-    env=RewardWrapper(gym.make('highway-v0'))
-    obs,info=env.reset()
-    assert obs is not None
+
+def test_fallback_collision_penalty():
+    state = {"speed_ms": 20.0, "collided": True}
+    assert _fallback_reward(state) < 0

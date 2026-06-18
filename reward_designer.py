@@ -54,7 +54,6 @@ from __future__ import annotations
 
 import os
 import re
-import json
 import time
 import math
 from collections import deque
@@ -64,7 +63,7 @@ from groq import Groq
 
 from reward_sandbox import validate_reward_code
 from reward_archive import RewardArchive
-from key_manager import call_with_rotation   # ← چرخش خودکار کلید
+from key_manager import call_with_rotation  # ← چرخش خودکار کلید
 
 # ── Groq client ───────────────────────────────────────────────────────────────
 # _client دیگه استفاده نمیشه — key_manager مدیریت می‌کنه
@@ -105,22 +104,28 @@ Your task: write a Python function compute_reward(state) that returns a float.
 The agent drives on a 4-lane highway. Goal: high-speed, safe, efficient driving with active overtaking.
 
 HARD RULES (violation = sandbox rejection):
-  * Function signature: def compute_reward(state):
-  * No import statements
-  * No attribute access (no obj.method)
-  * No loops (for/while)
-  * No builtins except: min, max, abs, round, float, int, bool
-  * Only approved math: sqrt, exp, log, sin, cos, tan, atan2, floor, ceil, clip, pi
-  * Must return a float value
-  * Single local variables allowed; no nested functions
+    * Function signature: def compute_reward(state):
+    * HARD SAFETY CHECK: If state["collided"] is True, the function MUST immediately
+      return the collision penalty (e.g., -30.0) without any other positive terms,
+      speed rewards, or bonuses calculated or added in that same step. You MUST use
+      exactly this pattern at the very beginning of the function body:
+          if state["collided"]:
+              return -30.0
+    * No import statements
+    * No attribute access (no obj.method)
+    * No loops (for/while)
+    * No builtins except: min, max, abs, round, float, int, bool
+    * Only approved math: sqrt, exp, log, sin, cos, tan, atan2, floor, ceil, clip, pi
+    * Must return a float value
+    * Single local variables allowed; no nested functions
 
 DESIGN PRINCIPLES:
-  * Collision penalty should dominate (-10 to -30) to prevent reward hacking
-  * Speed reward should be continuous and always incentivise going faster
-  * TTC penalty should activate only below 3 s -- not for normal driving
-  * Overtake bonus: large one-shot reward (+1 to +3) when overtook == True
-  * Jerk/accel penalties should be small (0.01-0.05 scale) to not suppress action
-  * Avoid rewarding stationary behaviour or unnecessary lane changes
+    * Collision penalty should dominate (-10 to -30) to prevent reward hacking
+    * Speed reward should be continuous and always incentivise going faster
+    * TTC penalty should activate only below 3 s -- not for normal driving
+    * Overtake bonus: large one-shot reward (+1 to +3) when overtook == True
+    * Jerk/accel penalties should be small (0.01-0.05 scale) to not suppress action
+    * Avoid rewarding stationary behaviour or unnecessary lane changes
 
 {state_schema}
 
@@ -217,48 +222,48 @@ No explanation, no markdown fences.
 #   _SAMPLE_STATE_NORMAL   — typical mid-episode state, no crash, no overtake
 #   _SAMPLE_STATE_COLLIDED — collision state to exercise the penalty branch
 _SAMPLE_STATE_NORMAL: dict = {
-    "speed_ms":        20.0,
-    "front_dist":      40.0,
-    "ttc":             10.0,
-    "rel_vel_ms":      -2.0,
-    "lane":            1,
-    "overtook":        False,
-    "lane_changed":    False,
-    "collided":        False,
+    "speed_ms": 20.0,
+    "front_dist": 40.0,
+    "ttc": 10.0,
+    "rel_vel_ms": -2.0,
+    "lane": 1,
+    "overtook": False,
+    "lane_changed": False,
+    "collided": False,
     "nearby_vehicles": 2,
-    "accel_ms2":       0.5,
-    "long_jerk":       0.1,
-    "lat_jerk":        0.0,
+    "accel_ms2": 0.5,
+    "long_jerk": 0.1,
+    "lat_jerk": 0.0,
 }
 
 _SAMPLE_STATE_OVERTAKE: dict = {
-    "speed_ms":        28.0,
-    "front_dist":      60.0,
-    "ttc":             20.0,
-    "rel_vel_ms":      5.0,
-    "lane":            2,
-    "overtook":        True,
-    "lane_changed":    True,
-    "collided":        False,
+    "speed_ms": 28.0,
+    "front_dist": 60.0,
+    "ttc": 20.0,
+    "rel_vel_ms": 5.0,
+    "lane": 2,
+    "overtook": True,
+    "lane_changed": True,
+    "collided": False,
     "nearby_vehicles": 1,
-    "accel_ms2":       1.2,
-    "long_jerk":       0.3,
-    "lat_jerk":        0.2,
+    "accel_ms2": 1.2,
+    "long_jerk": 0.3,
+    "lat_jerk": 0.2,
 }
 
 _SAMPLE_STATE_COLLIDED: dict = {
-    "speed_ms":        15.0,
-    "front_dist":      0.0,
-    "ttc":             0.0,
-    "rel_vel_ms":      -10.0,
-    "lane":            0,
-    "overtook":        False,
-    "lane_changed":    False,
-    "collided":        True,
+    "speed_ms": 15.0,
+    "front_dist": 0.0,
+    "ttc": 0.0,
+    "rel_vel_ms": -10.0,
+    "lane": 0,
+    "overtook": False,
+    "lane_changed": False,
+    "collided": True,
     "nearby_vehicles": 3,
-    "accel_ms2":       -8.0,
-    "long_jerk":       -5.0,
-    "lat_jerk":        0.5,
+    "accel_ms2": -8.0,
+    "long_jerk": -5.0,
+    "lat_jerk": 0.5,
 }
 
 
@@ -271,6 +276,7 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
 
     Returns (ok, error_message).  ok=True means all samples ran cleanly.
     """
+
     # Build a safe execution namespace with the math builtins the generated
     # code is allowed to use (mirrors the whitelist in reward_sandbox.py).
     def _clip(val, lo, hi):
@@ -278,14 +284,27 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
 
     safe_globals = {
         "__builtins__": {},
-        "min": min, "max": max, "abs": abs, "round": round,
-        "float": float, "int": int, "bool": bool,
-        "sqrt": math.sqrt, "exp": math.exp, "log": math.log,
-        "sin": math.sin, "cos": math.cos, "tan": math.tan,
-        "atan": math.atan, "atan2": math.atan2,
-        "floor": math.floor, "ceil": math.ceil,
+        "min": min,
+        "max": max,
+        "abs": abs,
+        "round": round,
+        "float": float,
+        "int": int,
+        "bool": bool,
+        "sqrt": math.sqrt,
+        "exp": math.exp,
+        "log": math.log,
+        "sin": math.sin,
+        "cos": math.cos,
+        "tan": math.tan,
+        "atan": math.atan,
+        "atan2": math.atan2,
+        "floor": math.floor,
+        "ceil": math.ceil,
         "clip": _clip,
-        "pi": math.pi, "e": math.e, "inf": math.inf,
+        "pi": math.pi,
+        "e": math.e,
+        "inf": math.inf,
     }
 
     local_ns: dict = {}
@@ -298,9 +317,11 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
     if fn is None:
         return False, "compute_reward function not found after exec"
 
+    # Execute sample states and record scalar rewards for gate checks.
+    rewards: dict[str, float] = {}
     for name, sample in [
-        ("normal",    _SAMPLE_STATE_NORMAL),
-        ("overtake",  _SAMPLE_STATE_OVERTAKE),
+        ("normal", _SAMPLE_STATE_NORMAL),
+        ("overtake", _SAMPLE_STATE_OVERTAKE),
         ("collision", _SAMPLE_STATE_COLLIDED),
     ]:
         try:
@@ -310,6 +331,7 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
                     f"Runtime error on sample state '{name}': "
                     f"compute_reward returned {type(result).__name__} instead of float"
                 )
+            rewards[name] = float(result)
         except KeyError as exc:
             key = str(exc)
             valid_keys = ", ".join(sorted(_SAMPLE_STATE_NORMAL.keys()))
@@ -319,19 +341,82 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
                 f"Valid keys are: {valid_keys}"
             )
         except Exception as exc:
-            return False, (
-                f"Runtime error on sample state '{name}': "
-                f"{type(exc).__name__}: {exc}"
+            return False, (f"Runtime error on sample state '{name}': " f"{type(exc).__name__}: {exc}")
+
+    # ── Gate 1b: Quantitative Collision Penalty Check (X = 20) ────────────
+    X = 20.0
+    if "collision" in rewards and "normal" in rewards:
+        # The collided state's reward must be at least X points lower than a
+        # typical normal state's reward. If not, the collision penalty is being
+        # suppressed by other bonuses in the same step.
+        if rewards["collision"] >= (rewards["normal"] - X):
+            msg = (
+                "Safety Gate Violation: Collision penalty is suppressed by positive bonuses! "
+                f"Normal state reward: {rewards['normal']:.2f}, "
+                f"Collided state reward: {rewards['collision']:.2f}. "
+                f"The collision reward must be at least X={X} points lower than the normal reward to bypass suppression."
             )
+            return False, msg
+
+    # ── Gate 2: Full Episodic Simulation (Synthetic Trajectories) ────────
+    # 1) cautious/steady safe trajectory (40 steps, no collision)
+    cautious_return = 0.0
+    for t in range(40):
+        cautious_state = {
+            "speed_ms": 18.0,
+            "front_dist": 50.0,
+            "ttc": 30.0,
+            "rel_vel_ms": 0.0,
+            "lane": 1,
+            "overtook": False,
+            "lane_changed": False,
+            "collided": False,
+            "nearby_vehicles": 1,
+            "accel_ms2": 0.0,
+            "long_jerk": 0.0,
+            "lat_jerk": 0.0,
+        }
+        cautious_return += fn(cautious_state)
+
+    # 2) reckless trajectory: high speed, many lane changes/overtakes, collision at final step
+    reckless_return = 0.0
+    for t in range(40):
+        is_last_step = t == 39
+        reckless_state = {
+            "speed_ms": 28.0,
+            "front_dist": 15.0 if not is_last_step else 0.0,
+            "ttc": 2.0 if not is_last_step else 0.0,
+            "rel_vel_ms": -5.0,
+            "lane": t % 3,
+            "overtook": True if (t % 10 == 0 and not is_last_step) else False,
+            "lane_changed": True if (t % 5 == 0 and not is_last_step) else False,
+            "collided": is_last_step,
+            "nearby_vehicles": 4,
+            "accel_ms2": 2.0 if t % 2 == 0 else -2.0,
+            "long_jerk": 1.5,
+            "lat_jerk": 1.0,
+        }
+        reckless_return += fn(reckless_state)
+
+    # 3) Trajectory fitness condition: safe driving must achieve higher episodic return
+    if reckless_return >= cautious_return:
+        return False, (
+            f"Trajectory Gate Violation (Reward Hacking Detected): "
+            f"The reckless/crashy trajectory achieved a HIGHER episodic return ({reckless_return:.2f}) "
+            f"than the safe/cautious trajectory ({cautious_return:.2f}). "
+            f"The reward function is inflating speed/overtake bonuses over survival metrics."
+        )
 
     return True, ""
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
 
+
 def _get_client() -> Groq:
     """Deprecated: از call_with_rotation استفاده کنید."""
     from key_manager import get_groq_client
+
     return get_groq_client()
 
 
@@ -357,16 +442,16 @@ class RewardDesigner:
         archive_path: str = "reward_archive.json",
         verbose: bool = True,
     ):
-        self.goal            = goal
-        self.evolve_every    = evolve_every
+        self.goal = goal
+        self.evolve_every = evolve_every
         self.warmup_episodes = warmup_episodes
-        self.reward_path     = reward_path
-        self.verbose         = verbose
+        self.reward_path = reward_path
+        self.verbose = verbose
 
         self.archive = RewardArchive(archive_path)
 
         self._episode_stats: list[dict] = []
-        self._episode_count  = 0
+        self._episode_count = 0
         # NOTE: generation is NEVER tracked as an independent counter.
         # It is always derived from len(self.archive.entries) — this is the
         # single source of truth, fixing a bug where an independent counter
@@ -448,22 +533,24 @@ class RewardDesigner:
         policy_loss: float,
         explained_variance: float,
     ) -> None:
-        self._policy_buf.append({
-            "entropy":            entropy,
-            "value_loss":         value_loss,
-            "policy_loss":        policy_loss,
-            "explained_variance": explained_variance,
-        })
+        self._policy_buf.append(
+            {
+                "entropy": entropy,
+                "value_loss": value_loss,
+                "policy_loss": policy_loss,
+                "explained_variance": explained_variance,
+            }
+        )
 
     def get_policy_snapshot(self) -> dict | None:
         if not self._policy_buf:
             return None
         n = len(self._policy_buf)
         return {
-            "n_updates":          n,
-            "entropy":            sum(d["entropy"]            for d in self._policy_buf) / n,
-            "value_loss":         sum(d["value_loss"]         for d in self._policy_buf) / n,
-            "policy_loss":        sum(d["policy_loss"]        for d in self._policy_buf) / n,
+            "n_updates": n,
+            "entropy": sum(d["entropy"] for d in self._policy_buf) / n,
+            "value_loss": sum(d["value_loss"] for d in self._policy_buf) / n,
+            "policy_loss": sum(d["policy_loss"] for d in self._policy_buf) / n,
             "explained_variance": sum(d["explained_variance"] for d in self._policy_buf) / n,
         }
 
@@ -518,28 +605,27 @@ class RewardDesigner:
                 "placeholder so the archive stays in sync."
             )
             current_code = (
-                "def compute_reward(state):\n"
-                "    return 0.0  # placeholder: original code was unavailable\n"
+                "def compute_reward(state):\n" "    return 0.0  # placeholder: original code was unavailable\n"
             )
 
         previous_entry = self.archive.get_latest()
-        trend_summary  = self._format_trend(metrics, previous_entry)
+        trend_summary = self._format_trend(metrics, previous_entry)
 
         entry = self.archive.add_entry(
-            reward_code = current_code,
-            metrics     = metrics,
-            critique    = "",
+            reward_code=current_code,
+            metrics=metrics,
+            critique="",
         )
 
         # ── 3+4. Critique the entry we just archived ─────────────────────────
         traj_summary = self._format_trajectory_samples(self._episode_stats[-5:])
         critique = self._call_critique(
-            reward_code        = entry["reward_code"],
-            metrics            = metrics,
-            trajectory_summary = traj_summary,
-            generation          = entry["generation"],
-            fitness             = entry["fitness"],
-            trend_summary        = trend_summary,
+            reward_code=entry["reward_code"],
+            metrics=metrics,
+            trajectory_summary=traj_summary,
+            generation=entry["generation"],
+            fitness=entry["fitness"],
+            trend_summary=trend_summary,
         )
         if critique:
             self.archive.update_critique(entry["generation"], critique)
@@ -572,12 +658,13 @@ class RewardDesigner:
         Returns the first code that passes both checks, or None on total failure.
         """
         system = _GENERATION_SYSTEM.format(state_schema=_STATE_SCHEMA)
-        user   = _GENERATION_USER_TEMPLATE.format(
-            goal            = self.goal,
-            archive_context = archive_context,
+        user = _GENERATION_USER_TEMPLATE.format(
+            goal=self.goal,
+            archive_context=archive_context,
         )
 
         raw: str | None = None
+        repair_error: str = ""
 
         for attempt in range(1, max_retries + 1):
             # On attempt 1, use the standard generation prompt.
@@ -585,24 +672,28 @@ class RewardDesigner:
             if attempt == 1 or raw is None:
                 messages = [
                     {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
+                    {"role": "user", "content": user},
                 ]
             else:
                 messages = [
                     {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
+                    {"role": "user", "content": user},
                     {"role": "assistant", "content": raw},
-                    {"role": "user",      "content": _REPAIR_USER_TEMPLATE.format(
-                        error=repair_error, rejected_code=raw,
-                    )},
+                    {
+                        "role": "user",
+                        "content": _REPAIR_USER_TEMPLATE.format(
+                            error=repair_error,
+                            rejected_code=raw,
+                        ),
+                    },
                 ]
 
             try:
                 resp = call_with_rotation(
-                    model       = MODEL,
-                    messages    = messages,
-                    temperature = 0.5,
-                    max_tokens  = 800,
+                    model=MODEL,
+                    messages=messages,
+                    temperature=0.5,
+                    max_tokens=800,
                 )
                 raw = resp.choices[0].message.content.strip()
                 raw = re.sub(r"```python\n?|```\n?", "", raw).strip()
@@ -615,7 +706,7 @@ class RewardDesigner:
                     f"{type(exc).__name__}: {exc}"
                 )
                 if attempt < max_retries:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2**attempt)
                 raw = None
                 repair_error = f"API error: {exc}"
                 continue
@@ -662,42 +753,39 @@ class RewardDesigner:
         max_retries: int = 2,
     ) -> str:
         user = _CRITIQUE_USER_TEMPLATE.format(
-            generation         = generation,
-            reward_code        = reward_code,
-            mean_speed         = metrics.get("mean_speed",         0.0),
-            crash_rate         = metrics.get("crash_rate",         0.0),
-            mean_overtakes     = metrics.get("mean_overtakes",     0.0),
-            completion_rate    = metrics.get("completion_rate",    0.0),
-            mean_steps         = metrics.get("mean_steps",         0.0),
-            mean_ttc           = metrics.get("mean_ttc",           0.0),
-            mean_long_jerk     = metrics.get("mean_long_jerk",     0.0),
-            mean_accel         = metrics.get("mean_accel",         0.0),
-            total_lane_changes = metrics.get("total_lane_changes", 0),
-            fitness            = fitness,
-            trend_summary       = trend_summary,
-            trajectory_summary = trajectory_summary,
+            generation=generation,
+            reward_code=reward_code,
+            mean_speed=metrics.get("mean_speed", 0.0),
+            crash_rate=metrics.get("crash_rate", 0.0),
+            mean_overtakes=metrics.get("mean_overtakes", 0.0),
+            completion_rate=metrics.get("completion_rate", 0.0),
+            mean_steps=metrics.get("mean_steps", 0.0),
+            mean_ttc=metrics.get("mean_ttc", 0.0),
+            mean_long_jerk=metrics.get("mean_long_jerk", 0.0),
+            mean_accel=metrics.get("mean_accel", 0.0),
+            total_lane_changes=metrics.get("total_lane_changes", 0),
+            fitness=fitness,
+            trend_summary=trend_summary,
+            trajectory_summary=trajectory_summary,
         )
 
         for attempt in range(1, max_retries + 1):
             try:
                 resp = call_with_rotation(
-                    model    = MODEL,
-                    messages = [
+                    model=MODEL,
+                    messages=[
                         {"role": "system", "content": _CRITIQUE_SYSTEM},
-                        {"role": "user",   "content": user},
+                        {"role": "user", "content": user},
                     ],
-                    temperature = 0.3,
-                    max_tokens  = 500,
+                    temperature=0.3,
+                    max_tokens=500,
                 )
                 return resp.choices[0].message.content.strip()
 
             except Exception as exc:
-                print(
-                    f"[designer] Critique attempt {attempt}/{max_retries} failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+                print(f"[designer] Critique attempt {attempt}/{max_retries} failed: " f"{type(exc).__name__}: {exc}")
                 if attempt < max_retries:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2**attempt)
 
         return "(critique unavailable)"
 
@@ -738,20 +826,20 @@ class RewardDesigner:
         crashes = sum(1 for s in episode_stats if s.get("collisions", 0) > 0)
         total_overtakes = sum(s.get("total_overtakes", 0) for s in episode_stats)
         return {
-            "n_episodes":         n,
-            "mean_speed":         sum(s.get("mean_speed",       0) for s in episode_stats) / n,
-            "crash_rate":         crashes / n,
-            "completion_rate":    1.0 - crashes / n,
-            "mean_overtakes":     total_overtakes / n,
-            "mean_steps":         sum(s.get("steps",            0) for s in episode_stats) / n,
-            "mean_ttc":           sum(s.get("mean_ttc",         0) for s in episode_stats) / n,
-            "mean_rel_vel":       sum(s.get("mean_rel_vel",     0) for s in episode_stats) / n,
-            "mean_long_jerk":     sum(s.get("mean_long_jerk",   0) for s in episode_stats) / n,
-            "mean_lat_jerk":      sum(s.get("mean_lat_jerk",    0) for s in episode_stats) / n,
-            "mean_accel":         sum(s.get("mean_accel",       0) for s in episode_stats) / n,
-            "total_overtakes":    total_overtakes,
+            "n_episodes": n,
+            "mean_speed": sum(s.get("mean_speed", 0) for s in episode_stats) / n,
+            "crash_rate": crashes / n,
+            "completion_rate": 1.0 - crashes / n,
+            "mean_overtakes": total_overtakes / n,
+            "mean_steps": sum(s.get("steps", 0) for s in episode_stats) / n,
+            "mean_ttc": sum(s.get("mean_ttc", 0) for s in episode_stats) / n,
+            "mean_rel_vel": sum(s.get("mean_rel_vel", 0) for s in episode_stats) / n,
+            "mean_long_jerk": sum(s.get("mean_long_jerk", 0) for s in episode_stats) / n,
+            "mean_lat_jerk": sum(s.get("mean_lat_jerk", 0) for s in episode_stats) / n,
+            "mean_accel": sum(s.get("mean_accel", 0) for s in episode_stats) / n,
+            "total_overtakes": total_overtakes,
             "total_lane_changes": sum(s.get("total_lane_changes", 0) for s in episode_stats),
-            "max_steps":          300,
+            "max_steps": 300,
         }
 
     @staticmethod
@@ -768,18 +856,18 @@ class RewardDesigner:
         prev = previous_entry["metrics"]
 
         def _delta(key: str, fmt: str = "{:+.2f}") -> str:
-            cur_v  = current_metrics.get(key, 0.0)
+            cur_v = current_metrics.get(key, 0.0)
             prev_v = prev.get(key, 0.0)
             return fmt.format(cur_v - prev_v)
 
-        speed_delta     = _delta("mean_speed")
-        overtake_delta  = _delta("mean_overtakes")
-        crash_delta     = _delta("crash_rate", "{:+.1%}")
+        speed_delta = _delta("mean_speed")
+        overtake_delta = _delta("mean_overtakes")
+        crash_delta = _delta("crash_rate", "{:+.1%}")
 
         warning = ""
-        speed_dropped     = current_metrics.get("mean_speed",     0.0) < prev.get("mean_speed",     0.0)
+        speed_dropped = current_metrics.get("mean_speed", 0.0) < prev.get("mean_speed", 0.0)
         overtakes_dropped = current_metrics.get("mean_overtakes", 0.0) < prev.get("mean_overtakes", 0.0)
-        crash_improved    = current_metrics.get("crash_rate",     1.0) < prev.get("crash_rate",     1.0)
+        crash_improved = current_metrics.get("crash_rate", 1.0) < prev.get("crash_rate", 1.0)
         if (speed_dropped or overtakes_dropped) and crash_improved:
             warning = (
                 "\n  !! WARNING: crash_rate improved but speed and/or overtakes "

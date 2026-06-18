@@ -103,29 +103,30 @@ ARCHIVE_FILE = "reward_archive.json"
 
 # ── Fitness weights ────────────────────────────────────────────────────────────
 _W = {
-    "w_speed":    0.35,
+    "w_speed": 0.35,
     "w_overtake": 0.25,
-    "w_comfort":  0.15,
-    "w_ttc":      0.10,
+    "w_comfort": 0.15,
+    "w_ttc": 0.10,
     "w_complete": 0.15,
 }
 assert abs(sum(_W.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
 
 # ── Component normalisation references ────────────────────────────────────────
-_SPEED_MIN    = 20.0    # m/s — speed below this earns zero speed score
-_SPEED_REF    = 30.0    # m/s — speed at which speed_score reaches 1.0
-_OVERTAKE_REF = 10.0    # overtakes/episode → overtake_score = 1.0
-_COMFORT_K    = 0.5     # exponential decay rate for jerk penalty
-_TTC_SAFE     = 5.0     # seconds — TTC above which ttc_score = 1.0
+_SPEED_MIN = 20.0  # m/s — speed below this earns zero speed score
+_SPEED_REF = 30.0  # m/s — speed at which speed_score reaches 1.0
+_OVERTAKE_REF = 10.0  # overtakes/episode → overtake_score = 1.0
+_COMFORT_K = 0.5  # exponential decay rate for jerk penalty
+_TTC_SAFE = 5.0  # seconds — TTC above which ttc_score = 1.0
 
 # ── Safety gate parameters ─────────────────────────────────────────────────────
-_CRASH_THRESHOLD    = 0.30   # crash_rate below this → no soft-gate penalty
-_CRASH_K_SOFT       = 5.0    # soft-gate decay rate (above threshold)
-_CRASH_HARD_LIMIT   = 0.80   # crash_rate above this triggers the hard gate
-_HARD_PENALTY_SCALE = 0.10   # additional ×0.10 multiplier for catastrophic agents
+_CRASH_THRESHOLD = 0.30  # crash_rate below this → no soft-gate penalty
+_CRASH_K_SOFT = 5.0  # soft-gate decay rate (above threshold)
+_CRASH_HARD_LIMIT = 0.80  # crash_rate above this triggers the hard gate
+_HARD_PENALTY_SCALE = 0.10  # additional ×0.10 multiplier for catastrophic agents
 
 
 # ── Component scorers (each returns float ∈ [0, 1]) ──────────────────────────
+
 
 def _speed_score(mean_speed: float) -> float:
     """
@@ -196,6 +197,7 @@ def _safety_gate(crash_rate: float) -> float:
 
 # ── Public fitness function ───────────────────────────────────────────────────
 
+
 def compute_fitness(metrics: dict[str, Any]) -> float:
     """
     Computes a scalar fitness score in [0, 1] from evaluation metrics.
@@ -225,27 +227,27 @@ def compute_fitness(metrics: dict[str, Any]) -> float:
     Bad (current): 14 m/s, 100% crash    0.006
     Stationary: 5 m/s, 0 crash, 0 ot     0.15
     """
-    crash_rate      = float(metrics.get("crash_rate",      0.5))
-    mean_speed      = float(metrics.get("mean_speed",       0.0))
-    mean_overtakes  = float(metrics.get("mean_overtakes",   0.0))
-    mean_long_jerk  = float(metrics.get("mean_long_jerk",   0.0))
-    mean_ttc        = float(metrics.get("mean_ttc",        30.0))
-    completion_rate = float(metrics.get("completion_rate",  0.5))
+    crash_rate = float(metrics.get("crash_rate", 0.5))
+    mean_speed = float(metrics.get("mean_speed", 0.0))
+    mean_overtakes = float(metrics.get("mean_overtakes", 0.0))
+    mean_long_jerk = float(metrics.get("mean_long_jerk", 0.0))
+    mean_ttc = float(metrics.get("mean_ttc", 30.0))
+    completion_rate = float(metrics.get("completion_rate", 0.5))
 
     # ── Component scores ─────────────────────────────────────────────────────
-    s_speed    = _speed_score(mean_speed)
+    s_speed = _speed_score(mean_speed)
     s_overtake = _overtake_score(mean_overtakes)
-    s_comfort  = _comfort_score(mean_long_jerk)
-    s_ttc      = _ttc_score(mean_ttc)
+    s_comfort = _comfort_score(mean_long_jerk)
+    s_ttc = _ttc_score(mean_ttc)
     s_complete = float(max(0.0, min(1.0, completion_rate)))
 
     # ── Weighted base score ───────────────────────────────────────────────────
     base = (
-        _W["w_speed"]    * s_speed    +
-        _W["w_overtake"] * s_overtake +
-        _W["w_comfort"]  * s_comfort  +
-        _W["w_ttc"]      * s_ttc      +
-        _W["w_complete"] * s_complete
+        _W["w_speed"] * s_speed
+        + _W["w_overtake"] * s_overtake
+        + _W["w_comfort"] * s_comfort
+        + _W["w_ttc"] * s_ttc
+        + _W["w_complete"] * s_complete
     )
 
     # ── Safety gate ───────────────────────────────────────────────────────────
@@ -258,6 +260,7 @@ def compute_fitness(metrics: dict[str, Any]) -> float:
 
 # ── Archive class ─────────────────────────────────────────────────────────────
 
+
 class RewardArchive:
     """
     Persistent store for reward programs, metrics, fitness, and critiques.
@@ -265,7 +268,7 @@ class RewardArchive:
     """
 
     def __init__(self, path: str = ARCHIVE_FILE):
-        self.path    = path
+        self.path = path
         self.entries: list[dict[str, Any]] = []
         self._load()
 
@@ -278,9 +281,7 @@ class RewardArchive:
             with open(self.path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.entries = data.get("entries", [])
-            print(
-                f"[archive] Loaded {len(self.entries)} entries from '{self.path}'"
-            )
+            print(f"[archive] Loaded {len(self.entries)} entries from '{self.path}'")
         except Exception as e:
             print(f"[archive] Failed to load '{self.path}': {e} — starting fresh")
             self.entries = []
@@ -313,12 +314,12 @@ class RewardArchive:
         """
         fitness = compute_fitness(metrics)
         entry: dict[str, Any] = {
-            "generation":  len(self.entries),
+            "generation": len(self.entries),
             "reward_code": reward_code,
-            "metrics":     dict(metrics),
-            "fitness":     fitness,
-            "critique":    critique,
-            "timestamp":   time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "metrics": dict(metrics),
+            "fitness": fitness,
+            "critique": critique,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         self.entries.append(entry)
         self.save()
@@ -338,10 +339,7 @@ class RewardArchive:
                 entry["critique"] = critique
                 self.save()
                 return
-        print(
-            f"[archive] Warning: generation {generation} not found "
-            "for critique update"
-        )
+        print(f"[archive] Warning: generation {generation} not found " "for critique update")
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
 
@@ -396,9 +394,7 @@ class RewardArchive:
             )
             if entry.get("critique"):
                 lines.append(f"Critique:\n{entry['critique']}\n")
-            lines.append(
-                f"Reward Code:\n```python\n{entry['reward_code']}\n```\n"
-            )
+            lines.append(f"Reward Code:\n```python\n{entry['reward_code']}\n```\n")
 
         return "\n".join(lines)
 
@@ -459,27 +455,97 @@ if __name__ == "__main__":
     print("=== Fitness Function Self-Test ===\n")
 
     scenarios = [
-        ("Perfect agent",    {"mean_speed": 30.0, "crash_rate": 0.00, "mean_overtakes": 10.0, "mean_long_jerk": 0.5, "mean_ttc": 8.0,  "completion_rate": 1.00}),
-        ("Good agent",       {"mean_speed": 25.0, "crash_rate": 0.05, "mean_overtakes":  5.0, "mean_long_jerk": 1.0, "mean_ttc": 6.0,  "completion_rate": 0.95}),
-        ("Mediocre agent",   {"mean_speed": 22.0, "crash_rate": 0.30, "mean_overtakes":  2.0, "mean_long_jerk": 2.0, "mean_ttc": 4.0,  "completion_rate": 0.70}),
-        ("Current (bad)",    {"mean_speed": 14.0, "crash_rate": 1.00, "mean_overtakes": 30.0, "mean_long_jerk": 1.5, "mean_ttc": 2.0,  "completion_rate": 0.00}),
-        ("Stationary/safe",  {"mean_speed":  5.0, "crash_rate": 0.00, "mean_overtakes":  0.0, "mean_long_jerk": 0.1, "mean_ttc": 30.0, "completion_rate": 1.00}),
-        ("Fast but crashy",  {"mean_speed": 28.0, "crash_rate": 0.50, "mean_overtakes":  8.0, "mean_long_jerk": 1.5, "mean_ttc": 3.5,  "completion_rate": 0.50}),
-        ("Old gen 8 (best)", {"mean_speed": 11.6, "crash_rate": 0.90, "mean_overtakes": 35.0, "mean_long_jerk": 1.2, "mean_ttc": 1.5,  "completion_rate": 0.10}),
+        (
+            "Perfect agent",
+            {
+                "mean_speed": 30.0,
+                "crash_rate": 0.00,
+                "mean_overtakes": 10.0,
+                "mean_long_jerk": 0.5,
+                "mean_ttc": 8.0,
+                "completion_rate": 1.00,
+            },
+        ),
+        (
+            "Good agent",
+            {
+                "mean_speed": 25.0,
+                "crash_rate": 0.05,
+                "mean_overtakes": 5.0,
+                "mean_long_jerk": 1.0,
+                "mean_ttc": 6.0,
+                "completion_rate": 0.95,
+            },
+        ),
+        (
+            "Mediocre agent",
+            {
+                "mean_speed": 22.0,
+                "crash_rate": 0.30,
+                "mean_overtakes": 2.0,
+                "mean_long_jerk": 2.0,
+                "mean_ttc": 4.0,
+                "completion_rate": 0.70,
+            },
+        ),
+        (
+            "Current (bad)",
+            {
+                "mean_speed": 14.0,
+                "crash_rate": 1.00,
+                "mean_overtakes": 30.0,
+                "mean_long_jerk": 1.5,
+                "mean_ttc": 2.0,
+                "completion_rate": 0.00,
+            },
+        ),
+        (
+            "Stationary/safe",
+            {
+                "mean_speed": 5.0,
+                "crash_rate": 0.00,
+                "mean_overtakes": 0.0,
+                "mean_long_jerk": 0.1,
+                "mean_ttc": 30.0,
+                "completion_rate": 1.00,
+            },
+        ),
+        (
+            "Fast but crashy",
+            {
+                "mean_speed": 28.0,
+                "crash_rate": 0.50,
+                "mean_overtakes": 8.0,
+                "mean_long_jerk": 1.5,
+                "mean_ttc": 3.5,
+                "completion_rate": 0.50,
+            },
+        ),
+        (
+            "Old gen 8 (best)",
+            {
+                "mean_speed": 11.6,
+                "crash_rate": 0.90,
+                "mean_overtakes": 35.0,
+                "mean_long_jerk": 1.2,
+                "mean_ttc": 1.5,
+                "completion_rate": 0.10,
+            },
+        ),
     ]
 
-    print(f"{'Scenario':<22} {'fitness':>8}  {'speed_s':>7}  {'overt_s':>7}  "
-          f"{'comf_s':>7}  {'ttc_s':>7}  {'gate':>7}")
+    print(
+        f"{'Scenario':<22} {'fitness':>8}  {'speed_s':>7}  {'overt_s':>7}  " f"{'comf_s':>7}  {'ttc_s':>7}  {'gate':>7}"
+    )
     print("─" * 85)
 
     for name, m in scenarios:
-        f  = compute_fitness(m)
+        f = compute_fitness(m)
         ss = _speed_score(m["mean_speed"])
         os = _overtake_score(m["mean_overtakes"])
         cs = _comfort_score(m["mean_long_jerk"])
         ts = _ttc_score(m["mean_ttc"])
-        g  = _safety_gate(m["crash_rate"])
-        print(f"{name:<22} {f:>8.4f}  {ss:>7.3f}  {os:>7.3f}  "
-              f"{cs:>7.3f}  {ts:>7.3f}  {g:>7.3f}")
+        g = _safety_gate(m["crash_rate"])
+        print(f"{name:<22} {f:>8.4f}  {ss:>7.3f}  {os:>7.3f}  " f"{cs:>7.3f}  {ts:>7.3f}  {g:>7.3f}")
 
     print("\n✓ All scenarios computed successfully.")

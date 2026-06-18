@@ -23,29 +23,30 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 
 import numpy as np
-
-# ── matplotlib setup (headless-safe) ─────────────────────────────────────────
 import matplotlib
-matplotlib.use("Agg")   # No GUI — works on servers and Colab
+
+matplotlib.use("Agg")  # No GUI — works on servers and Colab
 import matplotlib.pyplot as plt
 
 # ── style ─────────────────────────────────────────────────────────────────────
-plt.rcParams.update({
-    "figure.dpi":        150,
-    "font.family":       "DejaVu Sans",
-    "axes.spines.top":   False,
-    "axes.spines.right": False,
-    "axes.grid":         True,
-    "grid.alpha":        0.3,
-    "grid.linestyle":    "--",
-    "legend.framealpha": 0.85,
-})
+plt.rcParams.update(
+    {
+        "figure.dpi": 150,
+        "font.family": "DejaVu Sans",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": True,
+        "grid.alpha": 0.3,
+        "grid.linestyle": "--",
+        "legend.framealpha": 0.85,
+    }
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _rolling(arr: list[float], w: int) -> np.ndarray:
     """Rolling average with window size w."""
@@ -79,13 +80,14 @@ def _save(fig: plt.Figure, path: str) -> None:
 
 # ── Chart 1: Learning Curves ──────────────────────────────────────────────────
 
+
 def plot_learning_curves(
     episodes: list[dict],
     out_dir: str,
     smooth: int = 10,
 ) -> None:
     """Env reward and shaped reward with rolling average."""
-    eps   = [e["episode"] for e in episodes]
+    eps = [e["episode"] for e in episodes]
     env_r = [e["env_reward"] for e in episodes]
     shp_r = [e["shaped_reward"] for e in episodes]
 
@@ -118,6 +120,7 @@ def plot_learning_curves(
 
 
 # ── Chart 2: Safety & Behavior ────────────────────────────────────────────────
+
 
 def plot_safety_behavior(
     episodes: list[dict],
@@ -213,6 +216,7 @@ def plot_safety_behavior(
 
 # ── Chart 3: Generation Evolution ─────────────────────────────────────────────
 
+
 def plot_generation_evolution(
     episodes: list[dict],
     llm_updates: list[dict],
@@ -227,9 +231,9 @@ def plot_generation_evolution(
         print("  [plot] No LLM updates recorded — skipping generation_evolution.png")
         return
 
-    eps      = [e["episode"]    for e in episodes]
-    speeds   = [e["mean_speed"] for e in episodes]
-    crash    = [float(e["crashed"]) for e in episodes]
+    eps = [e["episode"] for e in episodes]
+    speeds = [e["mean_speed"] for e in episodes]
+    crash = [float(e["crashed"]) for e in episodes]
     overtake = [e.get("total_overtakes", 0) for e in episodes]
 
     update_eps = [u["episode"] for u in llm_updates]
@@ -238,12 +242,14 @@ def plot_generation_evolution(
     fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
     fig.suptitle(
         "Behaviour Evolution Across Reward Generations",
-        fontsize=14, fontweight="bold", y=0.99,
+        fontsize=14,
+        fontweight="bold",
+        y=0.99,
     )
 
     series = [
-        (axes[0], speeds,   "Mean Speed (m/s)", "#DD8452"),
-        (axes[1], crash,    "Crashed (0/1)",     "#C44E52"),
+        (axes[0], speeds, "Mean Speed (m/s)", "#DD8452"),
+        (axes[1], crash, "Crashed (0/1)", "#C44E52"),
         (axes[2], overtake, "Overtakes/episode", "#55A868"),
     ]
 
@@ -259,8 +265,13 @@ def plot_generation_evolution(
 
     for ue, gen in zip(update_eps, update_gens):
         axes[0].annotate(
-            f"gen{gen}", (ue, max(speeds, default=0)),
-            fontsize=7, color="#666", rotation=90, ha="right", va="top",
+            f"gen{gen}",
+            (ue, max(speeds, default=0)),
+            fontsize=7,
+            color="#666",
+            rotation=90,
+            ha="right",
+            va="top",
         )
 
     axes[-1].set_xlabel("Episode", fontsize=11)
@@ -269,6 +280,7 @@ def plot_generation_evolution(
 
 
 # ── Chart 4: LLM Impact ───────────────────────────────────────────────────────
+
 
 def plot_llm_impact(
     episodes: list[dict],
@@ -281,9 +293,9 @@ def plot_llm_impact(
         print("  [plot] No LLM updates recorded — skipping llm_impact.png")
         return
 
-    before_crash, after_crash   = [], []
-    before_speed, after_speed   = [], []
-    update_labels               = []
+    before_crash, after_crash = [], []
+    before_speed, after_speed = [], []
+    update_labels = []
 
     ep_map = {e["episode"]: e for e in episodes}
 
@@ -291,21 +303,13 @@ def plot_llm_impact(
         ep = upd["episode"]
         update_labels.append(f"#{i+1}\nep{ep}")
 
-        pre_eps  = [ep_map[n] for n in range(ep - window, ep)     if n in ep_map]
-        post_eps = [ep_map[n] for n in range(ep, ep + window)     if n in ep_map]
+        pre_eps = [ep_map[n] for n in range(ep - window, ep) if n in ep_map]
+        post_eps = [ep_map[n] for n in range(ep, ep + window) if n in ep_map]
 
-        before_crash.append(
-            sum(1 for e in pre_eps  if e["crashed"]) / max(len(pre_eps),  1)
-        )
-        after_crash.append(
-            sum(1 for e in post_eps if e["crashed"]) / max(len(post_eps), 1)
-        )
-        before_speed.append(
-            sum(e["mean_speed"] for e in pre_eps)  / max(len(pre_eps),  1)
-        )
-        after_speed.append(
-            sum(e["mean_speed"] for e in post_eps) / max(len(post_eps), 1)
-        )
+        before_crash.append(sum(1 for e in pre_eps if e["crashed"]) / max(len(pre_eps), 1))
+        after_crash.append(sum(1 for e in post_eps if e["crashed"]) / max(len(post_eps), 1))
+        before_speed.append(sum(e["mean_speed"] for e in pre_eps) / max(len(pre_eps), 1))
+        after_speed.append(sum(e["mean_speed"] for e in post_eps) / max(len(post_eps), 1))
 
     x = np.arange(len(llm_updates))
     bar_w = 0.35
@@ -313,12 +317,14 @@ def plot_llm_impact(
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(max(8, len(llm_updates) * 1.2), 8))
     fig.suptitle(
         f"LLM Update Impact  (window = ±{window} episodes)",
-        fontsize=14, fontweight="bold", y=0.99,
+        fontsize=14,
+        fontweight="bold",
+        y=0.99,
     )
 
     # Crash rate
-    ax1.bar(x - bar_w/2, before_crash, bar_w, label="before", color="#C44E52", alpha=0.8)
-    ax1.bar(x + bar_w/2, after_crash,  bar_w, label="after",  color="#55A868", alpha=0.8)
+    ax1.bar(x - bar_w / 2, before_crash, bar_w, label="before", color="#C44E52", alpha=0.8)
+    ax1.bar(x + bar_w / 2, after_crash, bar_w, label="after", color="#55A868", alpha=0.8)
     ax1.set_ylabel("Crash Rate", fontsize=11)
     ax1.set_ylim(0, 1.05)
     ax1.set_xticks(x)
@@ -326,8 +332,8 @@ def plot_llm_impact(
     ax1.legend(fontsize=9)
 
     # Mean speed
-    ax2.bar(x - bar_w/2, before_speed, bar_w, label="before", color="#C44E52", alpha=0.8)
-    ax2.bar(x + bar_w/2, after_speed,  bar_w, label="after",  color="#55A868", alpha=0.8)
+    ax2.bar(x - bar_w / 2, before_speed, bar_w, label="before", color="#C44E52", alpha=0.8)
+    ax2.bar(x + bar_w / 2, after_speed, bar_w, label="after", color="#55A868", alpha=0.8)
     ax2.axhline(22.2, color="#888", linestyle="--", linewidth=1, label="target min 22.2 m/s (80 km/h)")
     ax2.axhline(27.8, color="#555", linestyle="--", linewidth=1, label="target max 27.8 m/s (100 km/h)")
     ax2.set_ylabel("Mean Speed (m/s)", fontsize=11)
@@ -341,6 +347,7 @@ def plot_llm_impact(
 
 
 # ── Chart 5: Archive Fitness ──────────────────────────────────────────────────
+
 
 def plot_archive_fitness(
     archive_path: str,
@@ -359,10 +366,10 @@ def plot_archive_fitness(
         print("  [plot] Archive has no entries — skipping archive_fitness.png")
         return
 
-    gens     = [e["generation"] for e in entries]
-    fitness  = [e["fitness"]    for e in entries]
-    crashes  = [e["metrics"].get("crash_rate", 0)     for e in entries]
-    speeds   = [e["metrics"].get("mean_speed", 0)      for e in entries]
+    gens = [e["generation"] for e in entries]
+    fitness = [e["fitness"] for e in entries]
+    crashes = [e["metrics"].get("crash_rate", 0) for e in entries]
+    speeds = [e["metrics"].get("mean_speed", 0) for e in entries]
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(max(8, len(gens) * 0.8), 7), sharex=True)
     fig.suptitle("Reward Archive — Fitness per Generation", fontsize=14, fontweight="bold", y=0.98)
@@ -370,8 +377,13 @@ def plot_archive_fitness(
     colors = ["#55A868" if c < 0.1 else "#DD8452" if c < 0.3 else "#C44E52" for c in crashes]
     ax1.bar(gens, fitness, color=colors)
     best_idx = int(np.argmax(fitness))
-    ax1.axhline(fitness[best_idx], color="#333", linestyle="--", linewidth=1,
-                label=f"best = gen {gens[best_idx]} ({fitness[best_idx]:.3f})")
+    ax1.axhline(
+        fitness[best_idx],
+        color="#333",
+        linestyle="--",
+        linewidth=1,
+        label=f"best = gen {gens[best_idx]} ({fitness[best_idx]:.3f})",
+    )
     ax1.set_ylabel("Fitness", fontsize=11)
     ax1.legend(fontsize=9)
 
@@ -386,10 +398,11 @@ def plot_archive_fitness(
 
 # ── generate_all_plots — called by train.py ───────────────────────────────────
 
+
 def generate_all_plots(
     log_path: str = "training_log.json",
-    out_dir:  str = "plots",
-    smooth:   int = 10,
+    out_dir: str = "plots",
+    smooth: int = 10,
     archive_path: str = "reward_archive.json",
 ) -> None:
     """
@@ -404,7 +417,7 @@ def generate_all_plots(
     with open(log_path, "r", encoding="utf-8") as f:
         log = json.load(f)
 
-    episodes    = log.get("per_episode", [])
+    episodes = log.get("per_episode", [])
     llm_updates = log.get("llm_updates", [])
 
     if not episodes:
@@ -416,11 +429,11 @@ def generate_all_plots(
     print(f"[plot] {len(episodes)} episodes | {len(llm_updates)} generation switches")
     print(f"[plot] Output directory: '{out_dir}/'")
 
-    plot_learning_curves(episodes,                       out_dir, smooth)
-    plot_safety_behavior(episodes, llm_updates,           out_dir, smooth)
-    plot_generation_evolution(episodes, llm_updates,      out_dir, smooth)
-    plot_llm_impact(episodes, llm_updates,                out_dir)
-    plot_archive_fitness(archive_path,                    out_dir)
+    plot_learning_curves(episodes, out_dir, smooth)
+    plot_safety_behavior(episodes, llm_updates, out_dir, smooth)
+    plot_generation_evolution(episodes, llm_updates, out_dir, smooth)
+    plot_llm_impact(episodes, llm_updates, out_dir)
+    plot_archive_fitness(archive_path, out_dir)
 
     print(f"[plot] Done — {out_dir}/")
 
@@ -428,24 +441,12 @@ def generate_all_plots(
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Generate training plots from training_log.json"
-    )
+    parser = argparse.ArgumentParser(description="Generate training plots from training_log.json")
+    parser.add_argument("--log", type=str, default="training_log.json", help="Path to the training log JSON file")
+    parser.add_argument("--out", type=str, default="plots", help="Output directory for PNG plots")
+    parser.add_argument("--smooth", type=int, default=10, help="Rolling average window size")
     parser.add_argument(
-        "--log",    type=str, default="training_log.json",
-        help="Path to the training log JSON file"
-    )
-    parser.add_argument(
-        "--out",    type=str, default="plots",
-        help="Output directory for PNG plots"
-    )
-    parser.add_argument(
-        "--smooth", type=int, default=10,
-        help="Rolling average window size"
-    )
-    parser.add_argument(
-        "--archive", type=str, default="reward_archive.json",
-        help="Path to the reward archive JSON file"
+        "--archive", type=str, default="reward_archive.json", help="Path to the reward archive JSON file"
     )
     args = parser.parse_args()
 

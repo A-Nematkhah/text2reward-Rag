@@ -77,7 +77,7 @@ class _KeyManager:
 
     def __init__(self) -> None:
         self._keys: list[str] = []
-        self._index: int = 0          # کلید فعال فعلی
+        self._index: int = 0  # کلید فعال فعلی
         self._clients: dict[str, Groq] = {}
         self._cooldown_until: dict[str, float] = {}  # key → زمان رفع محدودیت
         self._initialized = False
@@ -108,7 +108,7 @@ class _KeyManager:
             if self._cooldown_until.get(key, 0) <= now:
                 print(f"[key_manager] سوئیچ به کلید #{self._index + 1}")
                 return True
-        return False   # همه کلیدها در cooldown هستند
+        return False  # همه کلیدها در cooldown هستند
 
     def get_active_client(self) -> Groq:
         self._ensure_init()
@@ -141,7 +141,7 @@ class _KeyManager:
                 cooldown_left = self._cooldown_until.get(key, 0) - time.time()
                 if cooldown_left > 0:
                     if not self._rotate():
-                        break   # همه cooldown → از حلقه بیرون بزن
+                        break  # همه cooldown → از حلقه بیرون بزن
                     continue
 
                 try:
@@ -153,18 +153,15 @@ class _KeyManager:
                         max_tokens=max_tokens,
                         **kwargs,
                     )
-                    return resp   # ✅ موفق
+                    return resp  # ✅ موفق
 
                 except groq.RateLimitError as exc:
                     # زمان انتظار را از هدر بگیر (اگه موجود بود)
                     wait = _parse_retry_after(exc) or 60
                     self._cooldown_until[key] = time.time() + wait
-                    print(
-                        f"[key_manager] کلید #{self._index + 1} rate-limit خورد "
-                        f"(انتظار {wait:.0f}s). سوئیچ..."
-                    )
+                    print(f"[key_manager] کلید #{self._index + 1} rate-limit خورد " f"(انتظار {wait:.0f}s). سوئیچ...")
                     if not self._rotate():
-                        break   # همه cooldown
+                        break  # همه cooldown
 
                 except groq.AuthenticationError:
                     print(f"[key_manager] کلید #{self._index + 1} نامعتبر است. سوئیچ...")
@@ -173,7 +170,7 @@ class _KeyManager:
                         raise RuntimeError("هیچ کلید معتبری باقی نمانده!")
 
                 except Exception:
-                    raise   # بقیه خطاها رو بالا بفرست
+                    raise  # بقیه خطاها رو بالا بفرست
 
             # اگه اینجا رسیدیم یعنی همه کلیدها rate-limit خوردند
             if rotation < _MAX_FULL_ROTATIONS - 1:
@@ -191,10 +188,7 @@ class _KeyManager:
                         self._index = i
                         break
 
-        raise RuntimeError(
-            f"[key_manager] بعد از {_MAX_FULL_ROTATIONS} دور چرخش، "
-            "هیچ کلیدی در دسترس نبود."
-        )
+        raise RuntimeError(f"[key_manager] بعد از {_MAX_FULL_ROTATIONS} دور چرخش، " "هیچ کلیدی در دسترس نبود.")
 
 
 def _parse_retry_after(exc: groq.RateLimitError) -> float | None:
@@ -209,16 +203,10 @@ def _parse_retry_after(exc: groq.RateLimitError) -> float | None:
     return None
 
 
-def _min_cooldown_wait(
-    cooldown_until: dict[str, float], keys: list[str]
-) -> float:
+def _min_cooldown_wait(cooldown_until: dict[str, float], keys: list[str]) -> float:
     """کمترین زمان انتظار تا آزاد شدن یک کلید را برمی‌گرداند."""
     now = time.time()
-    waits = [
-        max(0.0, cooldown_until.get(k, 0) - now)
-        for k in keys
-        if cooldown_until.get(k, 0) > now
-    ]
+    waits = [max(0.0, cooldown_until.get(k, 0) - now) for k in keys if cooldown_until.get(k, 0) > now]
     return min(waits) if waits else 1.0
 
 

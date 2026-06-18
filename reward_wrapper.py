@@ -45,26 +45,25 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import os
-import sys
 import numpy as np
 import gymnasium as gym
 
-from reward_sandbox import build_state, execute_reward, validate_reward_code
+from reward_sandbox import build_state, execute_reward
 
 # ── Observation column indices ────────────────────────────────────────────────
 _IDX_PRESENCE = 0
-_IDX_X        = 1
-_IDX_Y        = 2
-_IDX_VX       = 3
-_IDX_VY       = 4
+_IDX_X = 1
+_IDX_Y = 2
+_IDX_VX = 3
+_IDX_VY = 4
 
 # ── Physical constants ────────────────────────────────────────────────────────
 _SPEED_SCALE = 40.0
-_LANE_WIDTH  = 4.0
-_DT          = 1.0 / 5.0
+_LANE_WIDTH = 4.0
+_DT = 1.0 / 5.0
 _PRESENCE_TH = 0.5
-_DIST_SCALE  = 100.0
-_DIST_MAX    = 200.0
+_DIST_SCALE = 100.0
+_DIST_MAX = 200.0
 
 REWARD_PROGRAM_PATH = "reward_program.py"
 
@@ -86,7 +85,7 @@ def _load_reward_fn(path: str):
         from reward_sandbox import _make_safe_namespace
 
         spec = importlib.util.spec_from_file_location("reward_program", path)
-        mod  = importlib.util.module_from_spec(spec)
+        mod = importlib.util.module_from_spec(spec)
 
         # Inject safe math helpers (clip, sqrt, exp, ...) before exec
         safe_ns = _make_safe_namespace()
@@ -108,7 +107,7 @@ def _load_reward_fn(path: str):
 def _fallback_reward(state: dict) -> float:
     """Emergency fallback when reward_program.py is unavailable."""
     speed_norm = min(1.0, state.get("speed_ms", 0.0) / 30.0)
-    collision  = -20.0 if state.get("collided", False) else 0.0
+    collision = -20.0 if state.get("collided", False) else 0.0
     return 0.8 * speed_norm + collision
 
 
@@ -135,40 +134,40 @@ class LLMRewardWrapper(gym.Wrapper):
     ):
         super().__init__(env)
         self.reload_interval = reload_interval
-        self.num_lanes       = num_lanes
-        self.reward_path     = reward_path
+        self.num_lanes = num_lanes
+        self.reward_path = reward_path
 
-        self._reward_fn      = _load_reward_fn(self.reward_path)
-        self._global_step    = 0
-        self._density_radius = 30.0   # metres; fixed (no weight dict anymore)
+        self._reward_fn = _load_reward_fn(self.reward_path)
+        self._global_step = 0
+        self._density_radius = 30.0  # metres; fixed (no weight dict anymore)
 
         self._reset_episode_accum()
 
     # ── Episode accumulators ──────────────────────────────────────────────────
 
     def _reset_episode_accum(self) -> None:
-        self._ep_env_reward    = 0.0
+        self._ep_env_reward = 0.0
         self._ep_shaped_reward = 0.0
-        self._ep_speed_sum     = 0.0
-        self._ep_dist_sum      = 0.0
-        self._ep_steps         = 0
-        self._ep_collisions    = 0
+        self._ep_speed_sum = 0.0
+        self._ep_dist_sum = 0.0
+        self._ep_steps = 0
+        self._ep_collisions = 0
 
-        self._ep_ttc_sum          = 0.0
-        self._ep_rel_vel_sum      = 0.0
-        self._ep_long_jerk_sum    = 0.0
-        self._ep_lat_jerk_sum     = 0.0
-        self._ep_accel_sum        = 0.0
-        self._ep_density_sum      = 0.0
-        self._ep_overtakes        = 0
-        self._ep_lane_changes     = 0
+        self._ep_ttc_sum = 0.0
+        self._ep_rel_vel_sum = 0.0
+        self._ep_long_jerk_sum = 0.0
+        self._ep_lat_jerk_sum = 0.0
+        self._ep_accel_sum = 0.0
+        self._ep_density_sum = 0.0
+        self._ep_overtakes = 0
+        self._ep_lane_changes = 0
 
         self._ep_traj: list[dict] = []
 
-        self._prev_speed_ms: float | None  = None
-        self._prev_accel_ms2: float        = 0.0
-        self._prev_lat_vel_ms: float       = 0.0
-        self._prev_lane: int | None        = None
+        self._prev_speed_ms: float | None = None
+        self._prev_accel_ms2: float = 0.0
+        self._prev_lat_vel_ms: float = 0.0
+        self._prev_lane: int | None = None
         self._prev_trailing: set[tuple[int, int]] = set()
 
     def reset(self, **kwargs):
@@ -188,13 +187,13 @@ class LLMRewardWrapper(gym.Wrapper):
         # Parse state from observation
         parsed = _parse_full_obs(
             obs,
-            num_lanes        = self.num_lanes,
-            prev_speed_ms    = self._prev_speed_ms,
-            prev_accel_ms2   = self._prev_accel_ms2,
-            prev_lat_vel_ms  = self._prev_lat_vel_ms,
-            prev_lane        = self._prev_lane,
-            prev_trailing    = self._prev_trailing,
-            density_radius_m = self._density_radius,
+            num_lanes=self.num_lanes,
+            prev_speed_ms=self._prev_speed_ms,
+            prev_accel_ms2=self._prev_accel_ms2,
+            prev_lat_vel_ms=self._prev_lat_vel_ms,
+            prev_lane=self._prev_lane,
+            prev_trailing=self._prev_trailing,
+            density_radius_m=self._density_radius,
         )
 
         collided = bool(info.get("crashed", False))
@@ -223,28 +222,28 @@ class LLMRewardWrapper(gym.Wrapper):
             )
 
         # Carry state forward
-        self._prev_speed_ms   = parsed["speed_ms"]
-        self._prev_accel_ms2  = parsed["accel_ms2"]
+        self._prev_speed_ms = parsed["speed_ms"]
+        self._prev_accel_ms2 = parsed["accel_ms2"]
         self._prev_lat_vel_ms = parsed["lat_vel_ms"]
-        self._prev_lane       = parsed["lane"]
-        self._prev_trailing   = parsed["trailing_ids"]
+        self._prev_lane = parsed["lane"]
+        self._prev_trailing = parsed["trailing_ids"]
 
         # Accumulate episode statistics
-        self._ep_env_reward    += env_reward
+        self._ep_env_reward += env_reward
         self._ep_shaped_reward += shaped_reward
-        self._ep_speed_sum     += state["speed_ms"]
-        self._ep_dist_sum      += state["front_dist"]
-        self._ep_steps         += 1
+        self._ep_speed_sum += state["speed_ms"]
+        self._ep_dist_sum += state["front_dist"]
+        self._ep_steps += 1
 
         if collided:
             self._ep_collisions += 1
 
-        self._ep_ttc_sum       += state["ttc"]
-        self._ep_rel_vel_sum   += state["rel_vel_ms"]
+        self._ep_ttc_sum += state["ttc"]
+        self._ep_rel_vel_sum += state["rel_vel_ms"]
         self._ep_long_jerk_sum += abs(state["long_jerk"])
-        self._ep_lat_jerk_sum  += abs(state["lat_jerk"])
-        self._ep_accel_sum     += abs(state["accel_ms2"])
-        self._ep_density_sum   += state["nearby_vehicles"]
+        self._ep_lat_jerk_sum += abs(state["lat_jerk"])
+        self._ep_accel_sum += abs(state["accel_ms2"])
+        self._ep_density_sum += state["nearby_vehicles"]
 
         if state["overtook"]:
             self._ep_overtakes += 1
@@ -253,48 +252,48 @@ class LLMRewardWrapper(gym.Wrapper):
 
         # Trajectory sample
         sample_every = max(1, 40 // self.MAX_TRAJ_SAMPLES)
-        if (
-            self._ep_steps % sample_every == 0
-            and len(self._ep_traj) < self.MAX_TRAJ_SAMPLES
-        ):
-            self._ep_traj.append({
-                "speed_ms":        round(state["speed_ms"],    2),
-                "lane":            state["lane"],
-                "front_dist":      round(state["front_dist"], 1),
-                "collided":        collided,
-                "ttc":             round(state["ttc"],         1),
-                "rel_vel_ms":      round(state["rel_vel_ms"],  2),
-                "accel_ms2":       round(state["accel_ms2"],   2),
-                "nearby_vehicles": state["nearby_vehicles"],
-                "overtook":        state["overtook"],
-            })
+        if self._ep_steps % sample_every == 0 and len(self._ep_traj) < self.MAX_TRAJ_SAMPLES:
+            self._ep_traj.append(
+                {
+                    "speed_ms": round(state["speed_ms"], 2),
+                    "lane": state["lane"],
+                    "front_dist": round(state["front_dist"], 1),
+                    "collided": collided,
+                    "ttc": round(state["ttc"], 1),
+                    "rel_vel_ms": round(state["rel_vel_ms"], 2),
+                    "accel_ms2": round(state["accel_ms2"], 2),
+                    "nearby_vehicles": state["nearby_vehicles"],
+                    "overtook": state["overtook"],
+                }
+            )
 
         # Episode summary
         if terminated or truncated:
             n = max(self._ep_steps, 1)
             info = dict(info)
             info["episode_stats"] = {
-                "total_env_reward":    round(self._ep_env_reward,    3),
+                "total_env_reward": round(self._ep_env_reward, 3),
                 "total_shaped_reward": round(self._ep_shaped_reward, 3),
-                "mean_speed":          round(self._ep_speed_sum / n, 2),
-                "mean_front_dist":     round(self._ep_dist_sum  / n, 2),
-                "collisions":          self._ep_collisions,
-                "steps":               self._ep_steps,
-                "mean_ttc":            round(self._ep_ttc_sum       / n, 2),
-                "mean_rel_vel":        round(self._ep_rel_vel_sum   / n, 3),
-                "mean_long_jerk":      round(self._ep_long_jerk_sum / n, 3),
-                "mean_lat_jerk":       round(self._ep_lat_jerk_sum  / n, 3),
-                "mean_accel":          round(self._ep_accel_sum     / n, 3),
-                "mean_density":        round(self._ep_density_sum   / n, 2),
-                "total_overtakes":     self._ep_overtakes,
-                "total_lane_changes":  self._ep_lane_changes,
-                "trajectory_samples":  list(self._ep_traj),
+                "mean_speed": round(self._ep_speed_sum / n, 2),
+                "mean_front_dist": round(self._ep_dist_sum / n, 2),
+                "collisions": self._ep_collisions,
+                "steps": self._ep_steps,
+                "mean_ttc": round(self._ep_ttc_sum / n, 2),
+                "mean_rel_vel": round(self._ep_rel_vel_sum / n, 3),
+                "mean_long_jerk": round(self._ep_long_jerk_sum / n, 3),
+                "mean_lat_jerk": round(self._ep_lat_jerk_sum / n, 3),
+                "mean_accel": round(self._ep_accel_sum / n, 3),
+                "mean_density": round(self._ep_density_sum / n, 2),
+                "total_overtakes": self._ep_overtakes,
+                "total_lane_changes": self._ep_lane_changes,
+                "trajectory_samples": list(self._ep_traj),
             }
 
         return obs, shaped_reward, terminated, truncated, info
 
 
 # ── Reward execution helper (direct call, no sandbox overhead) ────────────────
+
 
 def _direct_execute(reward_fn, state: dict) -> float:
     """Calls the reward function directly (pre-validated, low overhead)."""
@@ -306,6 +305,7 @@ execute_reward.__wrapped__ = _direct_execute
 
 
 # ── Full observation parser ───────────────────────────────────────────────────
+
 
 def _parse_full_obs(
     obs: np.ndarray,
@@ -320,11 +320,11 @@ def _parse_full_obs(
     """Unchanged from original — parses KinematicObservation into state signals."""
     ego = obs[0]
 
-    vx_raw    = float(ego[_IDX_VX])
+    vx_raw = float(ego[_IDX_VX])
     normalised = abs(vx_raw) <= 1.5
 
-    speed_ms  = vx_raw * _SPEED_SCALE if normalised else vx_raw
-    speed_ms  = max(0.0, speed_ms)
+    speed_ms = vx_raw * _SPEED_SCALE if normalised else vx_raw
+    speed_ms = max(0.0, speed_ms)
 
     lat_vel_ms = float(ego[_IDX_VY]) * (_SPEED_SCALE if normalised else 1.0)
 
@@ -336,8 +336,8 @@ def _parse_full_obs(
 
     lane_changed = (prev_lane is not None) and (lane != prev_lane)
 
-    front_dist   = _DIST_MAX
-    front_vx_ms  = speed_ms
+    front_dist = _DIST_MAX
+    front_vx_ms = speed_ms
     nearby_count = 0
 
     current_trailing: set[tuple[int, int]] = set()
@@ -348,16 +348,16 @@ def _parse_full_obs(
             continue
 
         veh_x_raw = float(row[_IDX_X])
-        dx_m      = (veh_x_raw * _DIST_SCALE) if normalised else veh_x_raw
+        dx_m = (veh_x_raw * _DIST_SCALE) if normalised else veh_x_raw
 
-        veh_vx    = float(row[_IDX_VX])
+        veh_vx = float(row[_IDX_VX])
         veh_vx_ms = veh_vx * _SPEED_SCALE if normalised else veh_vx
 
         veh_y_raw = float(row[_IDX_Y])
-        dy_m      = (veh_y_raw * _LANE_WIDTH * (num_lanes - 1)) if normalised else veh_y_raw
+        dy_m = (veh_y_raw * _LANE_WIDTH * (num_lanes - 1)) if normalised else veh_y_raw
 
         if 0.0 < dx_m < front_dist and abs(dy_m) < _LANE_WIDTH * 1.5:
-            front_dist  = dx_m
+            front_dist = dx_m
             front_vx_ms = veh_vx_ms
 
         if abs(dx_m) < density_radius_m and abs(dy_m) < _LANE_WIDTH * 1.5:
@@ -379,21 +379,21 @@ def _parse_full_obs(
 
     accel_ms2 = 0.0 if prev_speed_ms is None else (speed_ms - prev_speed_ms) / _DT
     long_jerk = (accel_ms2 - prev_accel_ms2) / _DT
-    lat_jerk  = (lat_vel_ms - prev_lat_vel_ms) / _DT
-    overtook  = bool(prev_trailing - current_trailing)
+    lat_jerk = (lat_vel_ms - prev_lat_vel_ms) / _DT
+    overtook = bool(prev_trailing - current_trailing)
 
     return {
-        "speed_ms":        speed_ms,
-        "lat_vel_ms":      lat_vel_ms,
-        "trailing_ids":    current_trailing,
-        "lane":            lane,
-        "front_dist":      front_dist,
-        "rel_vel_ms":      rel_vel_ms,
-        "ttc":             ttc,
-        "accel_ms2":       accel_ms2,
-        "long_jerk":       long_jerk,
-        "lat_jerk":        lat_jerk,
+        "speed_ms": speed_ms,
+        "lat_vel_ms": lat_vel_ms,
+        "trailing_ids": current_trailing,
+        "lane": lane,
+        "front_dist": front_dist,
+        "rel_vel_ms": rel_vel_ms,
+        "ttc": ttc,
+        "accel_ms2": accel_ms2,
+        "long_jerk": long_jerk,
+        "lat_jerk": lat_jerk,
         "nearby_vehicles": nearby_count,
-        "overtook":        overtook,
-        "lane_changed":    lane_changed,
+        "overtook": overtook,
+        "lane_changed": lane_changed,
     }
