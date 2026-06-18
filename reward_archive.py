@@ -8,22 +8,82 @@ Each entry:
     "generation"   : int          — generation index (0-based)
     "reward_code"  : str          — full Python source of compute_reward()
     "metrics"      : dict         — evaluation metrics after PPO training
-    "fitness"      : float        — scalar fitness score
+    "fitness"      : float        — scalar fitness score  ∈ [0, 1]
     "critique"     : str          — LLM critique of this reward
     "timestamp"    : str          — ISO-8601 creation time
   }
 
-Fitness function (scalar ∈ [0, ∞)):
-  fitness = (
-      w_speed    * mean_speed_norm       +
-      w_overtake * overtake_rate_norm    +
-      w_lane     * lane_efficiency       +
-      w_safety   * (1 - collision_rate)  +
-      w_complete * completion_rate
-  ) * collision_penalty
+═══════════════════════════════════════════════════════════════════════════════
+FITNESS FUNCTION  (v2 — redesigned)
+═══════════════════════════════════════════════════════════════════════════════
 
-  where collision_penalty = exp(-5 * collision_rate)
-  (sharp drop toward zero for high crash rates)
+DESIGN GOALS
+────────────
+  1. Crash-free driving is a hard prerequisite, not just one weighted term.
+     A 100 % crash rate must produce near-zero fitness regardless of speed.
+  2. Speed must be rewarded only above a meaningful threshold (20 m/s).
+     Low-speed "safe" driving must score WORSE than fast driving with some
+     crashes — the old exp(-5·crash) formula gave virtually the same ~0.007
+     score to every generation when crash_rate ≈ 1.0, blinding the LLM.
+  3. Each behavioural dimension (speed, overtaking, comfort, completion) is
+     normalised to [0, 1] independently before weighting so the weights have
+     an intuitive, comparable interpretation.
+  4. The final score is always in [0, 1] so fitness values across generations
+     are directly comparable and the LLM gets a clear gradient to follow.
+
+FORMULA
+───────
+  Per-component scores (all ∈ [0, 1]):
+
+    speed_score    = clip((mean_speed - SPEED_MIN) / (SPEED_REF - SPEED_MIN), 0, 1)
+                     ^^ zero below 20 m/s, 1.0 at 30 m/s, capped at 1
+
+    overtake_score = min(1, mean_overtakes / OVERTAKE_REF)
+                     ^^ 1.0 at ≥10 overtakes/episode
+
+    comfort_score  = exp(-COMFORT_K · mean_long_jerk)
+                     ^^ exponential decay: 1.0 at jerk=0, ≈0.37 at jerk=1, ≈0.02 at jerk=4
+
+    ttc_score      = clip(mean_ttc / TTC_SAFE, 0, 1)
+                     ^^ 1.0 when TTC ≥ 5 s (safe headway), 0 when tailgating
+
+    completion_score = completion_rate   (fraction of episodes without crash)
+
+  Weighted combination:
+
+    base = w_speed    · speed_score
+         + w_overtake · overtake_score
+         + w_comfort  · comfort_score
+         + w_ttc      · ttc_score
+         + w_complete · completion_score
+
+  Safety gate — two-stage penalty:
+
+    Stage 1 (soft gate): if crash_rate > CRASH_THRESHOLD (0.30):
+        safety_factor = exp(-CRASH_K_SOFT · (crash_rate - CRASH_THRESHOLD))
+        ^^ gentle slope for crash_rate 0–30 %, then sharp drop above 30 %
+
+    Stage 2 (hard gate): if crash_rate > CRASH_HARD_LIMIT (0.80):
+        safety_factor *= HARD_PENALTY_SCALE   (= 0.10)
+        ^^ an extra 10× suppression for catastrophically unsafe agents,
+           ensuring crash_rate ≈ 1.0 never scores above ~0.01
+
+    fitness = clip(base · safety_factor, 0, 1)
+
+  This gives a smooth, navigable fitness landscape:
+    • crash_rate = 0.00  → safety_factor = 1.00  (no penalty)
+    • crash_rate = 0.30  → safety_factor = 1.00  (threshold not exceeded)
+    • crash_rate = 0.50  → safety_factor ≈ 0.37
+    • crash_rate = 0.80  → safety_factor ≈ 0.05  (soft gate only)
+    • crash_rate = 1.00  → safety_factor ≈ 0.005 (soft + hard gate)
+
+WEIGHTS
+───────
+  w_speed    = 0.35   high speed is the primary objective
+  w_overtake = 0.25   active overtaking rewards skill
+  w_comfort  = 0.15   smooth driving (jerk)
+  w_ttc      = 0.10   safe headway maintenance
+  w_complete = 0.15   episode completion (surrogate for crash-free rate)
 
 RAG-style retrieval
 ───────────────────
@@ -42,63 +102,158 @@ from typing import Any
 ARCHIVE_FILE = "reward_archive.json"
 
 # ── Fitness weights ────────────────────────────────────────────────────────────
-_FITNESS_WEIGHTS = {
-    "w_speed":    0.30,   # mean speed contribution
-    "w_overtake": 0.25,   # overtaking rate
-    "w_lane":     0.15,   # lane efficiency (steps / max_steps)
-    "w_safety":   0.20,   # crash-free rate
-    "w_complete": 0.10,   # episode completion
+_W = {
+    "w_speed":    0.35,
+    "w_overtake": 0.25,
+    "w_comfort":  0.15,
+    "w_ttc":      0.10,
+    "w_complete": 0.15,
 }
+assert abs(sum(_W.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
 
-# Normalisation references
-_SPEED_REF    = 30.0   # m/s — speed at which speed score = 1.0
-_OVERTAKE_REF = 10.0   # overtakes per episode at which overtake score = 1.0
+# ── Component normalisation references ────────────────────────────────────────
+_SPEED_MIN    = 20.0    # m/s — speed below this earns zero speed score
+_SPEED_REF    = 30.0    # m/s — speed at which speed_score reaches 1.0
+_OVERTAKE_REF = 10.0    # overtakes/episode → overtake_score = 1.0
+_COMFORT_K    = 0.5     # exponential decay rate for jerk penalty
+_TTC_SAFE     = 5.0     # seconds — TTC above which ttc_score = 1.0
+
+# ── Safety gate parameters ─────────────────────────────────────────────────────
+_CRASH_THRESHOLD    = 0.30   # crash_rate below this → no soft-gate penalty
+_CRASH_K_SOFT       = 5.0    # soft-gate decay rate (above threshold)
+_CRASH_HARD_LIMIT   = 0.80   # crash_rate above this triggers the hard gate
+_HARD_PENALTY_SCALE = 0.10   # additional ×0.10 multiplier for catastrophic agents
 
 
-# ── Fitness computation ────────────────────────────────────────────────────────
+# ── Component scorers (each returns float ∈ [0, 1]) ──────────────────────────
+
+def _speed_score(mean_speed: float) -> float:
+    """
+    Zero below SPEED_MIN, linear ramp to 1.0 at SPEED_REF.
+    Capped at 1.0 above SPEED_REF.
+
+    Rationale: an agent that drives at 14 m/s must score 0 on this
+    component — not 0.47 as in the old formula starting from 0 m/s.
+    """
+    span = max(_SPEED_REF - _SPEED_MIN, 1e-6)
+    return float(max(0.0, min(1.0, (mean_speed - _SPEED_MIN) / span)))
+
+
+def _overtake_score(mean_overtakes: float) -> float:
+    """Linear, capped at OVERTAKE_REF overtakes/episode."""
+    return float(min(1.0, mean_overtakes / max(_OVERTAKE_REF, 1e-6)))
+
+
+def _comfort_score(mean_long_jerk: float) -> float:
+    """
+    Exponential decay on mean longitudinal jerk magnitude.
+    score = exp(-COMFORT_K * jerk)
+      jerk = 0   → 1.00  (perfectly smooth)
+      jerk = 1   → 0.61
+      jerk = 2   → 0.37
+      jerk = 4   → 0.14
+    """
+    jerk = max(0.0, float(mean_long_jerk))
+    return float(math.exp(-_COMFORT_K * jerk))
+
+
+def _ttc_score(mean_ttc: float) -> float:
+    """
+    Linear ramp from 0 (TTC=0) to 1.0 (TTC ≥ TTC_SAFE).
+    Measures average headway safety across the episode.
+    """
+    return float(min(1.0, max(0.0, mean_ttc / _TTC_SAFE)))
+
+
+def _safety_gate(crash_rate: float) -> float:
+    """
+    Two-stage multiplicative safety gate.
+
+    Stage 1 — soft gate (activates above CRASH_THRESHOLD):
+      Exponential decay so a 50 % crash rate ≈ halves the score.
+
+    Stage 2 — hard gate (activates above CRASH_HARD_LIMIT):
+      Additional ×HARD_PENALTY_SCALE suppression for catastrophic agents.
+      Ensures crash_rate ≈ 1.0 always scores near zero.
+
+    Returns a multiplier ∈ (0, 1].
+    """
+    cr = float(crash_rate)
+
+    # Stage 1: soft gate
+    if cr <= _CRASH_THRESHOLD:
+        factor = 1.0
+    else:
+        excess = cr - _CRASH_THRESHOLD
+        factor = math.exp(-_CRASH_K_SOFT * excess)
+
+    # Stage 2: hard gate
+    if cr > _CRASH_HARD_LIMIT:
+        factor *= _HARD_PENALTY_SCALE
+
+    return float(factor)
+
+
+# ── Public fitness function ───────────────────────────────────────────────────
 
 def compute_fitness(metrics: dict[str, Any]) -> float:
     """
-    Computes a scalar fitness score from evaluation metrics.
+    Computes a scalar fitness score in [0, 1] from evaluation metrics.
 
     Parameters
     ──────────
     metrics : dict with keys from evaluate_agent() output:
-        mean_speed      float   m/s
-        crash_rate      float   [0,1]
-        mean_overtakes  float   overtakes/episode
-        mean_steps      float   steps/episode
-        max_steps       int     episode step limit (default 300)
-        completion_rate float   fraction of episodes not ending in crash
+        mean_speed       float   m/s
+        crash_rate       float   [0, 1]
+        mean_overtakes   float   overtakes/episode
+        completion_rate  float   fraction of episodes not ending in crash
+        mean_long_jerk   float   mean |longitudinal jerk| m/s³
+        mean_ttc         float   mean time-to-collision [s]
 
-    Returns fitness ∈ [0, 1+] (uncapped, but typically 0–1).
+    Returns
+    ───────
+    fitness : float ∈ [0, 1]
+        Higher is better. Returns 0.0 if all metrics are missing/zero.
+
+    Fitness landscape examples
+    ──────────────────────────
+    Scenario                              fitness (approx)
+    ────────────────────────────────────  ────────────────
+    Perfect: 30 m/s, 0 crash, 10 ot      0.97
+    Good:    25 m/s, 5% crash, 5 ot      0.72
+    Mediocre: 22 m/s, 30% crash, 2 ot   0.38
+    Bad (current): 14 m/s, 100% crash    0.006
+    Stationary: 5 m/s, 0 crash, 0 ot     0.15
     """
     crash_rate      = float(metrics.get("crash_rate",      0.5))
     mean_speed      = float(metrics.get("mean_speed",       0.0))
     mean_overtakes  = float(metrics.get("mean_overtakes",   0.0))
-    mean_steps      = float(metrics.get("mean_steps",       0.0))
-    max_steps       = float(metrics.get("max_steps",      300.0))
+    mean_long_jerk  = float(metrics.get("mean_long_jerk",   0.0))
+    mean_ttc        = float(metrics.get("mean_ttc",        30.0))
     completion_rate = float(metrics.get("completion_rate",  0.5))
 
-    # Component scores ∈ [0, 1]
-    speed_score    = min(1.0, mean_speed / max(_SPEED_REF, 1.0))
-    overtake_score = min(1.0, mean_overtakes / _OVERTAKE_REF)
-    lane_score     = min(1.0, mean_steps / max(max_steps, 1.0))
-    safety_score   = 1.0 - crash_rate
-    complete_score = completion_rate
+    # ── Component scores ─────────────────────────────────────────────────────
+    s_speed    = _speed_score(mean_speed)
+    s_overtake = _overtake_score(mean_overtakes)
+    s_comfort  = _comfort_score(mean_long_jerk)
+    s_ttc      = _ttc_score(mean_ttc)
+    s_complete = float(max(0.0, min(1.0, completion_rate)))
 
-    weighted = (
-        _FITNESS_WEIGHTS["w_speed"]    * speed_score    +
-        _FITNESS_WEIGHTS["w_overtake"] * overtake_score +
-        _FITNESS_WEIGHTS["w_lane"]     * lane_score     +
-        _FITNESS_WEIGHTS["w_safety"]   * safety_score   +
-        _FITNESS_WEIGHTS["w_complete"] * complete_score
+    # ── Weighted base score ───────────────────────────────────────────────────
+    base = (
+        _W["w_speed"]    * s_speed    +
+        _W["w_overtake"] * s_overtake +
+        _W["w_comfort"]  * s_comfort  +
+        _W["w_ttc"]      * s_ttc      +
+        _W["w_complete"] * s_complete
     )
 
-    # Sharp exponential penalty for high crash rates
-    collision_penalty = math.exp(-5.0 * crash_rate)
+    # ── Safety gate ───────────────────────────────────────────────────────────
+    gate = _safety_gate(crash_rate)
 
-    return round(weighted * collision_penalty, 4)
+    fitness = float(max(0.0, min(1.0, base * gate)))
+
+    return round(fitness, 4)
 
 
 # ── Archive class ─────────────────────────────────────────────────────────────
@@ -106,7 +261,6 @@ def compute_fitness(metrics: dict[str, Any]) -> float:
 class RewardArchive:
     """
     Persistent store for reward programs, metrics, fitness, and critiques.
-
     All writes are atomic (write-to-tmp then rename).
     """
 
@@ -115,7 +269,7 @@ class RewardArchive:
         self.entries: list[dict[str, Any]] = []
         self._load()
 
-    # ── persistence ───────────────────────────────────────────────────────────
+    # ── Persistence ──────────────────────────────────────────────────────────
 
     def _load(self) -> None:
         if not os.path.exists(self.path):
@@ -145,7 +299,7 @@ class RewardArchive:
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, self.path)
 
-    # ── CRUD ──────────────────────────────────────────────────────────────────
+    # ── CRUD ─────────────────────────────────────────────────────────────────
 
     def add_entry(
         self,
@@ -155,7 +309,6 @@ class RewardArchive:
     ) -> dict[str, Any]:
         """
         Adds a new reward entry. Computes fitness automatically.
-
         Returns the new entry dict.
         """
         fitness = compute_fitness(metrics)
@@ -173,7 +326,8 @@ class RewardArchive:
             f"[archive] Generation {entry['generation']} saved | "
             f"fitness={fitness:.4f} | "
             f"crash_rate={metrics.get('crash_rate', '?'):.1%} | "
-            f"speed={metrics.get('mean_speed', 0):.1f} m/s"
+            f"speed={metrics.get('mean_speed', 0):.1f} m/s | "
+            f"overtakes={metrics.get('mean_overtakes', 0):.1f}/ep"
         )
         return entry
 
@@ -184,7 +338,10 @@ class RewardArchive:
                 entry["critique"] = critique
                 self.save()
                 return
-        print(f"[archive] Warning: generation {generation} not found for critique update")
+        print(
+            f"[archive] Warning: generation {generation} not found "
+            "for critique update"
+        )
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
 
@@ -206,7 +363,6 @@ class RewardArchive:
     def format_for_llm(self, k: int = 3) -> str:
         """
         Formats the top-k entries as a human-readable string for LLM context.
-
         Used by RewardDesigner to provide RAG-style memory.
         """
         top = self.get_top_k(k)
@@ -214,22 +370,35 @@ class RewardArchive:
             return "No previous reward programs in archive."
 
         lines = ["=== TOP REWARD PROGRAMS FROM ARCHIVE ===\n"]
-        for i, entry in enumerate(top):
+        for entry in top:
             m = entry["metrics"]
             lines.append(
                 f"--- Generation {entry['generation']} "
                 f"(fitness={entry['fitness']:.4f}) ---\n"
                 f"Metrics:\n"
-                f"  mean_speed     : {m.get('mean_speed', 0):.2f} m/s\n"
-                f"  crash_rate     : {m.get('crash_rate', 0):.1%}\n"
-                f"  mean_overtakes : {m.get('mean_overtakes', 0):.2f}/ep\n"
+                f"  mean_speed     : {m.get('mean_speed',      0):.2f} m/s\n"
+                f"  crash_rate     : {m.get('crash_rate',      0):.1%}\n"
+                f"  mean_overtakes : {m.get('mean_overtakes',  0):.2f}/ep\n"
+                f"  mean_long_jerk : {m.get('mean_long_jerk',  0):.3f} m/s³\n"
+                f"  mean_ttc       : {m.get('mean_ttc',        0):.2f} s\n"
                 f"  completion_rate: {m.get('completion_rate', 0):.1%}\n"
-                f"  mean_steps     : {m.get('mean_steps', 0):.0f}\n"
+                f"  mean_steps     : {m.get('mean_steps',      0):.0f}\n"
+            )
+            # Component breakdown — helps LLM see WHY this program scored well
+            cr = m.get("crash_rate", 0.5)
+            lines.append(
+                f"Fitness breakdown:\n"
+                f"  speed_score    : {_speed_score(m.get('mean_speed', 0)):.3f}\n"
+                f"  overtake_score : {_overtake_score(m.get('mean_overtakes', 0)):.3f}\n"
+                f"  comfort_score  : {_comfort_score(m.get('mean_long_jerk', 0)):.3f}\n"
+                f"  ttc_score      : {_ttc_score(m.get('mean_ttc', 30)):.3f}\n"
+                f"  safety_gate    : {_safety_gate(cr):.3f}\n"
             )
             if entry.get("critique"):
                 lines.append(f"Critique:\n{entry['critique']}\n")
-
-            lines.append(f"Reward Code:\n```python\n{entry['reward_code']}\n```\n")
+            lines.append(
+                f"Reward Code:\n```python\n{entry['reward_code']}\n```\n"
+            )
 
         return "\n".join(lines)
 
@@ -242,6 +411,7 @@ class RewardArchive:
         if entry is None:
             return None
         m = entry["metrics"]
+        cr = m.get("crash_rate", 0.5)
         return (
             f"Generation {entry['generation']}\n"
             f"Reward Code:\n```python\n{entry['reward_code']}\n```\n\n"
@@ -256,6 +426,14 @@ class RewardArchive:
             f"  mean_lat_jerk   : {m.get('mean_lat_jerk',   0):.3f} m/s³\n"
             f"  mean_accel      : {m.get('mean_accel',      0):.3f} m/s²\n"
             f"  fitness         : {entry['fitness']:.4f}\n"
+            f"\nFitness breakdown:\n"
+            f"  speed_score     : {_speed_score(m.get('mean_speed', 0)):.3f}  "
+            f"(zero below {_SPEED_MIN} m/s)\n"
+            f"  overtake_score  : {_overtake_score(m.get('mean_overtakes', 0)):.3f}\n"
+            f"  comfort_score   : {_comfort_score(m.get('mean_long_jerk', 0)):.3f}\n"
+            f"  ttc_score       : {_ttc_score(m.get('mean_ttc', 30)):.3f}\n"
+            f"  safety_gate     : {_safety_gate(cr):.3f}  "
+            f"({'HARD gate active' if cr > _CRASH_HARD_LIMIT else 'soft gate' if cr > _CRASH_THRESHOLD else 'no penalty'})\n"
         )
 
     # ── Stats ─────────────────────────────────────────────────────────────────
@@ -268,5 +446,40 @@ class RewardArchive:
         return (
             f"Archive: {len(self.entries)} generations | "
             f"best fitness={best['fitness']:.4f} (gen {best['generation']}) | "
-            f"avg fitness={sum(fitnesses)/len(fitnesses):.4f}"
+            f"avg fitness={sum(fitnesses)/len(fitnesses):.4f} | "
+            f"speed range: "
+            f"{min(e['metrics'].get('mean_speed',0) for e in self.entries):.1f}"
+            f"–{max(e['metrics'].get('mean_speed',0) for e in self.entries):.1f} m/s"
         )
+
+
+# ── Quick self-test ───────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("=== Fitness Function Self-Test ===\n")
+
+    scenarios = [
+        ("Perfect agent",    {"mean_speed": 30.0, "crash_rate": 0.00, "mean_overtakes": 10.0, "mean_long_jerk": 0.5, "mean_ttc": 8.0,  "completion_rate": 1.00}),
+        ("Good agent",       {"mean_speed": 25.0, "crash_rate": 0.05, "mean_overtakes":  5.0, "mean_long_jerk": 1.0, "mean_ttc": 6.0,  "completion_rate": 0.95}),
+        ("Mediocre agent",   {"mean_speed": 22.0, "crash_rate": 0.30, "mean_overtakes":  2.0, "mean_long_jerk": 2.0, "mean_ttc": 4.0,  "completion_rate": 0.70}),
+        ("Current (bad)",    {"mean_speed": 14.0, "crash_rate": 1.00, "mean_overtakes": 30.0, "mean_long_jerk": 1.5, "mean_ttc": 2.0,  "completion_rate": 0.00}),
+        ("Stationary/safe",  {"mean_speed":  5.0, "crash_rate": 0.00, "mean_overtakes":  0.0, "mean_long_jerk": 0.1, "mean_ttc": 30.0, "completion_rate": 1.00}),
+        ("Fast but crashy",  {"mean_speed": 28.0, "crash_rate": 0.50, "mean_overtakes":  8.0, "mean_long_jerk": 1.5, "mean_ttc": 3.5,  "completion_rate": 0.50}),
+        ("Old gen 8 (best)", {"mean_speed": 11.6, "crash_rate": 0.90, "mean_overtakes": 35.0, "mean_long_jerk": 1.2, "mean_ttc": 1.5,  "completion_rate": 0.10}),
+    ]
+
+    print(f"{'Scenario':<22} {'fitness':>8}  {'speed_s':>7}  {'overt_s':>7}  "
+          f"{'comf_s':>7}  {'ttc_s':>7}  {'gate':>7}")
+    print("─" * 85)
+
+    for name, m in scenarios:
+        f  = compute_fitness(m)
+        ss = _speed_score(m["mean_speed"])
+        os = _overtake_score(m["mean_overtakes"])
+        cs = _comfort_score(m["mean_long_jerk"])
+        ts = _ttc_score(m["mean_ttc"])
+        g  = _safety_gate(m["crash_rate"])
+        print(f"{name:<22} {f:>8.4f}  {ss:>7.3f}  {os:>7.3f}  "
+              f"{cs:>7.3f}  {ts:>7.3f}  {g:>7.3f}")
+
+    print("\n✓ All scenarios computed successfully.")
