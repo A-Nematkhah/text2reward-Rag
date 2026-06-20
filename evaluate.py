@@ -48,6 +48,12 @@ ENV_CONFIG = {
     "lane_change_reward": 0.0,
 }
 
+# highway-env normalises vx into [-1, 1] using the range [-2*MAX_SPEED, 2*MAX_SPEED]
+# with Vehicle.MAX_SPEED = 40.0 m/s, so the de-normalisation factor is 2*40 = 80,
+# matching the corrected _SPEED_SCALE in reward_wrapper.py. This used to be 40.0
+# here too, which silently halved every reported mean_speed.
+_SPEED_SCALE = 80.0
+
 
 def make_eval_env(
     use_shaped: bool,
@@ -91,7 +97,7 @@ def run_episode(model, env, deterministic: bool = True, render: bool = False) ->
             crashed = True
 
         vx_raw = float(obs[0][3])
-        speed_ms = max(0.0, vx_raw * 40.0) if abs(vx_raw) <= 1.5 else max(0.0, vx_raw)
+        speed_ms = max(0.0, vx_raw * _SPEED_SCALE) if abs(vx_raw) <= 1.5 else max(0.0, vx_raw)
         speed_sum += speed_ms
 
         # collect from episode_stats if available
