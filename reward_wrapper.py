@@ -58,11 +58,17 @@ _IDX_VX = 3
 _IDX_VY = 4
 
 # ── Physical constants ────────────────────────────────────────────────────────
-_SPEED_SCALE = 40.0
+# highway-env normalises vx into [-1, 1] using the range [-2*MAX_SPEED, 2*MAX_SPEED]
+# and x into [-1, 1] using the range [-5*MAX_SPEED, 5*MAX_SPEED], where
+# Vehicle.MAX_SPEED = 40.0 m/s (see highway_env.envs.common.observation.KinematicObservation).
+# So the correct de-normalisation factors are 2*40=80 for speed and 5*40=200 for
+# distance — NOT 40 and 100. (Previously these were halved, which silently
+# capped every speed/distance signal at half its true value.)
+_SPEED_SCALE = 80.0
 _LANE_WIDTH = 4.0
 _DT = 1.0 / 5.0
 _PRESENCE_TH = 0.5
-_DIST_SCALE = 100.0
+_DIST_SCALE = 200.0
 _DIST_MAX = 200.0
 
 REWARD_PROGRAM_PATH = "reward_program.py"
@@ -317,7 +323,7 @@ def _parse_full_obs(
     prev_trailing: set[tuple[int, int]],
     density_radius_m: float,
 ) -> dict:
-    """Unchanged from original — parses KinematicObservation into state signals."""
+    """Parses KinematicObservation into state signals."""
     ego = obs[0]
 
     vx_raw = float(ego[_IDX_VX])
@@ -330,7 +336,7 @@ def _parse_full_obs(
 
     y_raw = float(ego[_IDX_Y])
     if normalised:
-        lane = int(np.clip(round(y_raw * (num_lanes - 1)), 0, num_lanes - 1))
+        lane = int(np.clip(round(y_raw * num_lanes), 0, num_lanes - 1))
     else:
         lane = int(np.clip(round(y_raw / _LANE_WIDTH), 0, num_lanes - 1))
 
