@@ -71,6 +71,34 @@ _PRESENCE_TH = 0.5
 _DIST_SCALE = 200.0
 _DIST_MAX = 200.0
 
+# ── Overtake-tracking constants ───────────────────────────────────────────────
+# Vehicles are tracked across steps by nearest-neighbour matching in
+# (relative longitudinal distance, relative speed) space, gated by maximum
+# plausible per-step jumps in each dimension. At policy_frequency=5 Hz a real
+# vehicle cannot teleport, so a match candidate whose dx or vx changed by more
+# than these bounds in one step is treated as a *different* vehicle rather
+# than the same one re-detected — this is what prevents identity swaps in
+# dense traffic (up to ~30 vehicles, ~10 visible in the observation).
+#   _TRACK_MAX_DX_JUMP : at 5 Hz, even a large relative speed (~40 m/s closing)
+#                        only covers 8 m per step, so an 8 m jump comfortably
+#                        bounds normal motion/IDM jitter while still rejecting
+#                        a match against a different, similarly-positioned car.
+#   _TRACK_MAX_VX_JUMP : relative speed cannot swing by more than a few m/s in
+#                        1/5 s under normal driving dynamics (no instantaneous
+#                        speed changes), so 6 m/s safely bounds real jitter
+#                        while rejecting a mismatched vehicle with a very
+#                        different relative speed.
+_TRACK_MAX_DX_JUMP = 8.0  # metres
+_TRACK_MAX_VX_JUMP = 6.0  # m/s
+# Only vehicles in the ego's lane or an immediately adjacent lane are
+# candidates for "being overtaken" — a car three lanes over is not something
+# the ego is meaningfully passing, even if it is technically ahead in x.
+_OVERTAKE_LANE_RANGE = 1
+# A tracked vehicle that hasn't been seen (matched) for this many consecutive
+# steps is dropped from tracking, so stale tracks don't linger and falsely
+# match a much-later, unrelated detection at a similar (dx, vx).
+_TRACK_MAX_MISSES = 3
+
 REWARD_PROGRAM_PATH = "reward_program.py"
 
 
@@ -174,7 +202,11 @@ class LLMRewardWrapper(gym.Wrapper):
         self._prev_accel_ms2: float = 0.0
         self._prev_lat_vel_ms: float = 0.0
         self._prev_lane: int | None = None
-        self._prev_trailing: set[tuple[int, int]] = set()
+        # Persistent nearest-neighbour vehicle tracker for overtake detection.
+        # See _match_tracks() / _update_overtake_tracks() for the tracking
+        # scheme. Each track is a dict: {dx, vx, misses, overtaken}.
+        self._overtake_tracks: list[dict] = []
+        self._next_track_id: int = 0
 
     def reset(self, **kwargs):
         self._reset_episode_accum()
@@ -198,7 +230,8 @@ class LLMRewardWrapper(gym.Wrapper):
             prev_accel_ms2=self._prev_accel_ms2,
             prev_lat_vel_ms=self._prev_lat_vel_ms,
             prev_lane=self._prev_lane,
-            prev_trailing=self._prev_trailing,
+            overtake_tracks=self._overtake_tracks,
+            next_track_id=self._next_track_id,
             density_radius_m=self._density_radius,
         )
 
@@ -232,7 +265,8 @@ class LLMRewardWrapper(gym.Wrapper):
         self._prev_accel_ms2 = parsed["accel_ms2"]
         self._prev_lat_vel_ms = parsed["lat_vel_ms"]
         self._prev_lane = parsed["lane"]
-        self._prev_trailing = parsed["trailing_ids"]
+        self._overtake_tracks = parsed["overtake_tracks"]
+        self._next_track_id = parsed["next_track_id"]
 
         # Accumulate episode statistics
         self._ep_env_reward += env_reward
@@ -310,6 +344,157 @@ def _direct_execute(reward_fn, state: dict) -> float:
 execute_reward.__wrapped__ = _direct_execute
 
 
+# ── Overtake tracking: nearest-neighbour vehicle identity across steps ────────
+
+
+def _match_track(
+    tracks: list[dict],
+    dx_m: float,
+    vx_rel_ms: float,
+    used: set[int],
+) -> int | None:
+    """
+    Finds the best matching existing track for a new detection at
+    (dx_m, vx_rel_ms), gated by the maximum plausible per-step jump in each
+    dimension (_TRACK_MAX_DX_JUMP, _TRACK_MAX_VX_JUMP).
+
+    Among all tracks within both gates, picks the nearest in normalised
+    (dx, vx) space — this is the "nearest neighbour, gated by plausibility"
+    matching scheme: a vehicle can't have moved further than physically
+    possible in 1/5 s, so any track outside the gate is necessarily a
+    different car and is excluded from the candidate set entirely, rather
+    than merely being penalised in the distance metric.
+
+    `used` holds indices already claimed by another detection this step, so
+    two different new detections cannot both match the same stale track.
+
+    Returns the matching track's index in `tracks`, or None if no track is
+    within the gate (i.e. this is a newly-appeared vehicle).
+    """
+    best_idx: int | None = None
+    best_score = float("inf")
+
+    for idx, tr in enumerate(tracks):
+        if idx in used:
+            continue
+        ddx = abs(dx_m - tr["dx"])
+        dvx = abs(vx_rel_ms - tr["vx"])
+        if ddx > _TRACK_MAX_DX_JUMP or dvx > _TRACK_MAX_VX_JUMP:
+            continue
+        # Normalised combined distance so dx (metres) and vx (m/s) contribute
+        # comparably to the nearest-neighbour score.
+        score = (ddx / _TRACK_MAX_DX_JUMP) ** 2 + (dvx / _TRACK_MAX_VX_JUMP) ** 2
+        if score < best_score:
+            best_score = score
+            best_idx = idx
+
+    return best_idx
+
+
+def _update_overtake_tracks(
+    tracks: list[dict],
+    next_track_id: int,
+    detections: list[tuple[float, float]],
+) -> tuple[list[dict], int, bool]:
+    """
+    Advances the persistent vehicle tracker by one step and detects overtakes.
+
+    Parameters
+    ──────────
+    tracks         : tracks from the previous step, each a dict with keys
+                      {id, dx, vx, misses, overtaken}. `dx` is the relative
+                      longitudinal distance to ego (positive = ahead),
+                      `vx` is the relative speed, `overtaken` marks a track
+                      that has already fired its one-shot overtake event
+                      since it was last ahead of the ego.
+    next_track_id  : monotonically increasing counter for new track IDs.
+    detections     : this step's qualifying (same-lane / adjacent-lane)
+                      vehicle detections as (dx_m, vx_rel_ms) pairs.
+
+    Returns
+    ───────
+    (new_tracks, new_next_track_id, overtook)
+
+    Matching is nearest-neighbour gated by maximum plausible per-step jumps
+    (_match_track), so the same physical vehicle keeps the same track id
+    across steps despite ordinary IDM jitter, while two physically distinct
+    vehicles in dense traffic are not merged into one track.
+
+    An overtake fires (exactly once per real pass) when a track's dx
+    transitions from > 0 (ahead) to <= 0 (behind/level) between consecutive
+    matched steps, gated by `overtaken` so a vehicle sitting behind the ego
+    across many subsequent steps doesn't keep re-firing. The gate resets only
+    if the vehicle genuinely goes back ahead (dx > 0 again), which allows a
+    legitimate double-overtake (re-merge ahead, then get passed again).
+    """
+    used: set[int] = set()
+    new_tracks: list[dict] = []
+    overtook = False
+
+    for dx_m, vx_rel_ms in detections:
+        match_idx = _match_track(tracks, dx_m, vx_rel_ms, used)
+
+        if match_idx is None:
+            # Newly appeared vehicle — start a fresh track. No overtake can
+            # fire on a track's first sighting since there is no prior dx to
+            # compare against (and a vehicle entering already-behind is not
+            # an observed passing event, just a vehicle becoming visible).
+            new_tracks.append(
+                {
+                    "id": next_track_id,
+                    "dx": dx_m,
+                    "vx": vx_rel_ms,
+                    "misses": 0,
+                    "overtaken": dx_m <= 0.0,
+                }
+            )
+            next_track_id += 1
+            continue
+
+        used.add(match_idx)
+        prev = tracks[match_idx]
+
+        # Sign-change detection: ahead (>0) last step, behind/level (<=0) now,
+        # and not already counted for this pass (prev["overtaken"] False).
+        if prev["dx"] > 0.0 and dx_m <= 0.0 and not prev["overtaken"]:
+            overtook = True
+            new_overtaken = True
+        elif dx_m > 0.0:
+            # Vehicle is ahead again — re-arm so a genuine future re-pass
+            # (e.g. it re-merges ahead after a lane change) can fire again.
+            new_overtaken = False
+        else:
+            # Still behind/level and already counted — stay armed-off so we
+            # don't recount the same pass on subsequent steps.
+            new_overtaken = prev["overtaken"]
+
+        new_tracks.append(
+            {
+                "id": prev["id"],
+                "dx": dx_m,
+                "vx": vx_rel_ms,
+                "misses": 0,
+                "overtaken": new_overtaken,
+            }
+        )
+
+    # Carry forward unmatched tracks (vehicle temporarily out of the
+    # qualifying lane window or briefly undetected) up to _TRACK_MAX_MISSES
+    # steps, so a one-frame dropout doesn't fragment a track's identity and
+    # spuriously re-fire an overtake. Beyond that, the track is dropped.
+    for idx, tr in enumerate(tracks):
+        if idx in used:
+            continue
+        misses = tr["misses"] + 1
+        if misses > _TRACK_MAX_MISSES:
+            continue
+        carried = dict(tr)
+        carried["misses"] = misses
+        new_tracks.append(carried)
+
+    return new_tracks, next_track_id, overtook
+
+
 # ── Full observation parser ───────────────────────────────────────────────────
 
 
@@ -320,7 +505,8 @@ def _parse_full_obs(
     prev_accel_ms2: float,
     prev_lat_vel_ms: float,
     prev_lane: int | None,
-    prev_trailing: set[tuple[int, int]],
+    overtake_tracks: list[dict],
+    next_track_id: int,
     density_radius_m: float,
 ) -> dict:
     """Parses KinematicObservation into state signals."""
@@ -346,7 +532,11 @@ def _parse_full_obs(
     front_vx_ms = speed_ms
     nearby_count = 0
 
-    current_trailing: set[tuple[int, int]] = set()
+    # Candidate detections for overtake tracking: only vehicles in the ego's
+    # lane or an immediately adjacent lane (_OVERTAKE_LANE_RANGE) are
+    # relevant to "being overtaken" — a car several lanes over is excluded
+    # even though it may be technically ahead in x.
+    overtake_detections: list[tuple[float, float]] = []
 
     for i in range(1, len(obs)):
         row = obs[i]
@@ -369,9 +559,11 @@ def _parse_full_obs(
         if abs(dx_m) < density_radius_m and abs(dy_m) < _LANE_WIDTH * 1.5:
             nearby_count += 1
 
-        if dx_m > 0.0:
-            fp = (int(dx_m / 5.0), int(veh_vx_ms / 2.0))
-            current_trailing.add(fp)
+        # Lane-window gate for overtake tracking: same lane or adjacent lane
+        # only (within _OVERTAKE_LANE_RANGE lane-widths of the ego's y).
+        if abs(dy_m) <= _LANE_WIDTH * (_OVERTAKE_LANE_RANGE + 0.5):
+            vx_rel_ms = veh_vx_ms - speed_ms
+            overtake_detections.append((dx_m, vx_rel_ms))
 
     front_dist = float(np.clip(front_dist, 0.0, _DIST_MAX))
     rel_vel_ms = front_vx_ms - speed_ms
@@ -386,12 +578,16 @@ def _parse_full_obs(
     accel_ms2 = 0.0 if prev_speed_ms is None else (speed_ms - prev_speed_ms) / _DT
     long_jerk = (accel_ms2 - prev_accel_ms2) / _DT
     lat_jerk = (lat_vel_ms - prev_lat_vel_ms) / _DT
-    overtook = bool(prev_trailing - current_trailing)
+
+    new_tracks, new_next_track_id, overtook = _update_overtake_tracks(
+        overtake_tracks, next_track_id, overtake_detections
+    )
 
     return {
         "speed_ms": speed_ms,
         "lat_vel_ms": lat_vel_ms,
-        "trailing_ids": current_trailing,
+        "overtake_tracks": new_tracks,
+        "next_track_id": new_next_track_id,
         "lane": lane,
         "front_dist": front_dist,
         "rel_vel_ms": rel_vel_ms,
