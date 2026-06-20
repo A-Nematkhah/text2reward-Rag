@@ -98,6 +98,16 @@ _OVERTAKE_LANE_RANGE = 1
 # steps is dropped from tracking, so stale tracks don't linger and falsely
 # match a much-later, unrelated detection at a similar (dx, vx).
 _TRACK_MAX_MISSES = 3
+# Hysteresis margin for re-arming a track's overtake flag. A vehicle must
+# clear back to dx > _OVERTAKE_REARM_MARGIN (not just dx > 0.0) before it is
+# considered to have genuinely returned ahead of the ego. Without this
+# margin, ordinary jitter for a vehicle riding alongside ego near dx=0
+# (e.g. a same-speed neighbour in an adjacent lane) crosses the dx<=0
+# boundary repeatedly, re-arming and re-firing a "new" overtake on every
+# crossing even though no real pass is occurring. The margin must exceed
+# plausible single-step jitter but stay well inside _TRACK_MAX_DX_JUMP so it
+# doesn't interfere with genuine re-merge-ahead detection.
+_OVERTAKE_REARM_MARGIN = 2.0  # metres
 
 REWARD_PROGRAM_PATH = "reward_program.py"
 
@@ -423,9 +433,13 @@ def _update_overtake_tracks(
     An overtake fires (exactly once per real pass) when a track's dx
     transitions from > 0 (ahead) to <= 0 (behind/level) between consecutive
     matched steps, gated by `overtaken` so a vehicle sitting behind the ego
-    across many subsequent steps doesn't keep re-firing. The gate resets only
-    if the vehicle genuinely goes back ahead (dx > 0 again), which allows a
-    legitimate double-overtake (re-merge ahead, then get passed again).
+    across many subsequent steps doesn't keep re-firing. The gate only
+    resets (re-arms) once the vehicle clears back to dx > _OVERTAKE_REARM_MARGIN
+    — not merely dx > 0.0 — which allows a legitimate double-overtake
+    (re-merge ahead, then get passed again) while preventing ordinary
+    jitter around dx=0 (e.g. a same-speed neighbour riding alongside the
+    ego in an adjacent lane) from re-arming and re-firing on every small
+    crossing of the zero boundary.
     """
     used: set[int] = set()
     new_tracks: list[dict] = []
@@ -459,13 +473,16 @@ def _update_overtake_tracks(
         if prev["dx"] > 0.0 and dx_m <= 0.0 and not prev["overtaken"]:
             overtook = True
             new_overtaken = True
-        elif dx_m > 0.0:
-            # Vehicle is ahead again — re-arm so a genuine future re-pass
-            # (e.g. it re-merges ahead after a lane change) can fire again.
+        elif dx_m > _OVERTAKE_REARM_MARGIN:
+            # Vehicle has genuinely cleared back ahead of the ego (beyond the
+            # hysteresis margin, not just a small jitter blip across dx=0) —
+            # re-arm so a real future re-pass (e.g. it re-merges ahead after
+            # a lane change) can fire again.
             new_overtaken = False
         else:
-            # Still behind/level and already counted — stay armed-off so we
-            # don't recount the same pass on subsequent steps.
+            # Still behind/level, or ahead but within the jitter margin of
+            # dx=0, or already counted — stay armed-off so ordinary noise
+            # near the crossing point doesn't recount the same pass.
             new_overtaken = prev["overtaken"]
 
         new_tracks.append(
