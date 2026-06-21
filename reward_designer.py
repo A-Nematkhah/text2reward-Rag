@@ -56,6 +56,7 @@ import os
 import re
 import time
 import math
+import threading
 from collections import deque
 from typing import Deque
 
@@ -71,6 +72,52 @@ _client: Groq | None = None
 MODEL = "llama-3.3-70b-versatile"
 
 REWARD_PROGRAM_PATH = "reward_program.py"
+
+# Hard wall-clock timeout for every single compute_reward() call made during
+# the smoke test (fixes audit finding #3). The structural AST check already
+# blocks the most obvious DoS vector (a huge literal exponent -- see
+# reward_sandbox._MAX_POW_EXPONENT), but it cannot catch every pathological
+# construct an LLM might still produce within the allowed grammar (e.g. a
+# deeply nested chain of Pow/exp/log operations on values near the bounds of
+# float range). Without a timeout here, such code would hang the MAIN
+# training process (not just a worker) during the repair loop, since
+# _smoke_test_reward_code previously called fn(...) directly with no time
+# bound at all.
+_SMOKE_TEST_TIMEOUT_SEC = 0.5
+
+
+def _call_with_timeout(fn, state: dict, timeout_sec: float = _SMOKE_TEST_TIMEOUT_SEC):
+    """
+    Executes fn(state) under a hard wall-clock timeout, mirroring the same
+    thread-based timeout used by reward_sandbox.execute_reward(). Re-raises
+    whatever exception fn(state) raised (including KeyError, so the existing
+    "wrong state key" repair-loop messaging downstream still works
+    unchanged), or raises TimeoutError if fn does not return in time.
+    """
+    result: list = []
+    exc: list[BaseException] = []
+
+    def _run():
+        try:
+            result.append(fn(state))
+        except Exception as e:  # noqa: BLE001 - intentionally broad, re-raised below
+            exc.append(e)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
+        raise TimeoutError(
+            f"compute_reward timed out after {timeout_sec}s during smoke test "
+            "(possible runaway computation, e.g. a deeply nested/expensive expression)"
+        )
+    if exc:
+        raise exc[0]
+    if not result:
+        raise RuntimeError("compute_reward returned no value during smoke test")
+    return result[0]
+
 
 _STATE_SCHEMA = """\
 State keys available inside compute_reward(state):
@@ -215,7 +262,6 @@ Fix ALL issues and return ONLY the corrected compute_reward(state) function.
 No explanation, no markdown fences.
 """
 
-
 # ── Smoke-test helper ─────────────────────────────────────────────────────────
 
 # Two representative sample states:
@@ -277,8 +323,6 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
     Returns (ok, error_message).  ok=True means all samples ran cleanly.
     """
 
-    # Build a safe execution namespace with the math builtins the generated
-    # code is allowed to use (mirrors the whitelist in reward_sandbox.py).
     def _clip(val, lo, hi):
         return max(lo, min(hi, val))
 
@@ -317,7 +361,6 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
     if fn is None:
         return False, "compute_reward function not found after exec"
 
-    # Execute sample states and record scalar rewards for gate checks.
     rewards: dict[str, float] = {}
     for name, sample in [
         ("normal", _SAMPLE_STATE_NORMAL),
@@ -325,7 +368,7 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
         ("collision", _SAMPLE_STATE_COLLIDED),
     ]:
         try:
-            result = fn(sample)
+            result = _call_with_timeout(fn, sample)
             if not isinstance(result, (int, float)):
                 return False, (
                     f"Runtime error on sample state '{name}': "
@@ -339,6 +382,12 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
                 f"Runtime error on sample state '{name}': KeyError {key} — "
                 f"this key does not exist in the state dict. "
                 f"Valid keys are: {valid_keys}"
+            )
+        except TimeoutError as exc:
+            return False, (
+                f"Timeout on sample state '{name}': {exc}. The reward function "
+                "is too computationally expensive or contains a runaway "
+                "expression -- simplify it (e.g. avoid large/nested exponents)."
             )
         except Exception as exc:
             return False, (f"Runtime error on sample state '{name}': " f"{type(exc).__name__}: {exc}")
@@ -361,42 +410,58 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
     # ── Gate 2: Full Episodic Simulation (Synthetic Trajectories) ────────
     # 1) cautious/steady safe trajectory (40 steps, no collision)
     cautious_return = 0.0
-    for t in range(40):
-        cautious_state = {
-            "speed_ms": 18.0,
-            "front_dist": 50.0,
-            "ttc": 30.0,
-            "rel_vel_ms": 0.0,
-            "lane": 1,
-            "overtook": False,
-            "lane_changed": False,
-            "collided": False,
-            "nearby_vehicles": 1,
-            "accel_ms2": 0.0,
-            "long_jerk": 0.0,
-            "lat_jerk": 0.0,
-        }
-        cautious_return += fn(cautious_state)
+    try:
+        for t in range(40):
+            cautious_state = {
+                "speed_ms": 18.0,
+                "front_dist": 50.0,
+                "ttc": 30.0,
+                "rel_vel_ms": 0.0,
+                "lane": 1,
+                "overtook": False,
+                "lane_changed": False,
+                "collided": False,
+                "nearby_vehicles": 1,
+                "accel_ms2": 0.0,
+                "long_jerk": 0.0,
+                "lat_jerk": 0.0,
+            }
+            cautious_return += _call_with_timeout(fn, cautious_state)
+    except TimeoutError as exc:
+        return False, (
+            f"Timeout during cautious-trajectory smoke test: {exc}. "
+            "Simplify the reward function -- it is too computationally expensive."
+        )
+    except Exception as exc:
+        return False, f"Runtime error during cautious-trajectory smoke test: {type(exc).__name__}: {exc}"
 
     # 2) reckless trajectory: high speed, many lane changes/overtakes, collision at final step
     reckless_return = 0.0
-    for t in range(40):
-        is_last_step = t == 39
-        reckless_state = {
-            "speed_ms": 28.0,
-            "front_dist": 15.0 if not is_last_step else 0.0,
-            "ttc": 2.0 if not is_last_step else 0.0,
-            "rel_vel_ms": -5.0,
-            "lane": t % 3,
-            "overtook": True if (t % 10 == 0 and not is_last_step) else False,
-            "lane_changed": True if (t % 5 == 0 and not is_last_step) else False,
-            "collided": is_last_step,
-            "nearby_vehicles": 4,
-            "accel_ms2": 2.0 if t % 2 == 0 else -2.0,
-            "long_jerk": 1.5,
-            "lat_jerk": 1.0,
-        }
-        reckless_return += fn(reckless_state)
+    try:
+        for t in range(40):
+            is_last_step = t == 39
+            reckless_state = {
+                "speed_ms": 28.0,
+                "front_dist": 15.0 if not is_last_step else 0.0,
+                "ttc": 2.0 if not is_last_step else 0.0,
+                "rel_vel_ms": -5.0,
+                "lane": t % 3,
+                "overtook": True if (t % 10 == 0 and not is_last_step) else False,
+                "lane_changed": True if (t % 5 == 0 and not is_last_step) else False,
+                "collided": is_last_step,
+                "nearby_vehicles": 4,
+                "accel_ms2": 2.0 if t % 2 == 0 else -2.0,
+                "long_jerk": 1.5,
+                "lat_jerk": 1.0,
+            }
+            reckless_return += _call_with_timeout(fn, reckless_state)
+    except TimeoutError as exc:
+        return False, (
+            f"Timeout during reckless-trajectory smoke test: {exc}. "
+            "Simplify the reward function -- it is too computationally expensive."
+        )
+    except Exception as exc:
+        return False, f"Runtime error during reckless-trajectory smoke test: {type(exc).__name__}: {exc}"
 
     # 3) Trajectory fitness condition: safe driving must achieve higher episodic return
     if reckless_return >= cautious_return:
@@ -471,7 +536,7 @@ class RewardDesigner:
                     f"with archive generation {latest_entry['generation']} — "
                     "restoring it from the archive."
                 )
-            self._save_reward_program(latest_entry["reward_code"])
+            self._restore_from_archive_entry(latest_entry)
 
         if self.verbose:
             print(
@@ -480,6 +545,56 @@ class RewardDesigner:
                 f"archive={len(self.archive.entries)} entries | "
                 f"generation={self.generation}"
             )
+
+    def _restore_from_archive_entry(self, entry: dict) -> None:
+        """
+        Restores `reward_program.py` from an archive entry -- but ONLY after
+        re-running the exact same validate + smoke-test pipeline used for
+        freshly-generated code (fixes audit finding #5).
+
+        Why this matters: previously, a disk/archive entry was written
+        straight to `reward_program.py` on restore with no re-validation at
+        all. Combined with the other two issues this audit flagged --
+        `_load_reward_fn` not stripping real builtins (#6) and the per-step
+        execution path bypassing the timeout-protected sandbox (#2) -- a
+        single corrupted or maliciously-modified archive entry on disk would
+        have been: (a) trusted unconditionally, (b) executed with real
+        Python builtins available, (c) with no timeout. That three-step
+        chain is a complete RCE path. Re-validating here closes the first
+        link: even a corrupted archive entry can no longer reach disk/exec
+        without passing the same AST + smoke-test gate as a brand-new LLM
+        generation.
+
+        On validation/smoke-test failure, this does NOT write the untrusted
+        code to disk. It loudly warns and writes a minimal, known-safe
+        placeholder instead, so training can still proceed and the failure
+        is visible rather than silent.
+        """
+        restored_code = entry["reward_code"]
+
+        ok, err = validate_reward_code(restored_code)
+        smoke_ok, smoke_err = (False, "(skipped: structural validation failed)")
+        if ok:
+            smoke_ok, smoke_err = _smoke_test_reward_code(restored_code)
+
+        if ok and smoke_ok:
+            self._save_reward_program(restored_code)
+            return
+
+        reason = err if not ok else smoke_err
+        print(
+            f"[designer] WARNING: archive entry for generation "
+            f"{entry.get('generation', '?')} FAILED re-validation on restore "
+            f"({reason}) — refusing to write it to disk. Falling back to a "
+            "safe placeholder reward program instead."
+        )
+        placeholder = (
+            "def compute_reward(state):\n"
+            '    if state["collided"]:\n'
+            "        return -30.0\n"
+            "    return 0.0  # placeholder: archived code failed re-validation on restore\n"
+        )
+        self._save_reward_program(placeholder)
 
     @property
     def generation(self) -> int:
@@ -644,8 +759,6 @@ class RewardDesigner:
         self._save_reward_program(new_code)
         self._episode_stats.clear()
         return True
-
-    # ── LLM: generate with validation + smoke-test repair loop ───────────────
 
     def _call_generate_with_repair(
         self,
