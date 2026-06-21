@@ -1,13 +1,13 @@
 """
-key_manager.py — مدیریت هوشمند API Key برای Groq
+key_manager.py — Smart API Key Manager for Groq
 --------------------------------------------------
-چند کلید رایگان در api_keys.json بذار.
-هرموقع rate limit خورد، خودش سوئیچ می‌کنه به کلید بعدی.
+Put multiple free keys in api_keys.json.
+Whenever a rate limit occurs, it automatically switches to the next key.
 
-استفاده:
+Usage:
     from key_manager import get_groq_client, call_with_rotation
 
-    client = get_groq_client()   # کلیه فعال فعلی
+    client = get_groq_client()   # current active key
     resp = call_with_rotation(
         model="llama-3.3-70b-versatile",
         messages=[...],
@@ -27,27 +27,27 @@ from typing import Any
 import groq
 from groq import Groq
 
-# ── تنظیمات ──────────────────────────────────────────────────────────────────
+# ── Settings ──────────────────────────────────────────────────────────────────
 _KEYS_FILE = Path(__file__).parent / "api_keys.json"
 
-# زمان انتظار (ثانیه) قبل از retry بعد از exhaustion تمام کلیدها
+# Wait time (seconds) before retrying after all keys are exhausted
 _WAIT_ALL_EXHAUSTED = 60
 
-# حداکثر دفعه retry بعد از اینکه همه کلیدها rate-limit خوردن
+# Maximum retry rounds after all keys hit rate limits
 _MAX_FULL_ROTATIONS = 3
 
 
-# ── بارگذاری کلیدها ──────────────────────────────────────────────────────────
+# ── Load Keys ────────────────────────────────────────────────────────────────
 def _load_keys() -> list[str]:
-    """کلیدها را از api_keys.json یا environment variable بارگذاری می‌کند."""
+    """Loads keys from api_keys.json or environment variables."""
     keys: list[str] = []
 
-    # اول env var رو چک کن (اگه فقط یه کلید داری)
+    # Check env var first (if you only have one key)
     env_key = os.environ.get("GROQ_API_KEY", "").strip()
     if env_key:
         keys.append(env_key)
 
-    # بعد فایل json رو بارگذاری کن
+    # Then load from json file
     if _KEYS_FILE.exists():
         try:
             data = json.loads(_KEYS_FILE.read_text(encoding="utf-8"))
@@ -57,15 +57,15 @@ def _load_keys() -> list[str]:
                 if k and k not in keys and not k.startswith("gsk_YOUR"):
                     keys.append(k)
         except Exception as exc:
-            print(f"[key_manager] هشدار: خواندن {_KEYS_FILE} ناموفق بود: {exc}")
+            print(f"[key_manager] Warning: Failed to read {_KEYS_FILE}: {exc}")
 
     if not keys:
         raise EnvironmentError(
-            "\n[ERROR] هیچ Groq API Key ای پیدا نشد!\n"
-            "یکی از این روش‌ها را انجام دهید:\n"
-            "  ۱) کلیدها را در api_keys.json وارد کنید\n"
-            "  ۲) export GROQ_API_KEY=gsk_xxxxxxxx\n"
-            "کلید رایگان از: https://console.groq.com\n"
+            "\n[ERROR] No Groq API Key found!\n"
+            "Use one of the following methods:\n"
+            "  1) Add keys to api_keys.json\n"
+            "  2) export GROQ_API_KEY=gsk_xxxxxxxx\n"
+            "Get a free key from: https://console.groq.com\n"
         )
 
     return keys
@@ -73,13 +73,13 @@ def _load_keys() -> list[str]:
 
 # ── Key Manager (Singleton) ───────────────────────────────────────────────────
 class _KeyManager:
-    """مدیریت چرخشی API Keyها با تشخیص Rate Limit."""
+    """Rotating API Key manager with Rate Limit detection."""
 
     def __init__(self) -> None:
         self._keys: list[str] = []
-        self._index: int = 0  # کلید فعال فعلی
+        self._index: int = 0  # current active key
         self._clients: dict[str, Groq] = {}
-        self._cooldown_until: dict[str, float] = {}  # key → زمان رفع محدودیت
+        self._cooldown_until: dict[str, float] = {}  # key → cooldown expiration time
         self._initialized = False
 
     def _ensure_init(self) -> None:
@@ -87,7 +87,7 @@ class _KeyManager:
             self._keys = _load_keys()
             self._index = 0
             self._initialized = True
-            print(f"[key_manager] {len(self._keys)} کلید بارگذاری شد.")
+            print(f"[key_manager] {len(self._keys)} keys loaded.")
 
     def _get_client(self, key: str) -> Groq:
         if key not in self._clients:
@@ -99,16 +99,16 @@ class _KeyManager:
         return self._keys[self._index]
 
     def _rotate(self) -> bool:
-        """به کلید بعدی که cooldown ندارد رفته؛ اگر همه cooldown باشند False برمی‌گرداند."""
+        """Switches to the next key without cooldown; returns False if all keys are in cooldown."""
         now = time.time()
         n = len(self._keys)
         for _ in range(n):
             self._index = (self._index + 1) % n
             key = self._keys[self._index]
             if self._cooldown_until.get(key, 0) <= now:
-                print(f"[key_manager] سوئیچ به کلید #{self._index + 1}")
+                print(f"[key_manager] Switched to key #{self._index + 1}")
                 return True
-        return False  # همه کلیدها در cooldown هستند
+        return False  # all keys are in cooldown
 
     def get_active_client(self) -> Groq:
         self._ensure_init()
@@ -124,24 +124,25 @@ class _KeyManager:
         **kwargs: Any,
     ) -> Any:
         """
-        یک API call با چرخش خودکار کلید هنگام Rate Limit.
+        Makes an API call with automatic key rotation on Rate Limit.
 
-        اگر همه کلیدها Rate Limit خوردند، _WAIT_ALL_EXHAUSTED ثانیه صبر می‌کند
-        و دوباره تلاش می‌کند (تا _MAX_FULL_ROTATIONS دور).
+        If all keys hit Rate Limit, waits _WAIT_ALL_EXHAUSTED seconds
+        and retries (up to _MAX_FULL_ROTATIONS rounds).
         """
         self._ensure_init()
 
         for rotation in range(_MAX_FULL_ROTATIONS):
             n = len(self._keys)
-            # یک دور کامل روی همه کلیدها
+
+            # One full pass through all keys
             for _ in range(n):
                 key = self._current_key()
 
-                # اگه این کلید هنوز cooldown داره، بعدی رو امتحان کن
+                # If this key is still in cooldown, try the next one
                 cooldown_left = self._cooldown_until.get(key, 0) - time.time()
                 if cooldown_left > 0:
                     if not self._rotate():
-                        break  # همه cooldown → از حلقه بیرون بزن
+                        break  # all keys are in cooldown
                     continue
 
                 try:
@@ -153,46 +154,53 @@ class _KeyManager:
                         max_tokens=max_tokens,
                         **kwargs,
                     )
-                    return resp  # ✅ موفق
+                    return resp  # ✅ success
 
                 except groq.RateLimitError as exc:
-                    # زمان انتظار را از هدر بگیر (اگه موجود بود)
+                    # Extract wait time from response headers (if available)
                     wait = _parse_retry_after(exc) or 60
                     self._cooldown_until[key] = time.time() + wait
-                    print(f"[key_manager] کلید #{self._index + 1} rate-limit خورد " f"(انتظار {wait:.0f}s). سوئیچ...")
+                    print(
+                        f"[key_manager] Key #{self._index + 1} hit rate limit "
+                        f"(wait {wait:.0f}s). Switching..."
+                    )
                     if not self._rotate():
-                        break  # همه cooldown
+                        break  # all keys in cooldown
 
                 except groq.AuthenticationError:
-                    print(f"[key_manager] کلید #{self._index + 1} نامعتبر است. سوئیچ...")
-                    self._cooldown_until[key] = float("inf")  # این کلید دیگه نباید استفاده بشه
+                    print(f"[key_manager] Key #{self._index + 1} is invalid. Switching...")
+                    self._cooldown_until[key] = float("inf")  # never use this key again
                     if not self._rotate():
-                        raise RuntimeError("هیچ کلید معتبری باقی نمانده!")
+                        raise RuntimeError("No valid keys remaining!")
 
                 except Exception:
-                    raise  # بقیه خطاها رو بالا بفرست
+                    raise  # propagate other errors
 
-            # اگه اینجا رسیدیم یعنی همه کلیدها rate-limit خوردند
+            # Reaching here means all keys hit rate limits
             if rotation < _MAX_FULL_ROTATIONS - 1:
-                # پیدا کن چه موقع زودترین کلید آزاد میشه
+                # Find when the next key becomes available
                 min_wait = _min_cooldown_wait(self._cooldown_until, self._keys)
                 print(
-                    f"[key_manager] همه {n} کلید rate-limit. "
-                    f"انتظار {min_wait:.0f}s ... (دور {rotation + 2}/{_MAX_FULL_ROTATIONS})"
+                    f"[key_manager] All {n} keys are rate-limited. "
+                    f"Waiting {min_wait:.0f}s ... "
+                    f"(round {rotation + 2}/{_MAX_FULL_ROTATIONS})"
                 )
                 time.sleep(min_wait)
-                # بعد از sleep ، اولین کلید آزاد رو پیدا کن
+
+                # After sleep, select the first available key
                 now = time.time()
                 for i, k in enumerate(self._keys):
                     if self._cooldown_until.get(k, 0) <= now:
                         self._index = i
                         break
 
-        raise RuntimeError(f"[key_manager] بعد از {_MAX_FULL_ROTATIONS} دور چرخش، " "هیچ کلیدی در دسترس نبود.")
+        raise RuntimeError(
+            f"[key_manager] No available key after {_MAX_FULL_ROTATIONS} rotation rounds."
+        )
 
 
 def _parse_retry_after(exc: groq.RateLimitError) -> float | None:
-    """زمان retry را از هدر پاسخ استخراج می‌کند (اگه موجود باشد)."""
+    """Extracts retry time from response headers (if available)."""
     try:
         headers = exc.response.headers  # type: ignore[union-attr]
         val = headers.get("retry-after") or headers.get("x-ratelimit-reset-requests")
@@ -204,18 +212,22 @@ def _parse_retry_after(exc: groq.RateLimitError) -> float | None:
 
 
 def _min_cooldown_wait(cooldown_until: dict[str, float], keys: list[str]) -> float:
-    """کمترین زمان انتظار تا آزاد شدن یک کلید را برمی‌گرداند."""
+    """Returns the minimum wait time until a key becomes available."""
     now = time.time()
-    waits = [max(0.0, cooldown_until.get(k, 0) - now) for k in keys if cooldown_until.get(k, 0) > now]
+    waits = [
+        max(0.0, cooldown_until.get(k, 0) - now)
+        for k in keys
+        if cooldown_until.get(k, 0) > now
+    ]
     return min(waits) if waits else 1.0
 
 
-# ── Singleton عمومی ──────────────────────────────────────────────────────────
+# ── Public Singleton ──────────────────────────────────────────────────────────
 _manager = _KeyManager()
 
 
 def get_groq_client() -> Groq:
-    """کلاینت Groq کلید فعال را برمی‌گرداند."""
+    """Returns the Groq client for the currently active key."""
     return _manager.get_active_client()
 
 
@@ -227,8 +239,8 @@ def call_with_rotation(
     **kwargs: Any,
 ) -> Any:
     """
-    API call با چرخش خودکار کلید.
-    جایگزین مستقیم client.chat.completions.create().
+    API call with automatic key rotation.
+    Direct replacement for client.chat.completions.create().
     """
     return _manager.call(
         model=model,
