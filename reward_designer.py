@@ -41,13 +41,21 @@ The critique prompt explicitly asks the LLM to look for:
   * stationary behaviour (mean_speed very low)
   * reward farming loops (shaped_reward high but env_reward low)
 
-Smoke-test validation (NEW)
-────────────────────────────
-After structural AST validation, every generated reward function is
-executed against two representative sample states before being written
-to disk. This catches runtime errors (e.g. KeyError: 'overtake' instead
-of the correct key 'overtook') that structural checks cannot detect.
-Failures are fed back through the same repair-loop as structural errors.
+Smoke-test validation (TWO STAGES)
+────────────────────────────────────
+Stage A (fast): the original two-sample + collision-gap + 2-trajectory check.
+Cheap, runs on every attempt, catches structural/runtime breakage fast
+(KeyError on a wrong state key, suppressed collision penalty, etc.).
+
+Stage B (thorough): only runs once Stage A passes. Executes the candidate
+against the full ~40-trajectory bank (trajectory_bank.py) spanning 8
+behavioural categories, and checks pairwise-ranking consistency against
+each trajectory's independent reference fitness (reward_archive.compute_fitness
+applied to the trajectory's own aggregate metrics — computed completely
+independently of the candidate reward function). This catches reward-hacking
+loopholes that a single cautious-vs-reckless comparison cannot, such as
+tailgating-without-crashing or lane-thrashing. Failures are fed back through
+the same repair loop as Stage A, with a per-pair violation report.
 """
 
 from __future__ import annotations
@@ -64,6 +72,7 @@ from groq import Groq
 
 from reward_sandbox import validate_reward_code
 from reward_archive import RewardArchive
+from trajectory_bank import build_trajectory_bank, evaluate_consistency
 from key_manager import call_with_rotation  # ← چرخش خودکار کلید
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -84,6 +93,19 @@ REWARD_PROGRAM_PATH = "reward_program.py"
 # _smoke_test_reward_code previously called fn(...) directly with no time
 # bound at all.
 _SMOKE_TEST_TIMEOUT_SEC = 0.5
+
+# Stage B (trajectory bank) gate parameters. Kept here rather than in
+# trajectory_bank.py so the designer's repair-loop tolerance is tunable
+# independently of the bank/gate module itself.
+_BANK_MAX_VIOLATION_RATE = 0.10
+_BANK_MIN_FITNESS_GAP = 0.05
+
+# Built once at import time: the bank is deterministic (fixed seed), so
+# there is no reason to rebuild it for every single generation/repair
+# attempt. ~40 trajectories x up to a few hundred steps each is cheap to
+# build but rebuilding it dozens of times per evolution step (every
+# generate + every repair retry) is needless overhead.
+_TRAJECTORY_BANK = build_trajectory_bank()
 
 
 def _call_with_timeout(fn, state: dict, timeout_sec: float = _SMOKE_TEST_TIMEOUT_SEC):
@@ -475,6 +497,93 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _full_validation_pipeline(code: str) -> tuple[bool, str]:
+    """
+    Two-stage smoke test, run in sequence:
+
+      Stage A (fast)  — _smoke_test_reward_code(): 3 sample states + the
+                        quantitative collision-suppression gate + the
+                        original 2-trajectory (cautious vs reckless) check.
+                        Cheap (~3 + 80 compute_reward calls), so it runs
+                        first and rejects most broken code immediately
+                        without ever touching the larger bank.
+
+      Stage B (thorough) — trajectory_bank.evaluate_consistency(): only
+                        runs if Stage A passed. Executes the candidate
+                        against the full ~40-trajectory bank (8 behavioural
+                        categories) and checks pairwise-ranking consistency
+                        against each trajectory's independent reference
+                        fitness. This is what catches reward-hacking
+                        loopholes that don't show up in the single
+                        cautious-vs-reckless comparison, e.g. tailgating
+                        without ever crashing, lane-thrashing, or
+                        accel/jerk spam with no net speed gain.
+
+    Returns (ok, error_message). On Stage B failure, error_message is the
+    full per-pair violation report from evaluate_consistency(), suitable
+    for feeding straight back into the LLM repair prompt.
+    """
+    stage_a_ok, stage_a_err = _smoke_test_reward_code(code)
+    if not stage_a_ok:
+        return False, stage_a_err
+
+    # Compile once for Stage B so we don't re-exec the source for every one
+    # of the ~40 trajectories' ~30-80 steps -- mirrors the compiled_fn reuse
+    # pattern already used by reward_wrapper.py's hot path.
+    def _clip(val, lo, hi):
+        return max(lo, min(hi, val))
+
+    safe_globals = {
+        "__builtins__": {},
+        "min": min,
+        "max": max,
+        "abs": abs,
+        "round": round,
+        "float": float,
+        "int": int,
+        "bool": bool,
+        "sqrt": math.sqrt,
+        "exp": math.exp,
+        "log": math.log,
+        "sin": math.sin,
+        "cos": math.cos,
+        "tan": math.tan,
+        "atan": math.atan,
+        "atan2": math.atan2,
+        "floor": math.floor,
+        "ceil": math.ceil,
+        "clip": _clip,
+        "pi": math.pi,
+        "e": math.e,
+        "inf": math.inf,
+    }
+    local_ns: dict = {}
+    try:
+        exec(compile(code, "<generated>", "exec"), safe_globals, local_ns)  # noqa: S102
+    except Exception as exc:
+        # Should not happen -- Stage A already compiled this exact code --
+        # but guard anyway rather than letting Stage B crash the designer.
+        return False, f"Compile error during Stage B setup: {type(exc).__name__}: {exc}"
+
+    fn = local_ns.get("compute_reward")
+    if fn is None:
+        return False, "compute_reward function not found after exec (Stage B setup)"
+
+    def _timed_fn(state: dict):
+        return _call_with_timeout(fn, state)
+
+    stage_b_ok, stage_b_report = evaluate_consistency(
+        _timed_fn,
+        bank=_TRAJECTORY_BANK,
+        max_violation_rate=_BANK_MAX_VIOLATION_RATE,
+        min_fitness_gap=_BANK_MIN_FITNESS_GAP,
+    )
+    if not stage_b_ok:
+        return False, stage_b_report
+
+    return True, ""
+
+
 # ── Groq client ───────────────────────────────────────────────────────────────
 
 
@@ -575,7 +684,7 @@ class RewardDesigner:
         ok, err = validate_reward_code(restored_code)
         smoke_ok, smoke_err = (False, "(skipped: structural validation failed)")
         if ok:
-            smoke_ok, smoke_err = _smoke_test_reward_code(restored_code)
+            smoke_ok, smoke_err = _full_validation_pipeline(restored_code)
 
         if ok and smoke_ok:
             self._save_reward_program(restored_code)
@@ -766,9 +875,11 @@ class RewardDesigner:
         max_retries: int = 3,
     ) -> str | None:
         """
-        Generate a reward function, then validate (AST) + smoke-test (execution).
-        If either check fails, send the error back to the LLM for repair.
-        Returns the first code that passes both checks, or None on total failure.
+        Generate a reward function, then validate (AST) + smoke-test (execution,
+        two stages -- see _full_validation_pipeline). If either AST validation
+        or either smoke-test stage fails, send the error back to the LLM for
+        repair. Returns the first code that passes both stages, or None on
+        total failure.
         """
         system = _GENERATION_SYSTEM.format(state_schema=_STATE_SCHEMA)
         user = _GENERATION_USER_TEMPLATE.format(
@@ -834,10 +945,10 @@ class RewardDesigner:
                 repair_error = f"Structural validation error: {err}"
                 continue
 
-            # ── Smoke-test: actually execute against sample states ────────
-            smoke_ok, smoke_err = _smoke_test_reward_code(raw)
+            # ── Smoke-test: Stage A (fast) then Stage B (full bank) ────────
+            smoke_ok, smoke_err = _full_validation_pipeline(raw)
             if not smoke_ok:
-                print(f"[designer] Smoke-test failed (attempt {attempt}): {smoke_err}")
+                print(f"[designer] Smoke-test failed (attempt {attempt}):\n{smoke_err}")
                 repair_error = smoke_err
                 continue
 
