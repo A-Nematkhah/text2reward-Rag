@@ -1,77 +1,117 @@
 # txt2reward-v2
 
-**True Text-to-Reward System for Highway Reinforcement Learning**
+**A Text-to-Reward system for highway-driving reinforcement learning.**
 
-Train a highway driving agent with PPO where a language model (Groq / llama-3.3-70b)
-**generates complete reward functions** (not just scalar weights), trains PPO, evaluates
-behaviour, critiques the result (including reward-hacking detection), and evolves an
-improved reward program — looping like an evolutionary search over reward code.
-
----
-
-## Idea
-
-Earlier versions of this project had the LLM tune a fixed set of weights (`w_speed`,
-`w_safety`, ...) inside a hand-written formula. This version replaces that entirely:
-the LLM now writes the formula itself, as a sandboxed Python function operating on a
-structured state object.
+An LLM (Groq / Llama 3.3 70B) writes complete Python reward functions for a PPO
+agent in `highway-env`, trains the agent, evaluates the resulting behaviour,
+critiques itself for reward hacking, and evolves an improved reward program —
+an evolutionary search over reward *code*, not just reward *weights*.
 
 ```
-Natural Language Goal
-        │
-        ▼
-   RewardDesigner (main process)
-        │  Groq API → llama-3.3-70b   (+ RAG context from reward_archive.json)
-        ▼
-  Generated compute_reward(state) source
-        │  AST validation (no imports/exec/eval/loops/attribute access)
-        ▼
-  reward_program.py  ◄───────────────────────────────┐
-        │                                              │
-        ▼                                              │
-  LLMRewardWrapper (per worker)                        │
-  reloads reward_program.py every N steps ─────────────┘
-        │
-        ▼
-  shaped_reward = compute_reward(state)
-        │
-        ▼
-     PPO training
-        │
-        ▼
-  evaluate_agent() → metrics (speed, crash rate, overtakes, completion)
-        │
-        ▼
-  fitness = compute_fitness(metrics)
-        │
-        ▼
-  LLM critique (reward hacking detection, failure modes, improvements)
-        │
-        ▼
-  reward_archive.json  (generation, code, metrics, fitness, critique)
-        │
-        ▼
-  Next generation (loop back to RewardDesigner)
+"Drive fast, overtake safely, avoid collisions"
+                    │
+                    ▼
+            ┌───────────────┐
+            │ RewardDesigner│  Groq API (Llama 3.3 70B)
+            │  + RAG context│  ← reward_archive.json (top performers)
+            └───────┬───────┘
+                    │  generates compute_reward(state) source
+                    ▼
+          ┌─────────────────────┐
+          │   Sandbox Pipeline   │  AST validation → smoke test →
+          │                     │  trajectory safety gate
+          └──────────┬──────────┘
+                    │ pass
+                    ▼
+            reward_program.py ◄────────────────┐
+                    │   (hot-reloaded by workers)│
+                    ▼                           │
+              PPO Training (SB3)                │
+                    │                           │
+                    ▼                           │
+           evaluate_agent() → metrics           │
+                    │                           │
+                    ▼                           │
+            LLM Critique (hacking detection)    │
+                    │                           │
+                    ▼                           │
+        reward_archive.json (code + metrics)    │
+                    │                           │
+                    └── next generation ─────────┘
 ```
 
 ---
 
-## Project Structure
+## Table of contents
+
+- [Why this exists](#why-this-exists)
+- [Architecture](#architecture)
+- [Project structure](#project-structure)
+- [Requirements](#requirements)
+- [Quickstart](#quickstart)
+  - [Google Colab](#google-colab)
+  - [Local setup](#local-setup)
+- [CLI reference](#cli-reference)
+- [How it works](#how-it-works)
+  - [State object](#state-object)
+  - [Reward program sandbox](#reward-program-sandbox)
+  - [Evolutionary loop](#evolutionary-loop)
+  - [Fitness function](#fitness-function)
+  - [Reward-hacking detection](#reward-hacking-detection)
+  - [Multi-process architecture](#multi-process-architecture)
+- [Output files](#output-files)
+- [Migrating from the weight-tuning version](#migrating-from-the-weight-tuning-version)
+- [Known limitations](#known-limitations)
+- [References](#references)
+
+---
+
+## Why this exists
+
+Earlier versions of this project had the LLM tune a fixed set of scalar
+weights (`w_speed`, `w_safety`, …) plugged into a hand-written reward
+formula. That approach caps the agent's ceiling at whatever behaviours the
+human-designed formula can express — the LLM can only turn knobs, not change
+the shape of the function.
+
+**txt2reward-v2 removes that ceiling.** The LLM writes the reward formula
+itself — a complete, sandboxed Python function operating on a structured
+state object — and iterates on the *code*, not the coefficients.
+
+---
+
+## Architecture
+
+| Stage | Component | Responsibility |
+|---|---|---|
+| 1 | `RewardDesigner` | Sends the driving goal + archive context to Groq, receives generated reward code |
+| 2 | `reward_sandbox` | AST-validates the code (no imports/exec/eval/loops/attribute access) |
+| 3 | `reward_designer._smoke_test_reward_code` | Executes the function against sample states and synthetic trajectories before it ever reaches disk |
+| 4 | `reward_program.py` | The current reward function, hot-swapped on disk |
+| 5 | `LLMRewardWrapper` | Per-worker Gym wrapper; reloads and executes `reward_program.py` |
+| 6 | `evaluate_agent()` | Measures speed, crash rate, overtakes, completion rate |
+| 7 | `reward_archive` | Computes fitness, stores every generation, serves RAG-style context for the next generation |
+| 8 | LLM critique | Flags reward-hacking patterns and proposes concrete fixes |
+
+---
+
+## Project structure
 
 ```
 txt2reward-v2/
-├── train.py               # Entry point — PPO training with the evolutionary loop
-├── reward_wrapper.py       # Gym wrapper: loads + executes reward_program.py, collects stats
-├── reward_designer.py      # LLM pipeline: generate / critique / evolve reward programs
-├── reward_sandbox.py        # Secure sandbox: AST validation + restricted execution
-├── reward_archive.py        # Persistent archive + fitness function + RAG retrieval
-├── reward_program.py        # Current generated reward function (hot-swapped at runtime)
-├── reward_components.py     # LEGACY — weight-based reward kept for evaluate.py --no-shaped
-├── evaluate.py             # Evaluate a trained model against any generation's reward
-├── plot_training.py         # Generates training/evolution/fitness charts
-├── training_logger.py       # Persists per-episode + per-generation training history
-├── requirements.txt        # Python dependencies
-└── colab_setup.ipynb        # Ready-to-run Google Colab notebook
+├── train.py              # Entry point — PPO training with the evolutionary loop
+├── reward_wrapper.py      # Gym wrapper: loads + executes reward_program.py, collects stats
+├── reward_designer.py     # LLM pipeline: generate / critique / evolve reward programs
+├── reward_sandbox.py      # Secure sandbox: AST validation + restricted execution
+├── reward_archive.py      # Persistent archive + fitness function + RAG retrieval
+├── reward_program.py      # Current generated reward function (hot-swapped at runtime)
+├── reward_components.py   # Legacy weight-based reward, kept for evaluate.py --no-shaped
+├── evaluate.py            # Evaluate a trained model against any generation's reward
+├── plot_training.py       # Training / evolution / fitness charts
+├── training_logger.py     # Per-episode and per-generation training history
+├── key_manager.py         # Multi-key Groq client with automatic rate-limit rotation
+├── requirements.txt       # Python dependencies
+└── colab_setup.ipynb      # Ready-to-run Google Colab notebook
 ```
 
 ---
@@ -79,8 +119,8 @@ txt2reward-v2/
 ## Requirements
 
 - Python 3.10+
-- [Groq API key](https://console.groq.com) — free tier is sufficient
-- GPU recommended (Colab T4 works fine; CPU is slow)
+- A [Groq API key](https://console.groq.com) — the free tier is sufficient
+- A GPU is recommended (Colab T4 works fine; CPU training is slow)
 
 ```bash
 pip install -r requirements.txt
@@ -88,22 +128,22 @@ pip install -r requirements.txt
 
 ---
 
-## Quickstart on Google Colab
+## Quickstart
 
-**Fastest path:** open `colab_setup.ipynb`.
+### Google Colab
 
-1. Set the runtime to GPU (Runtime → Change runtime type → T4 GPU)
+The fastest path — open **`colab_setup.ipynb`**:
+
+1. Set the runtime to GPU (**Runtime → Change runtime type → T4 GPU**)
 2. Paste your `GROQ_API_KEY` when prompted
-3. Run cells in order
+3. Run the cells in order
 
----
-
-## Local Setup
+### Local setup
 
 ```bash
 export GROQ_API_KEY="gsk_xxxxxxxx"
 
-# Train with a natural-language goal (bootstraps reward_program.py automatically)
+# Train with a natural-language goal (auto-bootstraps reward_program.py)
 python train.py --timesteps 200000 --n-envs 4 \
   --goal "Drive fast and safely, overtake slow vehicles, avoid collisions, minimise harsh braking."
 
@@ -114,9 +154,13 @@ python evaluate.py --model ppo_highway_txt2reward.zip --episodes 10
 python evaluate.py --model ppo_highway_txt2reward.zip --generation 2
 ```
 
+> **Multiple Groq keys?** Drop them into `api_keys.json` (see
+> `key_manager.py`) and the designer will automatically rotate to the next
+> available key on rate limits instead of stalling the run.
+
 ---
 
-## CLI Reference
+## CLI reference
 
 ### `train.py`
 
@@ -127,35 +171,36 @@ python evaluate.py --model ppo_highway_txt2reward.zip --generation 2
 | `--reload-interval` | `200` | Steps between `reward_program.py` reloads in each worker |
 | `--evolve-every` | `20` | Generate a new reward program every N episodes (after warmup) |
 | `--warmup-episodes` | `40` | Episodes before the first LLM reward generation |
-| `--goal` | (driving goal) | Natural language goal sent to the LLM |
+| `--goal` | *(driving goal)* | Natural-language goal sent to the LLM |
 | `--reward-path` | `reward_program.py` | Output path for the generated reward program |
 | `--archive-file` | `reward_archive.json` | Path to the reward archive |
 | `--bootstrap` | off | Force-generate an initial reward program before training |
-| `--resume` | `None` | Path to a `.zip` checkpoint to resume from |
-| `--drive-dir` | `/content/drive/MyDrive/txt2reward` | Google Drive folder for sync |
+| `--resume` | `None` | Checkpoint `.zip` to resume from |
+| `--fresh` | off | Wipe log, archive, reward program, and checkpoints before starting |
 | `--checkpoint-freq` | `10000` | Steps between checkpoints |
+| `--drive-dir` | `/content/drive/MyDrive/txt2reward` | Google Drive folder for Colab sync |
 
 ### `evaluate.py`
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model` | `ppo_highway_txt2reward.zip` | Path to trained model |
+| `--model` | `ppo_highway_txt2reward.zip` | Path to the trained model |
 | `--episodes` | `10` | Number of evaluation episodes |
 | `--no-shaped` | off | Disable shaped reward (env reward only) |
 | `--reward-path` | `reward_program.py` | Reward program to evaluate with |
 | `--generation` | `None` | Evaluate using a specific archived generation |
 | `--render` | off | Render the environment visually |
-| `--stochastic` | off | Use stochastic policy (default: deterministic) |
+| `--stochastic` | off | Use a stochastic policy (default: deterministic) |
 | `--save` | `None` | Save results as JSON to this path |
 
 ---
 
-## How It Works
+## How it works
 
-### State Object
+### State object
 
-Every step, the environment observation is parsed into a structured state dict
-passed to the generated reward function:
+On every step, the environment observation is parsed into a structured state
+dict and passed to the generated reward function:
 
 ```python
 state = {
@@ -174,63 +219,93 @@ state = {
 }
 ```
 
-### Reward Program
+### Reward program sandbox
 
 The LLM generates a complete `compute_reward(state) -> float` function (see
-`reward_program.py` for the current/default example). It is sandboxed:
+`reward_program.py` for the current example). Every generated function is
+sandboxed and validated before it can run:
 
-- No `import`, no `eval`/`exec`, no file/network access, no attribute access, no loops.
-- Only approved math (`sqrt`, `exp`, `log`, trig, `clip`, etc.) and approved state keys.
-- Validated via AST inspection (`reward_sandbox.validate_reward_code`) before being
-  written to disk or executed.
+- **No** `import`, `eval`/`exec`, file or network access, attribute access,
+  or loops.
+- Only an approved set of math functions (`sqrt`, `exp`, `log`, trig, `clip`,
+  …) and approved state keys.
+- **AST validation** (`reward_sandbox.validate_reward_code`) rejects
+  structurally unsafe or malformed code before it is ever executed.
+- **Smoke testing** then executes the function against representative
+  sample states — catching runtime errors structural checks can't, such as a
+  `KeyError` from `state["overtake"]` instead of the correct `state["overtook"]`.
+- A **trajectory safety gate** simulates a cautious 40-step rollout and a
+  reckless, crash-ending 40-step rollout, and rejects any reward function
+  under which the reckless trajectory scores *higher* — a direct defence
+  against reward hacking before training even starts.
 
-### Evolutionary Loop
+Only code that survives all three checks is written to disk.
 
-1. **Warmup phase** — first N episodes train with the current/default reward program.
-2. **Every `evolve_every` episodes** after warmup:
+### Evolutionary loop
+
+1. **Warmup** — the first N episodes train with the current/default reward
+   program.
+2. **Every `--evolve-every` episodes** after warmup:
    - Episode statistics are aggregated into evaluation metrics.
-   - The **current** reward program + metrics are sent to the LLM for **critique**
-     (reward hacking detection, failure modes, proposed fixes).
-   - The critique and metrics are stored in `reward_archive.json` alongside the
-     program's `fitness` score.
-   - The LLM is asked to **generate an improved reward program**, given top-performing
-     archive entries as RAG-style context.
-   - The new program is validated; on success it replaces `reward_program.py` and the
-     generation counter increments. On failure, the previous program is kept.
-3. Worker environments reload `reward_program.py` every `reload-interval` steps.
+   - The reward program that just produced those metrics is **archived
+     unconditionally** — the generation counter is *always* derived from
+     `len(archive.entries)`, never tracked independently.
+   - The LLM **critiques** that entry (reward-hacking detection, failure
+     modes, proposed fixes), including an explicit comparison against the
+     previous generation's trend.
+   - The LLM **generates an improved reward program**, given the
+     top-performing archive entries as RAG-style context.
+   - The new program runs through the full sandbox pipeline; only on success
+     does it replace `reward_program.py` and advance the generation. On any
+     failure, the previous program stays in effect.
+3. Worker environments reload `reward_program.py` from disk every
+   `--reload-interval` steps.
 
-### Fitness Function
+### Fitness function
 
 ```
-fitness = ( w_speed·speed_score + w_overtake·overtake_score
-          + w_lane·lane_score   + w_safety·safety_score
-          + w_complete·completion_score ) × exp(-5 · crash_rate)
+fitness = ( w_speed · speed_score + w_overtake · overtake_score
+          + w_comfort · comfort_score + w_ttc · ttc_score
+          + w_complete · completion_score ) × safety_gate(crash_rate)
 ```
 
-The exponential term sharply penalises high crash rates regardless of other metrics.
+Each component is normalised to `[0, 1]` independently, and a two-stage
+multiplicative safety gate suppresses fitness sharply once `crash_rate`
+exceeds 30%, with an additional hard penalty above 80% — ensuring a
+crash-prone agent can never out-score a slower, safer one regardless of raw
+speed or overtake count. See `reward_archive.py` for the full derivation and
+worked examples.
 
-### Reward Hacking Detection
+### Reward-hacking detection
 
-The critique prompt explicitly asks the LLM to look for:
+The critique prompt explicitly looks for:
 
-- Oscillatory lane changes (many lane changes, few overtakes)
-- Acceleration spam / brake-acceleration exploits (high jerk, no speed gain)
-- Stationary reward farming (low speed, high shaped reward)
-- TTC exploitation (very low TTC without crashes — tailgating for some bonus)
+| Pattern | Signal |
+|---|---|
+| Oscillatory lane changes | many lane changes, few completed overtakes |
+| Acceleration spam | high jerk/accel with no corresponding speed gain |
+| Stationary reward farming | low speed paired with high shaped reward |
+| TTC exploitation | very low time-to-collision without crashes (tailgating for a bonus) |
+| "Slow down to survive" | speed and/or overtakes *decreasing* while crash rate improves — the agent learning passivity rather than skill |
 
-### Multi-Process Architecture
+The last pattern is detected automatically: every critique includes a
+generation-over-generation trend comparison, and a hard-coded warning fires
+whenever speed or overtakes drop while crash rate improves, so this failure
+mode can't hide in metrics that look fine in isolation.
 
-Training uses `SubprocVecEnv` — each worker runs in a separate process. The shared
-state is the `reward_program.py` file on disk:
+### Multi-process architecture
 
-- **Main process** — runs `RewardDesigner`, calls Groq, validates and writes the new
-  reward program to disk, maintains `reward_archive.json`.
-- **Worker processes** — run `LLMRewardWrapper`, periodically reload and execute the
-  reward program from disk.
+Training uses `SubprocVecEnv` — each worker runs in its own process. The
+shared state between processes is `reward_program.py` on disk:
+
+- **Main process** — runs `RewardDesigner`, calls Groq, validates and writes
+  the new reward program, maintains `reward_archive.json`.
+- **Worker processes** — run `LLMRewardWrapper`, periodically reloading and
+  executing the reward program from disk.
 
 ---
 
-## Output Files
+## Output files
 
 | File | Description |
 |---|---|
@@ -243,76 +318,37 @@ state is the `reward_program.py` file on disk:
 
 ---
 
-## Bug Fixes (Generation-Tracking & Reward-Hacking Detection)
+## Migrating from the weight-tuning version
 
-A real training run surfaced four related issues, all fixed in this version:
+If you used the earlier (weight-tuning) version of this project:
 
-1. **Archive stopped growing after generation 0.** `_evolve()` used an
-   independent `self._generation` counter alongside `len(archive.entries)`.
-   If `add_entry()` was ever skipped (e.g. because the on-disk reward file
-   was momentarily empty), the counter kept incrementing forever while the
-   archive silently froze at 1 entry — so critiques were always written
-   against a stale generation 0, and RAG context never improved.
-   **Fix:** `generation` is now a property derived solely from
-   `len(self.archive.entries)`. `_evolve()` archives the program that just
-   ran unconditionally (with a loud warning + safe placeholder if the code
-   is somehow missing, instead of silently skipping), then critiques the
-   entry it just created — never a stale reference.
-
-2. **Bootstrap reward was never archived.** `train.py`'s bootstrap step
-   generated `reward_program.py` via a throwaway `bootstrap_designer` that
-   never called `archive.add_entry()`. **Fix:** there is now a single
-   `RewardDesigner` instance for the whole run; the first real `_evolve()`
-   call archives the bootstrap code together with its first real measured
-   metrics.
-
-3. **Drive restore ran after bootstrap.** This meant a freshly-bootstrapped
-   `reward_program.py` could be immediately overwritten by a stale Drive
-   copy. **Fix:** restore-from-Drive now runs first; bootstrap only fires if
-   no usable reward program exists locally or on Drive. A new reconciliation
-   step in `RewardDesigner.__init__` also self-heals partial restores (e.g.
-   archive restored but `reward_program.py` missing) by rewriting the reward
-   file from the archive's latest entry.
-
-4. **Undetected reward hacking ("slow down to avoid crashing").** Because
-   critiques were stuck on generation 0, the LLM never saw that mean speed
-   and overtakes were declining release-over-release while crash rate
-   improved — a classic reward-hacking pattern where the agent learns
-   passive/stationary behaviour instead of driving well. **Fix:** the
-   critique prompt now includes an explicit `TREND VS PREVIOUS GENERATION`
-   section with deltas, and a hard-coded warning fires whenever speed or
-   overtakes drop while crash rate improves, telling the LLM to call this
-   out explicitly.
+1. `reward_weights.json` is no longer the primary mechanism — it's replaced
+   by `reward_program.py`. `reward_components.py` is kept only as a legacy
+   compatibility layer for `evaluate.py --no-shaped`.
+2. `RewardDesigner` no longer exposes `get_weights()` returning a weight
+   dict; it now returns `{"generation": int, "reward_path": str}` for
+   logging compatibility.
+3. Existing `training_log.json` files from the old format are not compatible
+   with the new per-episode schema (`generation` replaces weight snapshots)
+   — start a fresh log or migrate manually.
+4. Re-run with `--bootstrap` on first launch to generate an initial
+   LLM-written reward program instead of relying on the bundled default in
+   `reward_program.py`.
 
 ---
 
+## Known limitations
 
-
-If you used the previous (weight-tuning) version of this project:
-
-1. `reward_weights.json` is no longer the primary mechanism — it is replaced by
-   `reward_program.py`. `reward_components.py` is kept only as a legacy compatibility
-   layer for `evaluate.py --no-shaped`.
-2. `RewardDesigner` no longer exposes `get_weights()` returning a weight dict; it now
-   returns `{"generation": int, "reward_path": str}` for logging compatibility.
-3. Existing training logs (`training_log.json`) from the old format are not compatible
-   with the new per-episode schema (`generation` replaces weight snapshots) — start a
-   fresh log or migrate manually.
-4. Re-run with `--bootstrap` on first launch to generate an initial LLM-written reward
-   program instead of relying on the bundled default in `reward_program.py`.
-
----
-
-## Known Limitations
-
-- Groq free tier is rate-limited. The designer uses exponential backoff (up to 8s) on
-  rate-limit/parse errors and keeps the previous reward program if generation fails.
+- The Groq free tier is rate-limited. The designer backs off exponentially
+  (up to 8s) on rate-limit or parse errors, and falls back across multiple
+  keys via `key_manager.py` if configured; if generation still fails, the
+  previous reward program is kept.
 - Training on CPU is slow; a GPU is strongly recommended.
-- The sandbox forbids loops and attribute access, so generated reward functions must
-  express any iteration as a single arithmetic expression (sufficient for per-step
-  reward shaping, but a deliberate constraint).
-- Reward program updates happen in the main process only — workers see the updated
-  program with a delay of up to `reload-interval` steps.
+- The sandbox forbids loops and attribute access, so generated reward
+  functions must express any aggregation as a single arithmetic expression
+  — a deliberate constraint, and sufficient for per-step reward shaping.
+- Reward program updates happen in the main process only; worker processes
+  see the update with a delay of up to `--reload-interval` steps.
 
 ---
 
