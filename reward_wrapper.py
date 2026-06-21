@@ -112,6 +112,49 @@ _OVERTAKE_REARM_MARGIN = 2.0  # metres
 REWARD_PROGRAM_PATH = "reward_program.py"
 
 
+# ── Shared y/lateral de-normalization (SINGLE source of truth) ───────────────
+#
+# highway-env normalises the "y" feature into [-1, 1] using the range
+# [-LANE_WIDTH * num_lanes, LANE_WIDTH * num_lanes] (see
+# highway_env.envs.common.observation.KinematicObservation.normalize_obs,
+# which derives the range from AbstractLane.DEFAULT_WIDTH * len(side_lanes),
+# i.e. LANE_WIDTH * num_lanes for a one-way road). This is exactly the same
+# kind of range-based normalisation already documented above for vx/x
+# (_SPEED_SCALE / _DIST_SCALE).
+#
+# SECURITY/CORRECTNESS NOTE (fixes audit finding #1): there used to be TWO
+# different, independently-derived multipliers applied to the same raw y
+# value:
+#   - the ego's lane index used  y_raw * num_lanes            (factor 4)
+#   - another vehicle's dy_m used y_raw * LANE_WIDTH*(num_lanes-1)  (factor 12)
+# Both were derived from the SAME underlying normalised y feature, so using
+# two different factors meant the ego's own lateral position and other
+# vehicles' lateral offsets were silently measured on two different scales.
+# Every downstream signal that depends on lateral alignment (front_dist,
+# ttc, nearby_vehicles, and the overtake lane-window gate) inherited this
+# inconsistency. The fix is to de-normalise y ONCE, the same way, for both
+# the ego and every other vehicle, and derive the lane index from that
+# single metres value.
+def _denorm_y(y_raw: float, num_lanes: int, normalised: bool) -> float:
+    """Converts a raw 'y' observation value into metres of lateral offset.
+
+    Used for BOTH the ego's absolute lateral position and other vehicles'
+    relative dy -- they must use the identical formula since they come from
+    the same normalisation range.
+    """
+    return y_raw * _LANE_WIDTH * num_lanes if normalised else y_raw
+
+
+def _lane_from_y_m(y_m: float, num_lanes: int) -> int:
+    """Converts a lateral offset in metres to a clipped lane index.
+
+    Lane centres sit at y = 0, LANE_WIDTH, 2*LANE_WIDTH, ... so the lane
+    index is simply the offset divided by LANE_WIDTH, rounded and clipped
+    to the valid lane range.
+    """
+    return int(np.clip(round(y_m / _LANE_WIDTH), 0, num_lanes - 1))
+
+
 def _load_reward_fn(path: str):
     """
     Dynamically loads compute_reward() from reward_program.py.
@@ -136,6 +179,23 @@ def _load_reward_fn(path: str):
         safe_ns.pop("__builtins__", None)
         for k, v in safe_ns.items():
             setattr(mod, k, v)
+
+        # SECURITY (fixes audit finding #6): explicitly strip real Python
+        # builtins from the module namespace before exec_module() runs.
+        # importlib's exec_module() calls exec() under the hood, and exec()
+        # auto-injects the REAL __builtins__ dict (open, eval, exec,
+        # __import__, ...) into the globals it's given if one isn't already
+        # present. The line above only sets approved helper names as plain
+        # module attributes -- it never sets mod.__builtins__ itself, so
+        # without this explicit assignment the generated code would still
+        # have full access to real builtins at runtime. AST validation
+        # (reward_sandbox.validate_reward_code) is the primary defense and
+        # already forbids names like `eval`/`exec`/`__import__`, but this is
+        # a deliberate second line of defense: if a reward program ever
+        # reaches this loader without having been (re-)validated -- e.g. a
+        # corrupted or pre-validation legacy archive entry -- real builtins
+        # must still not be reachable from inside compute_reward().
+        mod.__dict__["__builtins__"] = {}
 
         spec.loader.exec_module(mod)
         fn = getattr(mod, "compute_reward", None)
@@ -172,6 +232,7 @@ class LLMRewardWrapper(gym.Wrapper):
         reload_interval: int = 200,
         num_lanes: int = 4,
         reward_path: str = REWARD_PROGRAM_PATH,
+        reward_timeout_sec: float = 0.05,
         # backward-compat stubs
         weights_path: str | None = None,
         llm_interval: int = 50,
@@ -180,6 +241,7 @@ class LLMRewardWrapper(gym.Wrapper):
         self.reload_interval = reload_interval
         self.num_lanes = num_lanes
         self.reward_path = reward_path
+        self.reward_timeout_sec = reward_timeout_sec
 
         self._reward_fn = _load_reward_fn(self.reward_path)
         self._global_step = 0
@@ -250,11 +312,31 @@ class LLMRewardWrapper(gym.Wrapper):
         # Build canonical state dict
         state = build_state(parsed, collided)
 
-        # Execute reward function in sandbox
+        # Execute reward function in sandbox.
+        #
+        # SECURITY (fixes audit finding #2): this now actually goes through
+        # reward_sandbox.execute_reward(), which runs the call inside a
+        # thread with a hard timeout (self.reward_timeout_sec). Previously
+        # this called execute_reward.__wrapped__ -- a monkey-patched
+        # attribute that pointed at a plain, un-timeboxed direct call -- so
+        # the real sandboxed/timeout-protected execute_reward() was never
+        # actually invoked on the hot path, and an LLM-generated reward
+        # program with a runaway computation (e.g. a pathological exponent)
+        # could hang a worker process indefinitely.
+        #
+        # `compiled_fn=self._reward_fn` reuses the already-loaded function
+        # (loaded once per reload_interval steps by _load_reward_fn) so we
+        # still avoid recompiling the source on every single environment
+        # step -- only the function CALL itself is timeboxed.
         try:
-            shaped_reward = execute_reward.__wrapped__(self._reward_fn, state)
+            shaped_reward = execute_reward(
+                code="",
+                state=state,
+                timeout_sec=self.reward_timeout_sec,
+                compiled_fn=self._reward_fn,
+            )
         except Exception as e:
-            # Fallback if execution fails
+            # Fallback if execution fails or times out
             if self._global_step % 1000 == 1:
                 print(f"[wrapper] Reward execution error: {e}")
             shaped_reward = _fallback_reward(state)
@@ -342,16 +424,14 @@ class LLMRewardWrapper(gym.Wrapper):
         return obs, shaped_reward, terminated, truncated, info
 
 
-# ── Reward execution helper (direct call, no sandbox overhead) ────────────────
-
-
-def _direct_execute(reward_fn, state: dict) -> float:
-    """Calls the reward function directly (pre-validated, low overhead)."""
-    return float(reward_fn(state))
-
-
-# Monkey-patch for the wrapper so it uses direct call
-execute_reward.__wrapped__ = _direct_execute
+# NOTE (fixes audit finding #2): there used to be a monkey-patch here
+# (`execute_reward.__wrapped__ = _direct_execute`) that silently replaced
+# the timeout-protected execute_reward() with a plain, un-timeboxed direct
+# call, so the per-step hot path above never actually went through the
+# sandbox's timeout guard. That patch and its `_direct_execute` helper have
+# been removed -- the step() method now calls reward_sandbox.execute_reward()
+# directly (with compiled_fn=self._reward_fn so the source isn't recompiled
+# every step), which is the single, real execution path with a hard timeout.
 
 
 # ── Overtake tracking: nearest-neighbour vehicle identity across steps ────────
@@ -538,10 +618,8 @@ def _parse_full_obs(
     lat_vel_ms = float(ego[_IDX_VY]) * (_SPEED_SCALE if normalised else 1.0)
 
     y_raw = float(ego[_IDX_Y])
-    if normalised:
-        lane = int(np.clip(round(y_raw * num_lanes), 0, num_lanes - 1))
-    else:
-        lane = int(np.clip(round(y_raw / _LANE_WIDTH), 0, num_lanes - 1))
+    y_m = _denorm_y(y_raw, num_lanes, normalised)
+    lane = _lane_from_y_m(y_m, num_lanes)
 
     lane_changed = (prev_lane is not None) and (lane != prev_lane)
 
@@ -567,7 +645,7 @@ def _parse_full_obs(
         veh_vx_ms = veh_vx * _SPEED_SCALE if normalised else veh_vx
 
         veh_y_raw = float(row[_IDX_Y])
-        dy_m = (veh_y_raw * _LANE_WIDTH * (num_lanes - 1)) if normalised else veh_y_raw
+        dy_m = _denorm_y(veh_y_raw, num_lanes, normalised)
 
         if 0.0 < dx_m < front_dist and abs(dy_m) < _LANE_WIDTH * 1.5:
             front_dist = dx_m
