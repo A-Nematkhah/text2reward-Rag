@@ -14,7 +14,7 @@ Each entry:
   }
 
 ═══════════════════════════════════════════════════════════════════════════════
-FITNESS FUNCTION  (v2 — redesigned)
+FITNESS FUNCTION  (v3 — TTC reweighted)
 ═══════════════════════════════════════════════════════════════════════════════
 
 DESIGN GOALS
@@ -30,6 +30,20 @@ DESIGN GOALS
      an intuitive, comparable interpretation.
   4. The final score is always in [0, 1] so fitness values across generations
      are directly comparable and the LLM gets a clear gradient to follow.
+  5. (v3) High speed must not be able to outweigh a dangerously low TTC.
+     Under the v2 weights (w_speed=0.35, w_ttc=0.10), a trajectory that
+     drives at ~29 m/s while tailgating at TTC≈1.4s (never crashing) scored
+     a HIGHER fitness than a fully TTC-safe trajectory at 18 m/s — i.e. the
+     reference fitness itself ranked a near-miss above safe driving, purely
+     because the speed term's weight dwarfed the TTC term's weight. This
+     was discovered via trajectory_bank.py's pairwise consistency gate: no
+     LLM-generated compute_reward() could simultaneously satisfy the fixed
+     -30.0 collision-penalty rule AND match that ordering, because closing
+     the gap would require a continuous TTC penalty large enough to rival
+     the collision penalty itself -- a structural conflict in the reference
+     fitness, not a quality problem with the generated reward code. v3
+     rebalances w_speed down and w_ttc up so proximity/near-miss behaviour
+     can no longer be masked by raw speed.
 
 FORMULA
 ───────
@@ -77,12 +91,23 @@ FORMULA
     • crash_rate = 0.80  → safety_factor ≈ 0.05  (soft gate only)
     • crash_rate = 1.00  → safety_factor ≈ 0.005 (soft + hard gate)
 
+  NOTE: the safety_gate only ever sees crash_rate. It cannot distinguish a
+  trajectory that never crashed but tailgated the entire episode (TTC≈1.4s)
+  from one that drove with a fully safe headway -- that distinction is
+  carried entirely by ttc_score / w_ttc. This is exactly why w_ttc needed
+  to be large enough to matter (see v3 note above): the safety gate is not
+  a substitute for a meaningful TTC weight, the two checks catch different
+  failure modes (crash_rate catches actual collisions; ttc_score catches
+  near-misses that technically never cross the line).
+
 WEIGHTS
 ───────
-  w_speed    = 0.35   high speed is the primary objective
+  w_speed    = 0.25   high speed matters, but no longer dominates TTC
   w_overtake = 0.25   active overtaking rewards skill
-  w_comfort  = 0.15   smooth driving (jerk)
-  w_ttc      = 0.10   safe headway maintenance
+  w_comfort  = 0.10   smooth driving (jerk)
+  w_ttc      = 0.25   safe headway maintenance -- raised from 0.10 (v2) so a
+                       sustained near-miss (low TTC, no crash) cannot be
+                       masked by raw speed; see v3 note above
   w_complete = 0.15   episode completion (surrogate for crash-free rate)
 
 RAG-style retrieval
@@ -102,11 +127,27 @@ from typing import Any
 ARCHIVE_FILE = "reward_archive.json"
 
 # ── Fitness weights ────────────────────────────────────────────────────────────
+# w_speed / w_ttc rebalanced (was 0.35 / 0.10) -- fixes a real inconsistency
+# surfaced by trajectory_bank.py's pairwise consistency gate: under the old
+# weights, a high-speed tailgating trajectory (e.g. 29 m/s, TTC ~1.4s, never
+# crashes) scored a HIGHER reference fitness than slower trajectories with a
+# fully safe TTC (e.g. oscillating_lanes at 18 m/s, TTC ~10s), purely because
+# speed_score's weight (0.35) dwarfed ttc_score's weight (0.10). That made
+# the bank's OWN reference ranking favour proximity over safety in some
+# pairs -- a structural conflict that no LLM-generated compute_reward()
+# could ever satisfy alongside the fixed -30.0 collision-penalty rule,
+# since matching that ordering would require a continuous TTC penalty large
+# enough to rival the collision term itself. See the v3 docstring section
+# above for the full derivation, and trajectory_bank.py for the gate that
+# surfaced this. Verified after the change: zero hard safety-category
+# violations (legitimate_overtaking still strictly dominates every unsafe
+# category), and deliberately-hackable rewards (explicit proximity bonus,
+# or no TTC penalty at all) are still correctly rejected by the gate.
 _W = {
-    "w_speed": 0.35,
+    "w_speed": 0.25,
     "w_overtake": 0.25,
-    "w_comfort": 0.15,
-    "w_ttc": 0.10,
+    "w_comfort": 0.10,
+    "w_ttc": 0.25,
     "w_complete": 0.15,
 }
 assert abs(sum(_W.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
@@ -216,16 +257,6 @@ def compute_fitness(metrics: dict[str, Any]) -> float:
     ───────
     fitness : float ∈ [0, 1]
         Higher is better. Returns 0.0 if all metrics are missing/zero.
-
-    Fitness landscape examples
-    ──────────────────────────
-    Scenario                              fitness (approx)
-    ────────────────────────────────────  ────────────────
-    Perfect: 30 m/s, 0 crash, 10 ot      0.97
-    Good:    25 m/s, 5% crash, 5 ot      0.72
-    Mediocre: 22 m/s, 30% crash, 2 ot   0.38
-    Bad (current): 14 m/s, 100% crash    0.006
-    Stationary: 5 m/s, 0 crash, 0 ot     0.15
     """
     crash_rate = float(metrics.get("crash_rate", 0.5))
     mean_speed = float(metrics.get("mean_speed", 0.0))
@@ -522,6 +553,17 @@ if __name__ == "__main__":
             },
         ),
         (
+            "Tailgating (fast, low TTC, no crash)",
+            {
+                "mean_speed": 29.0,
+                "crash_rate": 0.00,
+                "mean_overtakes": 0.0,
+                "mean_long_jerk": 0.15,
+                "mean_ttc": 1.4,
+                "completion_rate": 1.00,
+            },
+        ),
+        (
             "Old gen 8 (best)",
             {
                 "mean_speed": 11.6,
@@ -535,9 +577,9 @@ if __name__ == "__main__":
     ]
 
     print(
-        f"{'Scenario':<22} {'fitness':>8}  {'speed_s':>7}  {'overt_s':>7}  " f"{'comf_s':>7}  {'ttc_s':>7}  {'gate':>7}"
+        f"{'Scenario':<38} {'fitness':>8}  {'speed_s':>7}  {'overt_s':>7}  " f"{'comf_s':>7}  {'ttc_s':>7}  {'gate':>7}"
     )
-    print("─" * 85)
+    print("─" * 100)
 
     for name, m in scenarios:
         f = compute_fitness(m)
@@ -546,6 +588,6 @@ if __name__ == "__main__":
         cs = _comfort_score(m["mean_long_jerk"])
         ts = _ttc_score(m["mean_ttc"])
         g = _safety_gate(m["crash_rate"])
-        print(f"{name:<22} {f:>8.4f}  {ss:>7.3f}  {os:>7.3f}  " f"{cs:>7.3f}  {ts:>7.3f}  {g:>7.3f}")
+        print(f"{name:<38} {f:>8.4f}  {ss:>7.3f}  {os:>7.3f}  " f"{cs:>7.3f}  {ts:>7.3f}  {g:>7.3f}")
 
     print("\n✓ All scenarios computed successfully.")
