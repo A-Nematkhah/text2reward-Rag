@@ -162,6 +162,19 @@ _ALLOWED_CALLS = frozenset(
     }
 )
 
+# ── DoS guard: maximum allowed constant exponent in a ** (Pow) operation ──────
+# Reward-shaping formulas have no legitimate need for an exponent above ~10
+# (e.g. squaring/cubing jerk terms, soft polynomial penalties). Without this
+# guard, AST validation alone allows a syntactically valid expression like
+# `x ** 999999999` straight through -- evaluating that on a float can take an
+# arbitrarily long time / produce inf, which is a CPU-DoS vector against the
+# worker process executing the reward function every environment step. This
+# only catches a *constant* exponent (the common, simple attack and the one
+# called out in the audit); a non-constant exponent (e.g. `x ** y`) is still
+# allowed since both operands are themselves bounded, validated expressions.
+_MAX_POW_EXPONENT = 10
+
+
 # ── Forbidden names (explicit) ────────────────────────────────────────────────
 _FORBIDDEN_NAMES = frozenset(
     {
@@ -302,6 +315,17 @@ def validate_reward_code(code: str) -> tuple[bool, str]:
         if isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
             return False, f"Forbidden name: '{node.id}'"
 
+        # DoS guard: reject x ** <large constant> (see _MAX_POW_EXPONENT docstring)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            exponent_node = node.right
+            if isinstance(exponent_node, ast.Constant) and isinstance(exponent_node.value, (int, float)):
+                if abs(exponent_node.value) > _MAX_POW_EXPONENT:
+                    return False, (
+                        f"Exponent too large in power operation: {exponent_node.value} "
+                        f"(max allowed magnitude is {_MAX_POW_EXPONENT}) -- this could "
+                        "cause a computationally expensive or numerically unstable result"
+                    )
+
         # Function calls: only whitelisted
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
@@ -329,15 +353,28 @@ def execute_reward(
     code: str,
     state: dict[str, Any],
     timeout_sec: float = 0.1,
+    compiled_fn: Any | None = None,
 ) -> float:
     """
-    Executes a validated reward function in a sandboxed namespace.
+    Executes a validated reward function in a sandboxed namespace, under a
+    hard wall-clock timeout.
 
     Parameters
     ──────────
-    code        : validated Python source (must pass validate_reward_code)
+    code        : validated Python source (must pass validate_reward_code).
+                  Ignored when `compiled_fn` is provided.
     state       : the state dict passed to compute_reward(state)
     timeout_sec : maximum execution time (default 100 ms)
+    compiled_fn : optional, an already-loaded compute_reward callable (e.g.
+                  from reward_wrapper._load_reward_fn). When provided, the
+                  source is NOT recompiled/re-exec'd on every call -- only
+                  the function call itself runs inside the timeout-guarded
+                  thread. This is what the per-step hot path in
+                  reward_wrapper.py uses: it lets every reward evaluation
+                  go through this single, timeout-protected entry point
+                  (fixing audit finding #2, where the per-step path used to
+                  bypass this function entirely via a monkey-patch) without
+                  paying a full compile+exec cost on every environment step.
 
     Returns the float reward value.
 
@@ -346,17 +383,20 @@ def execute_reward(
     RuntimeError  : execution error or timeout
     TypeError     : function returned non-numeric value
     """
-    namespace = _make_safe_namespace()
     result_container: list[Any] = []
     exc_container: list[Exception] = []
 
     def _run():
         try:
-            exec(compile(code, "<reward_program>", "exec"), namespace)  # noqa: S102
-            reward_fn = namespace.get("compute_reward")
-            if reward_fn is None:
-                exc_container.append(RuntimeError("compute_reward not defined"))
-                return
+            if compiled_fn is not None:
+                reward_fn = compiled_fn
+            else:
+                namespace = _make_safe_namespace()
+                exec(compile(code, "<reward_program>", "exec"), namespace)  # noqa: S102
+                reward_fn = namespace.get("compute_reward")
+                if reward_fn is None:
+                    exc_container.append(RuntimeError("compute_reward not defined"))
+                    return
             result = reward_fn(state)
             result_container.append(result)
         except Exception as e:
