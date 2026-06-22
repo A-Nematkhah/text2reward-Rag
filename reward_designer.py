@@ -876,7 +876,11 @@ class RewardDesigner:
                 print(f"[designer] Critique stored for generation {entry['generation']}")
 
         # ── 5+6. Generate, validate, smoke-test, and save ────────────────────
-        archive_context = self.archive.format_for_llm(k=3)
+        # Improvement #5: pass current failure modes for targeted retrieval
+        current_failure_modes = entry.get("critique_meta", {}).get("failure_modes", [])
+        archive_context = self.archive.format_for_llm(
+            k=3, current_failure_modes=current_failure_modes
+        )
         new_code = self._call_generate_with_repair(archive_context)
 
         if new_code is None:
@@ -1004,6 +1008,8 @@ class RewardDesigner:
             completion_rate=metrics.get("completion_rate", 0.0),
             mean_steps=metrics.get("mean_steps", 0.0),
             mean_ttc=metrics.get("mean_ttc", 0.0),
+            p10_ttc=metrics.get("p10_ttc", -1.0),
+            min_ttc=metrics.get("min_ttc", -1.0),
             mean_long_jerk=metrics.get("mean_long_jerk", 0.0),
             mean_accel=metrics.get("mean_accel", 0.0),
             total_lane_changes=metrics.get("total_lane_changes", 0),
@@ -1076,6 +1082,8 @@ class RewardDesigner:
             "mean_overtakes": total_overtakes / n,
             "mean_steps": sum(s.get("steps", 0) for s in episode_stats) / n,
             "mean_ttc": sum(s.get("mean_ttc", 0) for s in episode_stats) / n,
+            "p10_ttc": sum(s.get("p10_ttc", 30.0) for s in episode_stats) / n,
+            "min_ttc": min((s.get("min_ttc", 30.0) for s in episode_stats), default=30.0),
             "mean_rel_vel": sum(s.get("mean_rel_vel", 0) for s in episode_stats) / n,
             "mean_long_jerk": sum(s.get("mean_long_jerk", 0) for s in episode_stats) / n,
             "mean_lat_jerk": sum(s.get("mean_lat_jerk", 0) for s in episode_stats) / n,
