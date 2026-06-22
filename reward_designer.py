@@ -209,24 +209,41 @@ Identify:
    - Oscillatory lane changes: lane_changes >> overtakes (agent thrashing lanes for reward)
    - Acceleration spam: high mean_accel with low speed gain (braking-acceleration exploit)
    - Stationary farming: very low mean_speed but high shaped_reward
-   - TTC exploitation: very low ttc but no crashes (agent riding tailgate for some bonus)
+   - TTC exploitation: very low ttc or min_ttc but no crashes (agent riding tailgate for some bonus)
 2. Missing incentives (what good behaviour is not rewarded)
 3. Misaligned incentives (what bad behaviour is inadvertently rewarded)
 4. Proposed improvements with SPECIFIC code changes
 
 Be concise (max 300 words). End with 3 concrete bullet-point improvements.
+
+IMPORTANT: At the very end of your response, append a machine-readable metadata block
+on a single line in this EXACT format (no whitespace before the colon):
+CRITIQUE_META:{"failure_modes":["tag1","tag2"],"strengths":["s1"],"summary":"one sentence"}
+
+Valid failure_mode tags: tailgating, passive_driving, oscillatory_lane_changes,
+acceleration_spam, stationary_farming, reward_hacking
+Valid strength tags: high_speed, good_overtaking, safe_driving, smooth_driving
 """
 
 _GENERATION_USER_TEMPLATE = """\
 === DRIVING GOAL ===
 {goal}
 
-=== ARCHIVE MEMORY (top performing reward programs) ===
+=== ARCHIVE MEMORY ===
 {archive_context}
+
+The archive is organised into sections:
+  A) Top performers — adopt their strengths
+  B) Most recent — continue or fix the current trajectory
+  C) Failed rewards — do NOT repeat their mistakes
+  D) Similar failure modes — study why the same issues appeared before
 
 === TASK ===
 Generate an improved compute_reward(state) function that achieves the goal above.
-Learn from the archive: adopt what worked, fix what was critiqued.
+- Learn from top performers: adopt what scored well.
+- Avoid the failure patterns shown in sections C and D.
+- If a failure mode is listed (e.g. tailgating, passive_driving), explicitly add
+  a term that penalises it.
 Return ONLY the Python function source. No explanation, no markdown.
 """
 
@@ -243,6 +260,8 @@ _CRITIQUE_USER_TEMPLATE = """\
   completion_rate  : {completion_rate:.1%}
   mean_steps       : {mean_steps:.0f}
   mean_ttc         : {mean_ttc:.2f} s
+  p10_ttc          : {p10_ttc:.2f} s   (10th-percentile TTC — near-miss indicator)
+  min_ttc          : {min_ttc:.2f} s   (worst single-step TTC)
   mean_long_jerk   : {mean_long_jerk:.3f} m/s3
   mean_accel       : {mean_accel:.3f} m/s2
   total_lc         : {total_lane_changes} lane changes
