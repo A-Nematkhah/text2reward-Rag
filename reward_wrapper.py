@@ -213,7 +213,14 @@ def _fallback_reward(state: dict) -> float:
     speed_norm = min(1.0, state.get("speed_ms", 0.0) / 30.0)
     collision = -20.0 if state.get("collided", False) else 0.0
     return 0.8 * speed_norm + collision
-
+def _percentile(values: list[float], pct: int) -> float:
+    if not values:
+        return 30.0
+    sorted_vals = sorted(values)
+    k = (len(sorted_vals) - 1) * pct / 100.0
+    lo, hi = int(k), min(int(k) + 1, len(sorted_vals) - 1)
+    frac = k - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
 
 class LLMRewardWrapper(gym.Wrapper):
     """
@@ -260,6 +267,7 @@ class LLMRewardWrapper(gym.Wrapper):
         self._ep_collisions = 0
 
         self._ep_ttc_sum = 0.0
+        self._ep_ttc_vals: list[float] = []
         self._ep_rel_vel_sum = 0.0
         self._ep_long_jerk_sum = 0.0
         self._ep_lat_jerk_sum = 0.0
@@ -371,6 +379,7 @@ class LLMRewardWrapper(gym.Wrapper):
             self._ep_collisions += 1
 
         self._ep_ttc_sum += state["ttc"]
+        self._ep_ttc_vals.append(state["ttc"])
         self._ep_rel_vel_sum += state["rel_vel_ms"]
         self._ep_long_jerk_sum += abs(state["long_jerk"])
         self._ep_lat_jerk_sum += abs(state["lat_jerk"])
@@ -411,6 +420,8 @@ class LLMRewardWrapper(gym.Wrapper):
                 "collisions": self._ep_collisions,
                 "steps": self._ep_steps,
                 "mean_ttc": round(self._ep_ttc_sum / n, 2),
+                "min_ttc": round(min(self._ep_ttc_vals) if self._ep_ttc_vals else 30.0, 2),
+                "p10_ttc": round(_percentile(self._ep_ttc_vals, 10), 2),
                 "mean_rel_vel": round(self._ep_rel_vel_sum / n, 3),
                 "mean_long_jerk": round(self._ep_long_jerk_sum / n, 3),
                 "mean_lat_jerk": round(self._ep_lat_jerk_sum / n, 3),
