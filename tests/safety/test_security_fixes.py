@@ -126,7 +126,7 @@ def test_load_reward_fn_strips_real_builtins():
     try:
         with open(path, "w") as f:
             f.write("def compute_reward(state):\n    return float(len([1, 2, 3]))\n")
-        fn = rw._load_reward_fn(path)
+        fn = rw._load_reward_fn(path, validate=False)
         try:
             fn({"collided": False})
             raise AssertionError("expected NameError: real builtins should not be reachable")
@@ -155,19 +155,19 @@ def test_validate_allows_small_pow_exponent():
 # ── Fix #3: smoke-test enforces a timeout ────────────────────────────────────
 
 
-def test_smoke_test_timeout_helper_enforces_timeout():
+def test_smoke_test_execute_reward_enforces_timeout():
+    """Smoke test path uses execute_reward(), which must time out runaway code."""
     if not _HAS_DESIGNER:
         return
 
-    def hang(state):
-        while True:
-            pass
-
-    try:
-        rd._call_with_timeout(hang, {}, timeout_sec=0.1)
-        raise AssertionError("expected TimeoutError")
-    except TimeoutError:
-        pass
+    code = (
+        "def compute_reward(state):\n"
+        "    while True:\n"
+        "        pass\n"
+    )
+    ok, err = rd._smoke_test_reward_code(code)
+    assert not ok
+    assert "timeout" in err.lower() or "timed out" in err.lower()
 
 
 # ── Fix #5: archive restore re-validates before writing to disk ─────────────
@@ -213,6 +213,31 @@ def test_restore_rejects_corrupted_archive_entry():
     assert "placeholder" in written
 
 
+def _pipeline_passing_reward_code() -> str:
+    """Reward source that passes the full AST + trajectory-bank restore pipeline."""
+    # Self-contained fixture — do not read reward_program.py (bootstrap default
+    # is intentionally weaker and may not pass Stage B).
+    code = (
+        "def compute_reward(state):\n"
+        '    if state["collided"]:\n'
+        "        return -30.0\n"
+        "    reward = 0.0\n"
+        '    reward += 0.2 * (state["speed_ms"] / 30.0) ** 2\n'
+        '    reward += 3.5 if state["overtook"] else 0.0\n'
+        '    reward += 0 if state["ttc"] > 3 else -0.2 * (3 - state["ttc"])\n'
+        '    reward -= 0.02 * abs(state["long_jerk"])\n'
+        '    reward -= 0.02 * abs(state["lat_jerk"])\n'
+        '    reward += (0.2 if state["speed_ms"] >= 24 else -0.1) if state["front_dist"] > 50 and state["ttc"] > 5 else 0\n'
+        '    reward += -0.2 if state["front_dist"] < 20 else 0.0\n'
+        '    reward += -0.1 if state["lane_changed"] and not state["overtook"] else 0.0\n'
+        '    reward += -0.2 if state["front_dist"] > 50 and state["ttc"] > 5 and state["speed_ms"] < 20 else 0.0\n'
+        "    return reward\n"
+    )
+    ok, err = rd._full_validation_pipeline(code)
+    assert ok, f"fixture reward must pass restore pipeline: {err}"
+    return code
+
+
 def test_restore_accepts_valid_archive_entry():
     """Sanity check: a genuinely valid archived program restores unchanged."""
     if not _HAS_DESIGNER:
@@ -221,22 +246,7 @@ def test_restore_accepts_valid_archive_entry():
     archive_path = os.path.join(workdir, "reward_archive.json")
     reward_path = os.path.join(workdir, "reward_program.py")
 
-    valid_code = (
-        "def compute_reward(state):\n"
-        '    if state["collided"]:\n'
-        "        return -30.0\n"
-        '    speed_reward = clip(state["speed_ms"] * 0.1, 0.0, 3.0)\n'
-        '    ttc_penalty = -3.0 if state["ttc"] < 1.0 else -1.0 if state["ttc"] < 3.0 else 0.0\n'
-        '    overtake_bonus = 2.0 if state["overtook"] else 0.0\n'
-        '    jerk_penalty = -0.02 * (abs(state["long_jerk"]) + abs(state["lat_jerk"]))\n'
-        '    accel_penalty = -0.02 * abs(state["accel_ms2"])\n'
-        '    safe_gap_reward = 0.05 * clip(state["front_dist"] - 15.0, 0.0, 30.0)\n'
-        '    lane_change_penalty = -0.1 if state["lane_changed"] else 0.0\n'
-        "    return (\n"
-        "        speed_reward + ttc_penalty + overtake_bonus + jerk_penalty\n"
-        "        + accel_penalty + safe_gap_reward + lane_change_penalty\n"
-        "    )\n"
-    )
+    valid_code = _pipeline_passing_reward_code()
     entry = {
         "generation": 0,
         "reward_code": valid_code,
@@ -261,7 +271,7 @@ def test_restore_accepts_valid_archive_entry():
         written = f.read()
 
     assert "placeholder" not in written
-    assert "speed_reward" in written
+    assert "def compute_reward" in written
 
 
 if __name__ == "__main__":

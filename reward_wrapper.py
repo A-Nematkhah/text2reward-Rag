@@ -48,7 +48,7 @@ import os
 import numpy as np
 import gymnasium as gym
 
-from reward_sandbox import build_state, execute_reward
+from reward_sandbox import build_state, execute_reward, validate_reward_code, extract_reward_body
 
 # ── Observation column indices ────────────────────────────────────────────────
 _IDX_PRESENCE = 0
@@ -155,7 +155,7 @@ def _lane_from_y_m(y_m: float, num_lanes: int) -> int:
     return int(np.clip(round(y_m / _LANE_WIDTH), 0, num_lanes - 1))
 
 
-def _load_reward_fn(path: str):
+def _load_reward_fn(path: str, *, validate: bool = True):
     """
     Dynamically loads compute_reward() from reward_program.py.
 
@@ -169,6 +169,15 @@ def _load_reward_fn(path: str):
         return _fallback_reward
 
     try:
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        body = extract_reward_body(source)
+        if validate:
+            ok, err = validate_reward_code(body)
+            if not ok:
+                print(f"[wrapper] {path} failed AST validation on reload: {err} — using fallback")
+                return _fallback_reward
+
         from reward_sandbox import _make_safe_namespace
 
         spec = importlib.util.spec_from_file_location("reward_program", path)
@@ -422,6 +431,7 @@ class LLMRewardWrapper(gym.Wrapper):
                 "mean_ttc": round(self._ep_ttc_sum / n, 2),
                 "min_ttc": round(min(self._ep_ttc_vals) if self._ep_ttc_vals else 30.0, 2),
                 "p10_ttc": round(_percentile(self._ep_ttc_vals, 10), 2),
+                "ttc_vals": list(self._ep_ttc_vals),
                 "mean_rel_vel": round(self._ep_rel_vel_sum / n, 3),
                 "mean_long_jerk": round(self._ep_long_jerk_sum / n, 3),
                 "mean_lat_jerk": round(self._ep_lat_jerk_sum / n, 3),

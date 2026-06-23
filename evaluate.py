@@ -16,43 +16,73 @@ Use --no-shaped to disable the shaped reward entirely.
 import os
 import json
 import argparse
+import tempfile
 import numpy as np
 import gymnasium as gym
 import highway_env  # noqa: F401
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 
+from env_config import ENV_CONFIG
 from reward_wrapper import LLMRewardWrapper, REWARD_PROGRAM_PATH
 from reward_archive import RewardArchive, compute_fitness
-
-ENV_CONFIG = {
-    "vehicles_count": 30,
-    "simulation_frequency": 15,
-    "policy_frequency": 5,
-    "duration": 60,
-    "lanes_count": 4,
-    "observation": {
-        "type": "Kinematics",
-        "vehicles_count": 10,
-        "features": ["presence", "x", "y", "vx", "vy"],
-        "normalize": True,
-        "absolute": False,
-    },
-    "action": {
-        "type": "DiscreteMetaAction",
-    },
-    "reward_speed_range": [20, 30],
-    "collision_reward": -1.0,
-    "high_speed_reward": 0.1,
-    "right_lane_reward": 0.0,
-    "lane_change_reward": 0.0,
-}
+from reward_sandbox import validate_reward_code
 
 # highway-env normalises vx into [-1, 1] using the range [-2*MAX_SPEED, 2*MAX_SPEED]
 # with Vehicle.MAX_SPEED = 40.0 m/s, so the de-normalisation factor is 2*40 = 80,
 # matching the corrected _SPEED_SCALE in reward_wrapper.py. This used to be 40.0
 # here too, which silently halved every reported mean_speed.
 _SPEED_SCALE = 80.0
+
+
+def _percentile(values: list[float], pct: int) -> float:
+    if not values:
+        return 30.0
+    sorted_vals = sorted(values)
+    k = (len(sorted_vals) - 1) * pct / 100.0
+    lo, hi = int(k), min(int(k) + 1, len(sorted_vals) - 1)
+    frac = k - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+
+def _pool_ttc_metrics(episode_results: list[dict]) -> tuple[float, float]:
+    """Pool step-level TTC values across episodes (matches training aggregation)."""
+    all_ttc: list[float] = []
+    for r in episode_results:
+        if r.get("ttc_vals"):
+            all_ttc.extend(float(v) for v in r["ttc_vals"])
+        else:
+            all_ttc.append(float(r.get("min_ttc", 30.0)))
+
+    if all_ttc:
+        return _percentile(all_ttc, 10), min(all_ttc)
+
+    p10_vals = [float(r.get("p10_ttc", 30.0)) for r in episode_results]
+    min_vals = [float(r.get("min_ttc", 30.0)) for r in episode_results]
+    return (
+        float(np.mean(p10_vals)) if p10_vals else 30.0,
+        float(np.min(min_vals)) if min_vals else 30.0,
+    )
+
+
+def _write_validated_archive_reward(entry: dict, generation: int) -> str:
+    """Validate archived reward code before writing to a temp file for evaluation."""
+    from reward_designer import _full_validation_pipeline
+
+    code = entry["reward_code"]
+    ok, err = validate_reward_code(code)
+    if not ok:
+        raise ValueError(f"Generation {generation} failed AST validation: {err}")
+
+    smoke_ok, smoke_err = _full_validation_pipeline(code)
+    if not smoke_ok:
+        raise ValueError(f"Generation {generation} failed smoke test: {smoke_err}")
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=f"_reward_gen{generation}.py", prefix="txt2reward_")
+    os.close(tmp_fd)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(code)
+    return tmp_path
 
 
 def make_eval_env(
@@ -81,8 +111,7 @@ def run_episode(model, env, deterministic: bool = True, render: bool = False) ->
     steps = 0
     crashed = False
     speed_sum = 0.0
-    overtakes = 0
-    lane_changes = 0
+    ep_stats: dict = {}
 
     while True:
         action, _ = model.predict(obs, deterministic=deterministic)
@@ -100,13 +129,8 @@ def run_episode(model, env, deterministic: bool = True, render: bool = False) ->
         speed_ms = max(0.0, vx_raw * _SPEED_SCALE) if abs(vx_raw) <= 1.5 else max(0.0, vx_raw)
         speed_sum += speed_ms
 
-        # collect from episode_stats if available
-        ep_stats = info.get("episode_stats", {})
-        if ep_stats:
-            overtakes = ep_stats.get("total_overtakes", 0)
-            lane_changes = ep_stats.get("total_lane_changes", 0)
-
         if terminated or truncated:
+            ep_stats = info.get("episode_stats") or {}
             break
 
     return {
@@ -114,8 +138,14 @@ def run_episode(model, env, deterministic: bool = True, render: bool = False) ->
         "steps": steps,
         "crashed": crashed,
         "mean_speed": round(speed_sum / max(steps, 1), 2),
-        "overtakes": overtakes,
-        "lane_changes": lane_changes,
+        "overtakes": ep_stats.get("total_overtakes", 0),
+        "lane_changes": ep_stats.get("total_lane_changes", 0),
+        "mean_ttc": ep_stats.get("mean_ttc", 30.0),
+        "p10_ttc": ep_stats.get("p10_ttc", 30.0),
+        "min_ttc": ep_stats.get("min_ttc", 30.0),
+        "ttc_vals": list(ep_stats.get("ttc_vals", [])),
+        "mean_long_jerk": ep_stats.get("mean_long_jerk", 0.0),
+        "mean_accel": ep_stats.get("mean_accel", 0.0),
     }
 
 
@@ -167,14 +197,20 @@ def evaluate(
     steps_list = [r["steps"] for r in results]
     speeds = [r["mean_speed"] for r in results]
     overtakes = [r["overtakes"] for r in results]
+    p10_ttc, min_ttc = _pool_ttc_metrics(results)
 
-    # Compute fitness for archive
+    # Compute fitness (same metric fields as training/archive)
     metrics = {
         "mean_speed": float(np.mean(speeds)),
         "crash_rate": float(np.mean(crashes)),
         "mean_overtakes": float(np.mean(overtakes)),
         "mean_steps": float(np.mean(steps_list)),
         "completion_rate": 1.0 - float(np.mean(crashes)),
+        "mean_ttc": float(np.mean([r.get("mean_ttc", 30.0) for r in results])),
+        "p10_ttc": float(p10_ttc),
+        "min_ttc": float(min_ttc),
+        "mean_long_jerk": float(np.mean([r.get("mean_long_jerk", 0.0) for r in results])),
+        "mean_accel": float(np.mean([r.get("mean_accel", 0.0) for r in results])),
         "max_steps": 300,
     }
     fitness = compute_fitness(metrics)
@@ -237,16 +273,17 @@ if __name__ == "__main__":
 
     # Extract specific generation if requested
     if args.generation is not None:
-        archive = RewardArchive(args.archive)
+        archive = RewardArchive(os.path.abspath(args.archive))
         entry = archive.get_by_generation(args.generation)
         if entry is None:
             print(f"[evaluate] Generation {args.generation} not found in archive.")
             exit(1)
-        tmp_path = f"/tmp/reward_gen{args.generation}.py"
-        with open(tmp_path, "w") as f:
-            f.write(entry["reward_code"])
-        reward_path = tmp_path
-        print(f"[evaluate] Using generation {args.generation} from archive.")
+        try:
+            reward_path = _write_validated_archive_reward(entry, args.generation)
+        except ValueError as exc:
+            print(f"[evaluate] {exc}")
+            exit(1)
+        print(f"[evaluate] Using generation {args.generation} from archive (validated).")
 
     evaluate(
         model_path=args.model,

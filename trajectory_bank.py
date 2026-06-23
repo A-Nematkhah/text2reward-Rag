@@ -118,12 +118,25 @@ def _aggregate_trajectory_metrics(states: list[dict[str, Any]]) -> dict[str, flo
     jerk_sum = sum(abs(s.get("long_jerk", 0.0)) for s in states)
     ttc_sum = sum(s.get("ttc", 30.0) for s in states)
 
+    ttc_vals = [float(s.get("ttc", 30.0)) for s in states]
+
+    def _percentile(vals: list[float], pct: int) -> float:
+        if not vals:
+            return 30.0
+        sorted_vals = sorted(vals)
+        k = (len(sorted_vals) - 1) * pct / 100.0
+        lo, hi = int(k), min(int(k) + 1, len(sorted_vals) - 1)
+        frac = k - lo
+        return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
     return {
         "mean_speed": speed_sum / n,
         "crash_rate": 1.0 if crashed else 0.0,
         "mean_overtakes": float(overtakes),  # per-episode count, matches archive convention
         "mean_long_jerk": jerk_sum / n,
         "mean_ttc": ttc_sum / n,
+        "p10_ttc": _percentile(ttc_vals, 10),
+        "min_ttc": min(ttc_vals) if ttc_vals else 30.0,
         "completion_rate": 0.0 if crashed else 1.0,
     }
 
@@ -520,7 +533,7 @@ def evaluate_consistency(
             if fitness_gap > 0 and returns[L.name] <= returns[U.name]:
                 hard_violations.append((L, U, returns[L.name], returns[U.name]))
 
-    ok = violation_rate <= max_violation_rate
+    ok = violation_rate <= max_violation_rate and len(hard_violations) == 0
 
     # 4) Build report.
     lines = [

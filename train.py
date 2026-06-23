@@ -37,29 +37,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from reward_wrapper import LLMRewardWrapper, REWARD_PROGRAM_PATH
 from training_logger import TrainingLogger
 
-# ── Environment configuration ─────────────────────────────────────────────────
-ENV_CONFIG = {
-    "vehicles_count": 30,
-    "simulation_frequency": 15,
-    "policy_frequency": 5,
-    "duration": 60,
-    "lanes_count": 4,
-    "observation": {
-        "type": "Kinematics",
-        "vehicles_count": 10,
-        "features": ["presence", "x", "y", "vx", "vy"],
-        "normalize": True,
-        "absolute": False,
-    },
-    "action": {
-        "type": "DiscreteMetaAction",
-    },
-    "reward_speed_range": [20, 30],
-    "collision_reward": -1.0,
-    "high_speed_reward": 0.0,
-    "right_lane_reward": 0.0,
-    "lane_change_reward": 0.0,
-}
+from env_config import ENV_CONFIG
 
 
 def make_env(rank: int = 0, reload_interval: int = 200, reward_path: str = REWARD_PROGRAM_PATH):
@@ -75,6 +53,23 @@ def make_env(rank: int = 0, reload_interval: int = 200, reward_path: str = REWAR
         return env
 
     return _init
+
+
+def build_vec_env(env_fns, *, allow_dummy_env: bool = False):
+    """Create a vectorized env; optionally fall back to DummyVecEnv on failure."""
+    try:
+        vec_env = SubprocVecEnv(env_fns)
+        print(f"[train] Using SubprocVecEnv with {len(env_fns)} workers")
+        return vec_env
+    except Exception as e:
+        if allow_dummy_env:
+            print(f"[train] SubprocVecEnv failed ({e}), falling back to DummyVecEnv")
+            return DummyVecEnv(env_fns)
+        raise SystemExit(
+            f"[train] SubprocVecEnv failed ({e}). "
+            "Parallel workers require a working subprocess environment. "
+            "Pass --allow-dummy-env to fall back to single-process DummyVecEnv."
+        ) from e
 
 
 def _detect_device() -> str:
@@ -120,25 +115,29 @@ class RewardEvolutionCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
+        completed: list[dict] = []
+
         for info in infos:
             stats = info.get("episode_stats")
             if stats is None:
                 continue
+            completed.append(stats)
 
+        for stats in completed:
             meta_before = self.designer.get_weights()
-            updated = self.designer.record_episode(stats)
-            meta_after = self.designer.get_weights()
-
             policy_snap = self.designer.get_policy_snapshot()
 
             self.training_logger.log_episode(
                 stats=stats,
                 timestep=self.num_timesteps,
-                weights=meta_after,
+                weights=meta_before,
                 policy_snap=policy_snap,
             )
+            self.designer.accumulate_episode(stats)
 
-            if updated:
+            if self.designer.maybe_evolve():
+                meta_after = self.designer.get_weights()
+                policy_snap = self.designer.get_policy_snapshot()
                 self.training_logger.log_llm_update(
                     episode=self.training_logger._episode_n,
                     timestep=self.num_timesteps,
@@ -148,6 +147,7 @@ class RewardEvolutionCallback(BaseCallback):
                     policy_snap=policy_snap,
                 )
 
+        if completed:
             self.training_logger.save_periodically(every_n=10)
 
         return True
@@ -207,7 +207,18 @@ if __name__ == "__main__":
         "instead of silently resuming.",
     )
 
+    parser.add_argument(
+        "--allow-dummy-env",
+        action="store_true",
+        help="Fall back to DummyVecEnv if SubprocVecEnv fails (single-process only).",
+    )
+
     args = parser.parse_args()
+
+    # Resolve paths so subprocess workers see the same files regardless of CWD.
+    args.reward_path = os.path.abspath(args.reward_path)
+    args.archive_file = os.path.abspath(args.archive_file)
+    args.log_file = os.path.abspath(args.log_file)
 
     device = _detect_device()
     print(f"[train] Using device: {device}")
@@ -225,13 +236,11 @@ if __name__ == "__main__":
                 os.remove(f)
                 print(f"[train] --fresh: removed checkpoint {f}")
 
+    # Logger before designer so episode count can resume evolution schedule.
+    training_log = TrainingLogger(log_path=args.log_file)
+
     # ── Build the single RewardDesigner used for the whole run ────────────────
-    # (Previously a separate throwaway `bootstrap_designer` was constructed
-    # for the bootstrap step and a second one for training. Two instances
-    # reading/writing the same files is unnecessary and was a contributing
-    # factor to generation-tracking confusion. One instance, one source of
-    # truth: self.archive.entries.)
-    from reward_designer import RewardDesigner
+    from reward_designer import RewardDesigner, write_default_reward_program
 
     designer = RewardDesigner(
         goal=args.goal,
@@ -239,8 +248,20 @@ if __name__ == "__main__":
         warmup_episodes=args.warmup_episodes,
         reward_path=args.reward_path,
         archive_path=args.archive_file,
+        initial_episode_count=training_log.episode_count(),
+        initial_last_evolution_index=training_log.completed_evolution_index(
+            args.warmup_episodes, args.evolve_every
+        ),
         verbose=True,
     )
+
+    if training_log.episode_count() > 0:
+        evo_idx = training_log.completed_evolution_index(args.warmup_episodes, args.evolve_every)
+        print(
+            f"[train] Resuming evolution schedule from episode "
+            f"{training_log.episode_count()} "
+            f"(last evolution index={evo_idx})."
+        )
 
     # ── Bootstrap: generate initial reward program if needed ──────────────────
     # Runs AFTER --fresh (if passed), so it only fires when no local
@@ -252,19 +273,19 @@ if __name__ == "__main__":
         if ok:
             print("[train] Initial reward program generated successfully.")
         else:
-            print("[train] Bootstrap failed — using default reward_program.py")
+            if not os.path.exists(args.reward_path):
+                write_default_reward_program(args.reward_path)
+                designer._current_code = designer._load_current_code()
+                print("[train] Bootstrap failed — wrote shipped default reward_program.py")
+            else:
+                print("[train] Bootstrap failed — keeping existing reward_program.py")
 
     # ── Build environments ────────────────────────────────────────────────────
     env_fns = [
         make_env(rank=i, reload_interval=args.reload_interval, reward_path=args.reward_path) for i in range(args.n_envs)
     ]
 
-    try:
-        vec_env = SubprocVecEnv(env_fns)
-        print(f"[train] Using SubprocVecEnv with {args.n_envs} workers")
-    except Exception as e:
-        print(f"[train] SubprocVecEnv failed ({e}), falling back to DummyVecEnv")
-        vec_env = DummyVecEnv(env_fns)
+    vec_env = build_vec_env(env_fns, allow_dummy_env=args.allow_dummy_env)
 
     # ── Build or restore PPO model ────────────────────────────────────────────
     if args.resume:
@@ -281,8 +302,6 @@ if __name__ == "__main__":
             n_epochs=5,
             tensorboard_log="./tb_logs/",
         )
-
-    training_log = TrainingLogger(log_path=args.log_file)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     checkpoint_cb = CheckpointCallback(

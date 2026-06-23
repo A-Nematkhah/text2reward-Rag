@@ -77,6 +77,13 @@ WEIGHTS (v4 — unchanged from v3 except speed/ttc split)
   w_comfort  = 0.10
   w_ttc      = 0.25
   w_complete = 0.15
+
+Improvement #5 — Passive-driving gate (v5)
+──────────────────────────────────────────
+Once crash_rate <= 15%, fitness is further multiplied by a passive-driving
+gate that penalises mean_speed < 22 m/s and mean_overtakes < 0.5/ep.
+This prevents "0% crashes at 20 m/s with no overtakes" from outscoring
+faster, active drivers.
 """
 
 from __future__ import annotations
@@ -120,6 +127,16 @@ _CRASH_THRESHOLD = 0.30
 _CRASH_K_SOFT = 5.0
 _CRASH_HARD_LIMIT = 0.80
 _HARD_PENALTY_SCALE = 0.10
+
+# ── Passive-driving gate (v5) ─────────────────────────────────────────────────
+# When the agent is already safe (low crash_rate), suppress fitness if it trades
+# speed/overtaking for survival — the "slow down to stay safe" reward hack.
+_PASSIVE_CRASH_CEILING = 0.15   # only apply when agent is mostly crash-free
+_PASSIVE_SPEED_MIN = 22.0       # m/s — below this is passive when road is clear
+_PASSIVE_OVERTAKE_MIN = 0.5     # overtakes/episode expected when safe
+_PASSIVE_GATE_FLOOR = 0.25      # never zero-out completely (gradient signal)
+_PASSIVE_SPEED_WEIGHT = 0.55
+_PASSIVE_OVERTAKE_WEIGHT = 0.45
 
 
 # ── Component scorers (each returns float ∈ [0, 1]) ──────────────────────────
@@ -182,6 +199,46 @@ def _safety_gate(crash_rate: float) -> float:
     return float(factor)
 
 
+def is_passive_driving(metrics: dict[str, Any]) -> bool:
+    """
+    True when the agent is crash-free enough that we should expect active
+    driving, but mean speed and/or overtakes are too low.
+    """
+    crash_rate = float(metrics.get("crash_rate", 1.0))
+    if crash_rate > _PASSIVE_CRASH_CEILING:
+        return False
+    mean_speed = float(metrics.get("mean_speed", 0.0))
+    mean_overtakes = float(metrics.get("mean_overtakes", 0.0))
+    return mean_speed < _PASSIVE_SPEED_MIN or mean_overtakes < _PASSIVE_OVERTAKE_MIN
+
+
+def _passive_driving_gate(
+    mean_speed: float,
+    mean_overtakes: float,
+    crash_rate: float,
+) -> float:
+    """
+    Multiplicative gate ∈ [_PASSIVE_GATE_FLOOR, 1.0].
+
+    Inactive (returns 1.0) while crash_rate is still high — don't punish an
+    agent that is legitimately slowing down to learn safety first.
+
+    Once crash_rate <= _PASSIVE_CRASH_CEILING, penalises shortfalls in speed
+    and overtaking so "0% crashes at 20 m/s with no overtakes" cannot score
+    as well as a faster, active driver.
+    """
+    if float(crash_rate) > _PASSIVE_CRASH_CEILING:
+        return 1.0
+
+    speed_shortfall = max(0.0, (_PASSIVE_SPEED_MIN - float(mean_speed)) / _PASSIVE_SPEED_MIN)
+    overtake_shortfall = max(
+        0.0,
+        (_PASSIVE_OVERTAKE_MIN - float(mean_overtakes)) / max(_PASSIVE_OVERTAKE_MIN, 1e-6),
+    )
+    penalty = _PASSIVE_SPEED_WEIGHT * speed_shortfall + _PASSIVE_OVERTAKE_WEIGHT * overtake_shortfall
+    return float(max(_PASSIVE_GATE_FLOOR, 1.0 - min(1.0, penalty)))
+
+
 # ── Public fitness function ───────────────────────────────────────────────────
 
 
@@ -226,8 +283,9 @@ def compute_fitness(metrics: dict[str, Any]) -> float:
         + _W["w_complete"] * s_complete
     )
 
-    gate = _safety_gate(crash_rate)
-    fitness = float(max(0.0, min(1.0, base * gate)))
+    safety = _safety_gate(crash_rate)
+    passive = _passive_driving_gate(mean_speed, mean_overtakes, crash_rate)
+    fitness = float(max(0.0, min(1.0, base * safety * passive)))
     return round(fitness, 4)
 
 
@@ -242,6 +300,44 @@ FAILURE_MODE_TAGS = frozenset({
     "stationary_farming",
     "reward_hacking",
 })
+
+STRENGTH_MODE_TAGS = frozenset({
+    "high_speed",
+    "good_overtaking",
+    "safe_driving",
+    "smooth_driving",
+})
+
+
+def _filter_known_tags(tags: Any, allowed: frozenset[str]) -> list[str]:
+    if not isinstance(tags, list):
+        return []
+    return [t for t in tags if isinstance(t, str) and t in allowed]
+
+
+def _extract_critique_meta_json(critique_text: str) -> dict[str, Any] | None:
+    """Parse CRITIQUE_META:{...} using balanced-brace extraction."""
+    marker = "CRITIQUE_META:"
+    if marker not in critique_text:
+        return None
+    raw = critique_text[critique_text.index(marker) + len(marker) :].strip()
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    parsed = json.loads(raw[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+    return None
 
 
 def parse_structured_critique(critique_text: str, metrics: dict[str, Any]) -> dict[str, Any]:
@@ -273,12 +369,11 @@ def parse_structured_critique(critique_text: str, metrics: dict[str, Any]) -> di
     mean_accel     = float(metrics.get("mean_accel", 0.0))
     lc             = int(metrics.get("total_lane_changes", 0))
     ot             = float(metrics.get("mean_overtakes", 0.0))
-    total_lc       = int(metrics.get("total_lane_changes", 0))
 
     # Heuristic failure mode tagging
     if mean_speed < 5.0:
         failure_modes.append("stationary_farming")
-    if mean_speed < 18.0 or (mean_overtakes < 1.0 and crash_rate < 0.1):
+    if is_passive_driving(metrics):
         if "stationary_farming" not in failure_modes:
             failure_modes.append("passive_driving")
     effective_ttc = min_ttc if min_ttc >= 0 else mean_ttc
@@ -307,21 +402,17 @@ def parse_structured_critique(critique_text: str, metrics: dict[str, Any]) -> di
         "strengths": strengths,
         "summary": "",
     }
-    if critique_text and "CRITIQUE_META:" in critique_text:
-        try:
-            marker = critique_text.index("CRITIQUE_META:") + len("CRITIQUE_META:")
-            raw_json = critique_text[marker:].strip()
-            brace_end = raw_json.index("}") + 1
-            parsed = json.loads(raw_json[:brace_end + raw_json[brace_end:].index("}") + 1]
-                                if raw_json.count("}") > 1 else raw_json[:brace_end])
-            if isinstance(parsed.get("failure_modes"), list):
-                meta["failure_modes"] = parsed["failure_modes"]
-            if isinstance(parsed.get("strengths"), list):
-                meta["strengths"] = parsed["strengths"]
+    if critique_text:
+        parsed = _extract_critique_meta_json(critique_text)
+        if parsed:
+            llm_failures = _filter_known_tags(parsed.get("failure_modes"), FAILURE_MODE_TAGS)
+            if llm_failures:
+                meta["failure_modes"] = llm_failures
+            llm_strengths = _filter_known_tags(parsed.get("strengths"), STRENGTH_MODE_TAGS)
+            if llm_strengths:
+                meta["strengths"] = llm_strengths
             if isinstance(parsed.get("summary"), str):
                 meta["summary"] = parsed["summary"]
-        except Exception:
-            pass  # fall back to heuristic result
 
     if not meta["summary"]:
         if failure_modes:
@@ -425,6 +516,18 @@ class RewardArchive:
                 return
         print(f"[archive] Warning: generation {generation} not found for critique update")
 
+    def remove_generation(self, generation: int) -> bool:
+        """Remove a corrupt/invalid archive entry (e.g. failed restore re-validation)."""
+        before = len(self.entries)
+        self.entries = [e for e in self.entries if e["generation"] != generation]
+        if len(self.entries) < before:
+            for i, entry in enumerate(self.entries):
+                entry["generation"] = i
+            self.save()
+            print(f"[archive] Removed generation {generation} from archive")
+            return True
+        return False
+
     # ── Core retrieval ────────────────────────────────────────────────────────
 
     def get_top_k(self, k: int = 3) -> list[dict[str, Any]]:
@@ -454,9 +557,20 @@ class RewardArchive:
         """
         Entries with fitness below max_fitness — useful as negative examples
         so the LLM knows what NOT to replicate.
+
+        Also includes "passive but safe" entries (low crash, low speed/overtakes)
+        even when fitness is above max_fitness, so the LLM does not copy
+        slow-to-survive strategies from the top-k list.
         """
         failed = [e for e in self.entries if e["fitness"] <= max_fitness]
-        return sorted(failed, key=lambda e: e["fitness"])[:k]
+        passive = [
+            e for e in self.entries
+            if e not in failed and is_passive_driving(e["metrics"])
+        ]
+        combined = sorted(failed, key=lambda e: e["fitness"]) + sorted(
+            passive, key=lambda e: e["fitness"]
+        )
+        return combined[:k]
 
     def get_similar_failure_rewards(
         self, failure_mode: str, k: int = 3
@@ -525,7 +639,10 @@ class RewardArchive:
         # ── C) Failed rewards (negative examples) ────────────────────────────
         failed = self.get_failed_rewards(k=2)
         if failed:
-            lines.append("=== C) FAILED REWARDS (do NOT repeat these patterns) ===\n")
+            lines.append(
+                "=== C) FAILED / PASSIVE REWARDS (do NOT repeat these patterns) ===\n"
+                "(Includes low-fitness entries AND safe-but-slow passive-driving traps)\n"
+            )
             for entry in failed:
                 lines.append(_format_entry(entry, show_code=False))
 
@@ -584,6 +701,8 @@ class RewardArchive:
             f"min={_ttc_component_norm(m.get('min_ttc', 30)):.3f})\n"
             f"  safety_gate     : {_safety_gate(cr):.3f}  "
             f"({'HARD gate active' if cr > _CRASH_HARD_LIMIT else 'soft gate' if cr > _CRASH_THRESHOLD else 'no penalty'})\n"
+            f"  passive_gate    : {_passive_driving_gate(m.get('mean_speed', 0), m.get('mean_overtakes', 0), cr):.3f}  "
+            f"({'PASSIVE driving' if is_passive_driving(m) else 'active enough'})\n"
             f"\nStructured critique metadata:\n"
             f"  failure_modes   : {entry.get('critique_meta', {}).get('failure_modes', [])}\n"
             f"  strengths       : {entry.get('critique_meta', {}).get('strengths', [])}\n"
@@ -632,6 +751,8 @@ def _format_entry(entry: dict[str, Any], show_code: bool) -> str:
         f"  comfort_score  : {_comfort_score(m.get('mean_long_jerk', 0)):.3f}\n"
         f"  ttc_score      : {_ttc_score(m.get('mean_ttc',30), m.get('p10_ttc',-1), m.get('min_ttc',-1)):.3f}\n"
         f"  safety_gate    : {_safety_gate(cr):.3f}\n"
+        f"  passive_gate   : {_passive_driving_gate(m.get('mean_speed', 0), m.get('mean_overtakes', 0), cr):.3f}"
+        f"{'  [PASSIVE — do not copy]' if is_passive_driving(m) else ''}\n"
         f"Failure modes: {meta.get('failure_modes', [])}\n"
         f"Strengths    : {meta.get('strengths', [])}\n"
     ]
@@ -685,6 +806,12 @@ if __name__ == "__main__":
             "Stationary/safe",
             {"mean_speed": 5.0, "crash_rate": 0.00, "mean_overtakes": 0.0,
              "mean_long_jerk": 0.1, "mean_ttc": 30.0, "p10_ttc": 30.0, "min_ttc": 30.0,
+             "completion_rate": 1.00},
+        ),
+        (
+            "Passive safe (20 m/s, 0 overtakes)",
+            {"mean_speed": 20.0, "crash_rate": 0.00, "mean_overtakes": 0.0,
+             "mean_long_jerk": 0.6, "mean_ttc": 2.4, "p10_ttc": 1.4, "min_ttc": 0.3,
              "completion_rate": 1.00},
         ),
         (

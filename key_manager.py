@@ -185,7 +185,7 @@ class _KeyManager:
                     f"Waiting {min_wait:.0f}s ... "
                     f"(round {rotation + 2}/{_MAX_FULL_ROTATIONS})"
                 )
-                time.sleep(min_wait)
+                _interruptible_sleep(min_wait)
 
                 # After sleep, select the first available key
                 now = time.time()
@@ -211,7 +211,16 @@ def _parse_retry_after(exc: groq.RateLimitError) -> float | None:
     return None
 
 
-def _min_cooldown_wait(cooldown_until: dict[str, float], keys: list[str]) -> float:
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep in 1s chunks so KeyboardInterrupt is not blocked for minutes."""
+    end = time.time() + max(0.0, seconds)
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(1.0, remaining))
+
+
     """Returns the minimum wait time until a key becomes available."""
     now = time.time()
     waits = [

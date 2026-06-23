@@ -1,0 +1,10 @@
+api_keys.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
+plots/
+tb_logs/
+*.zip
+reward_archive.json
+training_log.json
+.env

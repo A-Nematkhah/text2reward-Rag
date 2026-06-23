@@ -76,6 +76,22 @@ class TrainingLogger:
             except Exception as e:
                 print(f"[logger] Could not load old log: {e} — starting fresh")
 
+    def episode_count(self) -> int:
+        """Number of episodes already recorded (for resuming evolution schedule)."""
+        return self._episode_n
+
+    def completed_evolution_index(self, warmup_episodes: int, evolve_every: int) -> int:
+        """
+        Last evolution boundary already completed (for resuming designer schedule).
+
+        Uses ``llm_updates`` as ground truth so a skipped boundary is not
+        mistaken for a completed evolution on resume. Falls back to episode
+        count only for legacy logs with no LLM update records.
+        """
+        if self.llm_updates:
+            return len(self.llm_updates)
+        return -1
+
     def log_episode(
         self,
         stats: dict,

@@ -47,7 +47,11 @@ from __future__ import annotations
 import ast
 import math
 import threading
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from typing import Any, Callable
+
+# Bounded pool caps how many timed-out reward calls can linger as orphans.
+_TIMEOUT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="reward_timeout")
 
 # ── Whitelist of allowed AST node types ──────────────────────────────────────
 _ALLOWED_NODES = frozenset(
@@ -325,6 +329,12 @@ def validate_reward_code(code: str) -> tuple[bool, str]:
                         f"(max allowed magnitude is {_MAX_POW_EXPONENT}) -- this could "
                         "cause a computationally expensive or numerically unstable result"
                     )
+            else:
+                return False, (
+                    "Power exponent must be a small constant literal "
+                    f"(magnitude <= {_MAX_POW_EXPONENT}); dynamic exponents like "
+                    "state['x'] ** round(state['y']) are forbidden"
+                )
 
         # Function calls: only whitelisted
         if isinstance(node, ast.Call):
@@ -347,6 +357,45 @@ def validate_reward_code(code: str) -> tuple[bool, str]:
 
 class _TimeoutError(Exception):
     pass
+
+
+def run_callable_with_timeout(
+    fn: Callable[..., Any],
+    *args: Any,
+    timeout_sec: float = 0.05,
+    **kwargs: Any,
+) -> Any:
+    """
+    Run fn(*args, **kwargs) with a wall-clock timeout via a bounded thread pool.
+
+    Uses a fixed-size executor so timed-out calls cannot spawn unbounded
+    daemon threads (CPU leak under pathological rewards).
+    """
+    future = _TIMEOUT_EXECUTOR.submit(lambda: fn(*args, **kwargs))
+    try:
+        return future.result(timeout=timeout_sec)
+    except FuturesTimeout:
+        raise RuntimeError(
+            f"Callable timed out after {timeout_sec}s "
+            "(possible infinite loop or too-complex computation)"
+        ) from None
+
+
+def extract_reward_body(source: str) -> str:
+    """Returns the compute_reward definition from a reward program file."""
+    idx = source.find("def compute_reward")
+    return source[idx:] if idx >= 0 else source
+
+
+def compile_reward_function(code: str):
+    """Compile validated reward source into a compute_reward callable."""
+    namespace = _make_safe_namespace()
+    local_ns: dict = {}
+    exec(compile(code, "<reward_program>", "exec"), namespace, local_ns)  # noqa: S102
+    fn = local_ns.get("compute_reward")
+    if fn is None:
+        raise RuntimeError("compute_reward not defined")
+    return fn
 
 
 def execute_reward(
@@ -383,45 +432,21 @@ def execute_reward(
     RuntimeError  : execution error or timeout
     TypeError     : function returned non-numeric value
     """
-    result_container: list[Any] = []
-    exc_container: list[Exception] = []
+    def _run() -> float:
+        if compiled_fn is not None:
+            reward_fn = compiled_fn
+        else:
+            namespace = _make_safe_namespace()
+            exec(compile(code, "<reward_program>", "exec"), namespace)  # noqa: S102
+            reward_fn = namespace.get("compute_reward")
+            if reward_fn is None:
+                raise RuntimeError("compute_reward not defined")
+        result = reward_fn(state)
+        if not isinstance(result, (int, float)):
+            raise TypeError(f"compute_reward must return a float, got {type(result).__name__}: {result!r}")
+        return float(result)
 
-    def _run():
-        try:
-            if compiled_fn is not None:
-                reward_fn = compiled_fn
-            else:
-                namespace = _make_safe_namespace()
-                exec(compile(code, "<reward_program>", "exec"), namespace)  # noqa: S102
-                reward_fn = namespace.get("compute_reward")
-                if reward_fn is None:
-                    exc_container.append(RuntimeError("compute_reward not defined"))
-                    return
-            result = reward_fn(state)
-            result_container.append(result)
-        except Exception as e:
-            exc_container.append(e)
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=timeout_sec)
-
-    if t.is_alive():
-        raise RuntimeError(
-            f"Reward function timed out after {timeout_sec}s " "(possible infinite loop or too-complex computation)"
-        )
-
-    if exc_container:
-        raise RuntimeError(f"Reward execution error: {exc_container[0]}") from exc_container[0]
-
-    if not result_container:
-        raise RuntimeError("Reward function returned no value")
-
-    val = result_container[0]
-    if not isinstance(val, (int, float)):
-        raise TypeError(f"compute_reward must return a float, got {type(val).__name__}: {val!r}")
-
-    return float(val)
+    return run_callable_with_timeout(_run, timeout_sec=timeout_sec)
 
 
 # ── State builder (from observation parser output) ────────────────────────────

@@ -8,19 +8,6 @@ be OVERWRITTEN the first time RewardDesigner.generate_reward() (--bootstrap)
 or _evolve() succeeds -- at that point this hand-written version is archived
 as the actual generation 0 in reward_archive.json, and the LLM takes over
 from here.
-
-Design notes (mirrors the same rules given to the LLM in
-reward_designer.py's _GENERATION_SYSTEM prompt):
-  * Hard safety check first: if state["collided"], return the collision
-    penalty immediately with nothing else added.
-  * Continuous, always-increasing speed term (capped, not unbounded).
-  * TTC penalty only engages below 3s -- not punished during normal driving.
-  * One-shot overtake bonus on state["overtook"] (NOTE: "overtook", not
-    "overtake" -- see STATE SCHEMA in reward_designer.py).
-  * Small jerk/accel penalties (0.02 scale) so they shape, not dominate.
-  * Mild reward for keeping a safe following gap.
-  * Small lane-change penalty so changes must be earned by the rest of the
-    reward, not free.
 """
 
 def compute_reward(state):
