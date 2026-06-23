@@ -206,12 +206,20 @@ DESIGN PRINCIPLES:
     * Jerk/accel penalties should be small (0.01-0.05 scale) to not suppress action
     * Avoid rewarding stationary behaviour or unnecessary lane changes
     * ANTI-PASSIVE-DRIVING: zero crashes alone is NOT success. When front_dist > 50
-      and ttc > 5, the agent MUST be rewarded for speed >= 22 m/s and penalised for
-      sustained speed < 20 m/s. Do NOT stack so many safety penalties that crawling
-      at 18-20 m/s becomes optimal.
-    * The archive fitness function applies a passive-driving gate: once crash_rate
-      is below 15%, fitness drops sharply if mean_speed < 22 m/s or mean_overtakes
-      < 0.5/ep. Programs that are "safe but slow" score poorly — do not copy them.
+      and ttc > 5, the agent MUST be rewarded for speed >= 24 m/s and penalised for
+      sustained speed < 22 m/s. Do NOT stack so many safety penalties that crawling
+      at 18-20 m/s becomes optimal. Do NOT make safe_gap or front_dist bonuses so
+      large that slowing down (which increases front_dist) becomes profitable.
+    * SPEED INCENTIVE TEST: the validation pipeline will execute your function at
+      28 m/s and 14 m/s with identical safe conditions (front_dist=40, ttc=12,
+      no collision). Your function MUST return strictly more reward at 28 m/s.
+      If the gap between fast and slow reward is too small, the agent will not
+      learn to drive faster. Ensure the speed term coefficient is large enough.
+    * The archive fitness function applies a multiplicative passive-driving gate:
+      once crash_rate is below 20%, fitness = base × speed_factor × overtake_factor,
+      where speed_factor = (mean_speed/24)² and overtake_factor = (mean_overtakes/1.5)^0.5.
+      An agent at 20 m/s with 0 overtakes gets gate = 0.10 — 90% fitness penalty.
+      Programs that are "safe but slow" score very poorly — do not copy them.
 
 {state_schema}
 
@@ -358,6 +366,38 @@ _SAMPLE_STATE_OVERTAKE: dict = {
     "accel_ms2": 1.2,
     "long_jerk": 0.3,
     "lat_jerk": 0.2,
+}
+
+# Speed incentive gate: identical safety conditions, only speed differs.
+# Gate 2b requires that fast_safe gives strictly more reward than slow_safe.
+_SAMPLE_STATE_FAST_SAFE: dict = {
+    "speed_ms": 28.0,
+    "front_dist": 40.0,
+    "ttc": 12.0,
+    "rel_vel_ms": 0.0,
+    "lane": 1,
+    "overtook": False,
+    "lane_changed": False,
+    "collided": False,
+    "nearby_vehicles": 1,
+    "accel_ms2": 0.0,
+    "long_jerk": 0.0,
+    "lat_jerk": 0.0,
+}
+
+_SAMPLE_STATE_SLOW_SAFE: dict = {
+    "speed_ms": 14.0,       # clearly below any acceptable minimum
+    "front_dist": 40.0,     # identical — tests speed term in isolation
+    "ttc": 12.0,            # identical
+    "rel_vel_ms": 0.0,
+    "lane": 1,
+    "overtook": False,
+    "lane_changed": False,
+    "collided": False,
+    "nearby_vehicles": 1,
+    "accel_ms2": 0.0,
+    "long_jerk": 0.0,
+    "lat_jerk": 0.0,
 }
 
 _SAMPLE_STATE_COLLIDED: dict = {
@@ -539,6 +579,48 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
             f"The reckless/crashy trajectory achieved a HIGHER episodic return ({reckless_return:.2f}) "
             f"than the safe/cautious trajectory ({cautious_return:.2f}). "
             f"The reward function is inflating speed/overtake bonuses over survival metrics."
+        )
+
+    # ── Gate 2b: Speed Incentive Gate ─────────────────────────────────────
+    # At IDENTICAL safety conditions (same front_dist=40, same ttc=12, same
+    # everything except speed), the reward function MUST give higher per-step
+    # reward at 28 m/s than at 14 m/s. This directly tests whether the speed
+    # term is positive and large enough to matter.
+    fast_return = 0.0
+    slow_return = 0.0
+    try:
+        for _ in range(20):
+            fast_return += execute_reward(
+                "",
+                _SAMPLE_STATE_FAST_SAFE,
+                timeout_sec=_SMOKE_TEST_TIMEOUT_SEC,
+                compiled_fn=reward_fn,
+            )
+            slow_return += execute_reward(
+                "",
+                _SAMPLE_STATE_SLOW_SAFE,
+                timeout_sec=_SMOKE_TEST_TIMEOUT_SEC,
+                compiled_fn=reward_fn,
+            )
+    except RuntimeError as exc:
+        if "timed out" in str(exc).lower():
+            return False, f"Timeout during speed-incentive gate: {exc}"
+        return False, f"Runtime error during speed-incentive gate: {type(exc).__name__}: {exc}"
+    except Exception as exc:
+        return False, f"Runtime error during speed-incentive gate: {type(exc).__name__}: {exc}"
+
+    if fast_return <= slow_return:
+        return False, (
+            f"Speed Incentive Gate Violation: a 28 m/s safe trajectory scored "
+            f"{fast_return:.2f} total reward over 20 steps, but a 14 m/s safe "
+            f"trajectory (identical front_dist=40, ttc=12, no collision, no "
+            f"overtake) scored {slow_return:.2f}. The reward function does not "
+            f"incentivise driving faster — the agent will learn to crawl. "
+            f"Ensure the speed_ms term has a positive coefficient large enough "
+            f"that higher speed always produces strictly more per-step reward "
+            f"under safe conditions. Avoid letting safe_gap / front_dist bonuses "
+            f"dominate so heavily that slowing down (which increases front_dist "
+            f"in practice) becomes the optimal strategy."
         )
 
     return True, ""

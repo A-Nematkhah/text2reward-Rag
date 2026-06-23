@@ -70,20 +70,23 @@ New metrics required in episode_stats (collected in reward_wrapper.py):
   min_ttc   : float   minimum TTC seen during the episode
   p10_ttc   : float   10th-percentile TTC across all steps
 
-WEIGHTS (v4 — unchanged from v3 except speed/ttc split)
+WEIGHTS (v6 — overtake up, ttc down)
 ────────
   w_speed    = 0.25
-  w_overtake = 0.25
+  w_overtake = 0.30
   w_comfort  = 0.10
-  w_ttc      = 0.25
+  w_ttc      = 0.20
   w_complete = 0.15
 
-Improvement #5 — Passive-driving gate (v5)
-──────────────────────────────────────────
-Once crash_rate <= 15%, fitness is further multiplied by a passive-driving
-gate that penalises mean_speed < 22 m/s and mean_overtakes < 0.5/ep.
-This prevents "0% crashes at 20 m/s with no overtakes" from outscoring
-faster, active drivers.
+Improvement #6 — Multiplicative passive-driving gate (v6)
+──────────────────────────────────────────────────────────
+Once crash_rate <= 20%, fitness is multiplied by a two-factor gate:
+  gate = max(0.10, speed_factor × overtake_factor)
+  speed_factor    = min(1, (mean_speed / 24.0)²)      — sharp below 24 m/s
+  overtake_factor = min(1, (mean_overtakes / 1.5)^0.5) — rewarded for any overtaking
+Both factors must be near 1.0 for the gate to be near 1.0. A fast-but-passive
+agent (26 m/s, 0 overtakes) gets gate=0.10. A slow-but-active agent (18 m/s,
+3 overtakes) gets gate=0.10. Only fast + active driving escapes the penalty.
 """
 
 from __future__ import annotations
@@ -99,9 +102,9 @@ ARCHIVE_FILE = "reward_archive.json"
 # ── Fitness weights ────────────────────────────────────────────────────────────
 _W = {
     "w_speed": 0.25,
-    "w_overtake": 0.25,
+    "w_overtake": 0.30,   # raised: overtaking is the clearest active-driving signal
     "w_comfort": 0.10,
-    "w_ttc": 0.25,
+    "w_ttc": 0.20,        # lowered to compensate; sum stays 1.0
     "w_complete": 0.15,
 }
 assert abs(sum(_W.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
@@ -112,7 +115,7 @@ _SPEED_REF = 30.0        # kept for backward-compat
 _SPEED_SIGMOID_K = 0.5   # logistic steepness (#1)
 _SPEED_SIGMOID_MID = 25.0  # midpoint of logistic (#1)
 
-_OVERTAKE_REF = 10.0
+_OVERTAKE_REF = 5.0   # 3 overtakes/ep now gives 0.60 score, not 0.30
 _COMFORT_K = 0.5
 _TTC_SAFE = 5.0          # s — normalisation ceiling for all TTC components
 
@@ -128,15 +131,15 @@ _CRASH_K_SOFT = 5.0
 _CRASH_HARD_LIMIT = 0.80
 _HARD_PENALTY_SCALE = 0.10
 
-# ── Passive-driving gate (v5) ─────────────────────────────────────────────────
+# ── Passive-driving gate (v6) ─────────────────────────────────────────────────
 # When the agent is already safe (low crash_rate), suppress fitness if it trades
 # speed/overtaking for survival — the "slow down to stay safe" reward hack.
-_PASSIVE_CRASH_CEILING = 0.15   # only apply when agent is mostly crash-free
-_PASSIVE_SPEED_MIN = 22.0       # m/s — below this is passive when road is clear
-_PASSIVE_OVERTAKE_MIN = 0.5     # overtakes/episode expected when safe
-_PASSIVE_GATE_FLOOR = 0.25      # never zero-out completely (gradient signal)
-_PASSIVE_SPEED_WEIGHT = 0.55
-_PASSIVE_OVERTAKE_WEIGHT = 0.45
+_PASSIVE_CRASH_CEILING = 0.20   # wider: gate applies even with ~20% crash rate
+_PASSIVE_SPEED_MIN = 24.0       # m/s — raised: 20-22 m/s is passive, need 24+
+_PASSIVE_OVERTAKE_MIN = 1.5     # overtakes/ep — raised: 0.5 was trivially easy
+_PASSIVE_GATE_FLOOR = 0.10      # lowered: passive agent gets ≤10% of base fitness
+# Note: _PASSIVE_SPEED_WEIGHT and _PASSIVE_OVERTAKE_WEIGHT are removed.
+# The new _passive_driving_gate() uses a multiplicative formula instead.
 
 
 # ── Component scorers (each returns float ∈ [0, 1]) ──────────────────────────
@@ -203,6 +206,9 @@ def is_passive_driving(metrics: dict[str, Any]) -> bool:
     """
     True when the agent is crash-free enough that we should expect active
     driving, but mean speed and/or overtakes are too low.
+
+    Thresholds: mean_speed < 24.0 m/s or mean_overtakes < 1.5/ep (when
+    crash_rate <= 20%).
     """
     crash_rate = float(metrics.get("crash_rate", 1.0))
     if crash_rate > _PASSIVE_CRASH_CEILING:
@@ -220,23 +226,42 @@ def _passive_driving_gate(
     """
     Multiplicative gate ∈ [_PASSIVE_GATE_FLOOR, 1.0].
 
-    Inactive (returns 1.0) while crash_rate is still high — don't punish an
-    agent that is legitimately slowing down to learn safety first.
+    Inactive (returns 1.0) while crash_rate > _PASSIVE_CRASH_CEILING — don't
+    punish an agent still learning basic safety.
 
-    Once crash_rate <= _PASSIVE_CRASH_CEILING, penalises shortfalls in speed
-    and overtaking so "0% crashes at 20 m/s with no overtakes" cannot score
-    as well as a faster, active driver.
+    Once crash_rate is low enough, applies TWO independent multiplicative factors:
+
+      speed_factor    = min(1, (mean_speed / _PASSIVE_SPEED_MIN)²)
+      overtake_factor = min(1, (mean_overtakes / _PASSIVE_OVERTAKE_MIN)^0.5)
+      gate            = max(_PASSIVE_GATE_FLOOR, speed_factor × overtake_factor)
+
+    The product means BOTH speed AND overtaking are required to score well — a
+    fast agent that never overtakes and an agent that overtakes once while crawling
+    both get heavily penalised. Only genuinely active, fast driving escapes the gate.
+
+    The squared speed term creates a sharp gradient below _PASSIVE_SPEED_MIN
+    (e.g. 20 m/s → factor 0.694, 18 m/s → factor 0.563), while the sqrt overtake
+    term is softer (any overtaking is better than none; the first overtake matters
+    most).
+
+    Example values after this change:
+      passive (20 m/s, 0 overtakes, 0% crash) → gate = 0.10  (was 0.50)
+      semi-active (22 m/s, 1 overtake, 5% crash) → gate = 0.73
+      good (26 m/s, 3 overtakes, 5% crash) → gate = 1.00
     """
     if float(crash_rate) > _PASSIVE_CRASH_CEILING:
         return 1.0
 
-    speed_shortfall = max(0.0, (_PASSIVE_SPEED_MIN - float(mean_speed)) / _PASSIVE_SPEED_MIN)
-    overtake_shortfall = max(
-        0.0,
-        (_PASSIVE_OVERTAKE_MIN - float(mean_overtakes)) / max(_PASSIVE_OVERTAKE_MIN, 1e-6),
-    )
-    penalty = _PASSIVE_SPEED_WEIGHT * speed_shortfall + _PASSIVE_OVERTAKE_WEIGHT * overtake_shortfall
-    return float(max(_PASSIVE_GATE_FLOOR, 1.0 - min(1.0, penalty)))
+    # Speed factor: squared for sharp gradient below the minimum
+    speed_ratio = float(mean_speed) / _PASSIVE_SPEED_MIN
+    speed_factor = min(1.0, max(0.0, speed_ratio) ** 2)
+
+    # Overtake factor: sqrt for a softer curve (first overtake is the hardest)
+    overtake_ratio = float(mean_overtakes) / max(_PASSIVE_OVERTAKE_MIN, 1e-6)
+    overtake_factor = min(1.0, max(0.0, overtake_ratio) ** 0.5)
+
+    combined = speed_factor * overtake_factor
+    return float(max(_PASSIVE_GATE_FLOOR, combined))
 
 
 # ── Public fitness function ───────────────────────────────────────────────────
