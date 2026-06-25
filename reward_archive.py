@@ -207,15 +207,17 @@ def is_passive_driving(metrics: dict[str, Any]) -> bool:
     True when the agent is crash-free enough that we should expect active
     driving, but mean speed and/or overtakes are too low.
 
-    Thresholds: mean_speed < 24.0 m/s or mean_overtakes < 1.5/ep (when
-    crash_rate <= 20%).
+    Uses v7 thresholds when default fitness version is 7.
     """
     crash_rate = float(metrics.get("crash_rate", 1.0))
-    if crash_rate > _PASSIVE_CRASH_CEILING:
+    ceiling = _V7_PASSIVE_CRASH_CEIL if FITNESS_VERSION_DEFAULT >= 7 else _PASSIVE_CRASH_CEILING
+    speed_min = _V7_PASSIVE_SPEED_MIN if FITNESS_VERSION_DEFAULT >= 7 else _PASSIVE_SPEED_MIN
+    ot_min = _V7_PASSIVE_OT_MIN if FITNESS_VERSION_DEFAULT >= 7 else _PASSIVE_OVERTAKE_MIN
+    if crash_rate > ceiling:
         return False
     mean_speed = float(metrics.get("mean_speed", 0.0))
     mean_overtakes = float(metrics.get("mean_overtakes", 0.0))
-    return mean_speed < _PASSIVE_SPEED_MIN or mean_overtakes < _PASSIVE_OVERTAKE_MIN
+    return mean_speed < speed_min or mean_overtakes < ot_min
 
 
 def _passive_driving_gate(
@@ -264,27 +266,145 @@ def _passive_driving_gate(
     return float(max(_PASSIVE_GATE_FLOOR, combined))
 
 
-# ── Public fitness function ───────────────────────────────────────────────────
+# ── Fitness v7 parameters ─────────────────────────────────────────────────────
+FITNESS_VERSION_DEFAULT = 7
+
+_V7_W = {
+    "activity": 0.35,
+    "speed": 0.15,
+    "overtake": 0.15,
+    "lane_eff": 0.05,
+    "ttc": 0.15,
+    "comfort": 0.15,
+}
+assert abs(sum(_V7_W.values()) - 1.0) < 1e-9
+
+_V7_SPEED_K = 0.55
+_V7_SPEED_MID = 24.0
+_V7_OVERTAKE_REF = 2.0
+_V7_OVERTAKE_ALPHA = 0.7
+_V7_ACTIVITY_SPEED_EXP = 0.6
+_V7_ACTIVITY_OT_EXP = 0.4
+_V7_LANE_EFF_REF = 0.35
+
+_V7_SAFETY_C0 = 0.10
+_V7_SAFETY_LAMBDA = 0.55
+_V7_SAFETY_GAMMA = 1.2
+_V7_NEAR_MISS_LAMBDA = 0.10
+_V7_NEAR_MISS_TTC = 2.0
+
+_V7_PASSIVE_CRASH_CEIL = 0.40
+_V7_PASSIVE_SPEED_MIN = 24.0
+_V7_PASSIVE_OT_MIN = 1.0
+_V7_PASSIVE_LAMBDA = 0.35
+_V7_PASSIVE_TARGET = 0.5
+
+_V7_TREND_LAMBDA = 0.15
+_V7_CURRICULUM_ETA = 0.8
+_V7_CURRICULUM_BANDS = (
+    (0.50, 0.35),  # phase A — safety
+    (0.35, 0.10),  # phase B — efficiency
+    (0.15, 0.05),  # phase C — active overtaking
+)
+
+_V7_HARD_CRASH_LIMIT = 0.50
+_V7_PASSIVE_CAP = 0.12
+_V7_STATIONARY_SPEED_MAX = 5.0
+_V7_STATIONARY_PENALTY = 0.30
 
 
-def compute_fitness(metrics: dict[str, Any]) -> float:
-    """
-    Computes a scalar fitness score in [0, 1] from evaluation metrics.
+def _speed_score_v7(mean_speed: float) -> float:
+    x = _V7_SPEED_K * (float(mean_speed) - _V7_SPEED_MID)
+    return float(1.0 / (1.0 + math.exp(-x)))
 
-    Accepts both v3 metrics (no min_ttc/p10_ttc) and v4 metrics.
 
-    Parameters
-    ──────────
-    metrics : dict with keys:
-        mean_speed       float   m/s
-        crash_rate       float   [0, 1]
-        mean_overtakes   float   overtakes/episode
-        completion_rate  float   fraction of episodes not ending in crash
-        mean_long_jerk   float   mean |longitudinal jerk| m/s³
-        mean_ttc         float   mean time-to-collision [s]
-        p10_ttc          float   10th-percentile TTC [s]  (NEW, optional)
-        min_ttc          float   minimum TTC [s]          (NEW, optional)
-    """
+def _overtake_score_v7(mean_overtakes: float) -> float:
+    ratio = float(mean_overtakes) / max(_V7_OVERTAKE_REF, 1e-6)
+    return float(min(1.0, max(0.0, ratio) ** _V7_OVERTAKE_ALPHA))
+
+
+def _activity_score_v7(mean_speed: float, mean_overtakes: float) -> float:
+    s_v = _speed_score_v7(mean_speed)
+    s_o = _overtake_score_v7(mean_overtakes)
+    return float((s_v ** _V7_ACTIVITY_SPEED_EXP) * (s_o ** _V7_ACTIVITY_OT_EXP))
+
+
+def _activity_product_v7(mean_speed: float, mean_overtakes: float) -> float:
+    speed_factor = min(1.0, (float(mean_speed) / _V7_PASSIVE_SPEED_MIN) ** 2)
+    overtake_factor = min(1.0, (float(mean_overtakes) / _V7_PASSIVE_OT_MIN) ** 0.5)
+    return float(speed_factor * overtake_factor)
+
+
+def _lane_efficiency_score(metrics: dict[str, Any]) -> float:
+    lane_changes = int(metrics.get("total_lane_changes", 0))
+    if lane_changes <= 0:
+        return 1.0
+    total_overtakes = metrics.get("total_overtakes")
+    if total_overtakes is None:
+        n_eps = max(int(metrics.get("n_episodes", 1)), 1)
+        total_overtakes = float(metrics.get("mean_overtakes", 0.0)) * n_eps
+    ratio = min(1.0, float(total_overtakes) / lane_changes)
+    return float(min(1.0, ratio / _V7_LANE_EFF_REF))
+
+
+def _stationary_penalty_v7(mean_speed: float) -> float:
+    if float(mean_speed) < _V7_STATIONARY_SPEED_MAX:
+        return _V7_STATIONARY_PENALTY
+    return 0.0
+
+
+def _safety_penalty_v7(crash_rate: float) -> float:
+    cr = float(crash_rate)
+    return float(_V7_SAFETY_LAMBDA * (max(0.0, cr - _V7_SAFETY_C0) ** _V7_SAFETY_GAMMA))
+
+
+def _near_miss_penalty_v7(min_ttc: float) -> float:
+    if min_ttc < 0:
+        return 0.0
+    return float(_V7_NEAR_MISS_LAMBDA * max(0.0, 1.0 - float(min_ttc) / _V7_NEAR_MISS_TTC))
+
+
+def _passive_penalty_v7(mean_speed: float, mean_overtakes: float, crash_rate: float) -> float:
+    if float(crash_rate) > _V7_PASSIVE_CRASH_CEIL:
+        return 0.0
+    activity = _activity_product_v7(mean_speed, mean_overtakes)
+    return float(_V7_PASSIVE_LAMBDA * max(0.0, _V7_PASSIVE_TARGET - activity))
+
+
+def _trend_penalty_v7(metrics: dict[str, Any], prev_metrics: dict[str, Any] | None) -> float:
+    if not prev_metrics:
+        return 0.0
+    delta_speed = float(metrics.get("mean_speed", 0.0)) - float(prev_metrics.get("mean_speed", 0.0))
+    delta_crash = float(metrics.get("crash_rate", 0.0)) - float(prev_metrics.get("crash_rate", 0.0))
+    if delta_speed >= 0.0 or delta_crash >= 0.0:
+        return 0.0
+    return float(_V7_TREND_LAMBDA * (-delta_speed))
+
+
+def _curriculum_phase(generation: int, crash_rate: float) -> int:
+    if float(crash_rate) > 0.40 or generation <= 1:
+        return 0
+    if generation <= 4 or float(crash_rate) > 0.15:
+        return 1
+    return 2
+
+
+def _curriculum_ceiling_v7(crash_rate: float, phase: int) -> float:
+    c_ceil, c_floor = _V7_CURRICULUM_BANDS[phase]
+    cr = float(crash_rate)
+    if cr >= c_ceil:
+        return 0.0
+    if cr <= c_floor:
+        return 1.0
+    span = max(c_ceil - c_floor, 1e-6)
+    return float(((c_ceil - cr) / span) ** _V7_CURRICULUM_ETA)
+
+
+# ── Public fitness functions ──────────────────────────────────────────────────
+
+
+def compute_fitness_v6(metrics: dict[str, Any]) -> float:
+    """Legacy v6 fitness (multiplicative safety × passive gates)."""
     crash_rate      = float(metrics.get("crash_rate", 0.5))
     mean_speed      = float(metrics.get("mean_speed", 0.0))
     mean_overtakes  = float(metrics.get("mean_overtakes", 0.0))
@@ -312,6 +432,83 @@ def compute_fitness(metrics: dict[str, Any]) -> float:
     passive = _passive_driving_gate(mean_speed, mean_overtakes, crash_rate)
     fitness = float(max(0.0, min(1.0, base * safety * passive)))
     return round(fitness, 4)
+
+
+def compute_fitness_v7(
+    metrics: dict[str, Any],
+    *,
+    generation: int = 0,
+    prev_metrics: dict[str, Any] | None = None,
+) -> float:
+    """
+    Fitness v7 — additive base with bounded penalties and curriculum ceiling.
+
+    Addresses v6 failure modes: transition-ridge peak, slow-to-survive reward,
+    and completion/crash double-counting.
+    """
+    crash_rate = float(metrics.get("crash_rate", 0.5))
+    if crash_rate > _V7_HARD_CRASH_LIMIT:
+        return 0.01
+
+    mean_speed = float(metrics.get("mean_speed", 0.0))
+    mean_overtakes = float(metrics.get("mean_overtakes", 0.0))
+    mean_long_jerk = float(metrics.get("mean_long_jerk", 0.0))
+    mean_ttc = float(metrics.get("mean_ttc", 30.0))
+    p10_ttc = float(metrics.get("p10_ttc", -1.0))
+    min_ttc = float(metrics.get("min_ttc", -1.0))
+
+    s_activity = _activity_score_v7(mean_speed, mean_overtakes)
+    s_speed = _speed_score_v7(mean_speed)
+    s_overtake = _overtake_score_v7(mean_overtakes)
+    s_lane = _lane_efficiency_score(metrics)
+    s_ttc = _ttc_score(mean_ttc, p10_ttc, min_ttc)
+    s_comfort = _comfort_score(mean_long_jerk)
+
+    base = (
+        _V7_W["activity"] * s_activity
+        + _V7_W["speed"] * s_speed
+        + _V7_W["overtake"] * s_overtake
+        + _V7_W["lane_eff"] * s_lane
+        + _V7_W["ttc"] * s_ttc
+        + _V7_W["comfort"] * s_comfort
+    )
+
+    penalty = (
+        _safety_penalty_v7(crash_rate)
+        + _near_miss_penalty_v7(min_ttc)
+        + _passive_penalty_v7(mean_speed, mean_overtakes, crash_rate)
+        + _stationary_penalty_v7(mean_speed)
+        + _trend_penalty_v7(metrics, prev_metrics)
+    )
+
+    phase = _curriculum_phase(generation, crash_rate)
+    ceiling = _curriculum_ceiling_v7(crash_rate, phase)
+    fitness = max(0.0, min(1.0, base - penalty)) * ceiling
+
+    if crash_rate <= 0.05 and mean_speed < 22.0 and mean_overtakes < 0.3:
+        fitness = min(fitness, _V7_PASSIVE_CAP)
+
+    return round(float(fitness), 4)
+
+
+def compute_fitness(
+    metrics: dict[str, Any],
+    *,
+    generation: int = 0,
+    prev_metrics: dict[str, Any] | None = None,
+    version: int | None = None,
+) -> float:
+    """
+    Dispatch to the configured fitness version (default: v7).
+
+    Optional ``prev_metrics`` enables the slow-to-survive trend penalty in v7.
+  """
+    ver = FITNESS_VERSION_DEFAULT if version is None else version
+    if ver == 6:
+        return compute_fitness_v6(metrics)
+    if ver == 7:
+        return compute_fitness_v7(metrics, generation=generation, prev_metrics=prev_metrics)
+    raise ValueError(f"Unsupported fitness version: {ver}")
 
 
 # ── Structured failure mode detection (improvement #4) ───────────────────────
@@ -491,6 +688,7 @@ class RewardArchive:
         data = {
             "meta": {
                 "total_generations": len(self.entries),
+                "fitness_version": FITNESS_VERSION_DEFAULT,
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             },
             "entries": self.entries,
@@ -507,13 +705,20 @@ class RewardArchive:
         metrics: dict[str, Any],
         critique: str = "",
     ) -> dict[str, Any]:
-        fitness = compute_fitness(metrics)
+        prev_metrics = self.entries[-1]["metrics"] if self.entries else None
+        generation = len(self.entries)
+        fitness = compute_fitness(
+            metrics,
+            generation=generation,
+            prev_metrics=prev_metrics,
+        )
         critique_meta = parse_structured_critique(critique, metrics)
         entry: dict[str, Any] = {
-            "generation": len(self.entries),
+            "generation": generation,
             "reward_code": reward_code,
             "metrics": dict(metrics),
             "fitness": fitness,
+            "fitness_version": FITNESS_VERSION_DEFAULT,
             "critique": critique,
             "critique_meta": critique_meta,          # improvement #4
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),

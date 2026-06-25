@@ -221,6 +221,7 @@ def _interruptible_sleep(seconds: float) -> None:
         time.sleep(min(1.0, remaining))
 
 
+def _min_cooldown_wait(cooldown_until: dict[str, float], keys: list[str]) -> float:
     """Returns the minimum wait time until a key becomes available."""
     now = time.time()
     waits = [

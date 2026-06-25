@@ -7,6 +7,8 @@ Usage:
   python evaluate.py --model ppo_highway_txt2reward.zip
   python evaluate.py --model ppo_highway_txt2reward.zip --episodes 20 --render
   python evaluate.py --model ppo_highway_txt2reward.zip --generation 3
+  python evaluate.py --model ppo_highway_50000_steps.zip --episodes 20 --render
+
 
 The evaluator runs the current reward_program.py by default.
 Use --generation N to evaluate with a specific archived reward program.
@@ -74,7 +76,7 @@ def _write_validated_archive_reward(entry: dict, generation: int) -> str:
     if not ok:
         raise ValueError(f"Generation {generation} failed AST validation: {err}")
 
-    smoke_ok, smoke_err = _full_validation_pipeline(code)
+    smoke_ok, smoke_err, _ = _full_validation_pipeline(code)
     if not smoke_ok:
         raise ValueError(f"Generation {generation} failed smoke test: {smoke_err}")
 

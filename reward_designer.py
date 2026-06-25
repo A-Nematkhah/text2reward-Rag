@@ -86,21 +86,35 @@ DEFAULT_BOOTSTRAP_REWARD_BODY = """\
 def compute_reward(state):
     if state["collided"]:
         return -30.0
-    speed_reward = clip(state["speed_ms"] * 0.1, 0.0, 3.0)
-    ttc_penalty = -3.0 if state["ttc"] < 1.0 else -1.0 if state["ttc"] < 3.0 else 0.0
-    overtake_bonus = 2.0 if state["overtook"] else 0.0
-    jerk_penalty = -0.02 * (abs(state["long_jerk"]) + abs(state["lat_jerk"]))
-    accel_penalty = -0.02 * abs(state["accel_ms2"])
-    safe_gap_reward = 0.05 * clip(state["front_dist"] - 15.0, 0.0, 30.0)
-    lane_change_penalty = -0.1 if state["lane_changed"] else 0.0
+    speed = state["speed_ms"]
+    clear_road = state["front_dist"] > 40.0 and state["ttc"] > 5.0
+    speed_reward = clip(speed * 0.12, 0.0, 4.0)
+    slow_penalty = -0.6 if clear_road and speed < 22.0 else 0.0
+    cruise_tax = -2.0 if clear_road and not state["overtook"] and speed > 22.0 else 0.0
+    no_overtake_tax = (
+        -1.1
+        if clear_road and not state["overtook"] and not state["lane_changed"]
+        else (-0.45 if clear_road and not state["overtook"] else 0.0)
+    )
+    ttc_penalty = -3.0 if state["ttc"] < 1.0 else -1.5 if state["ttc"] < 3.0 else 0.0
+    tailgate_penalty = -1.2 if state["front_dist"] < 20.0 and state["ttc"] < 4.0 else 0.0
+    overtake_bonus = 3.0 if state["overtook"] else 0.0
+    jerk_penalty = -0.08 * (abs(state["long_jerk"]) + abs(state["lat_jerk"]))
+    accel_penalty = -0.05 * abs(state["accel_ms2"])
+    gap_bonus = 0.008 * clip(state["front_dist"] - 25.0, 0.0, 15.0) if speed >= 22.0 else 0.0
+    lc_penalty = -0.35 if state["lane_changed"] and not state["overtook"] else 0.0
     return (
         speed_reward
+        + slow_penalty
+        + cruise_tax
+        + no_overtake_tax
         + ttc_penalty
+        + tailgate_penalty
         + overtake_bonus
         + jerk_penalty
         + accel_penalty
-        + safe_gap_reward
-        + lane_change_penalty
+        + gap_bonus
+        + lc_penalty
     )
 """
 
@@ -140,8 +154,8 @@ _SMOKE_TEST_TIMEOUT_SEC = 0.5
 # Stage B (trajectory bank) gate parameters. Kept here rather than in
 # trajectory_bank.py so the designer's repair-loop tolerance is tunable
 # independently of the bank/gate module itself.
-_BANK_MAX_VIOLATION_RATE = 0.10
-_BANK_MIN_FITNESS_GAP = 0.05
+_BANK_MAX_VIOLATION_RATE = 0.12
+_BANK_MIN_FITNESS_GAP = 0.06
 
 # Built once at import time: the bank is deterministic (fixed seed), so
 # there is no reason to rebuild it for every single generation/repair
@@ -205,11 +219,10 @@ DESIGN PRINCIPLES:
     * Overtake bonus: large one-shot reward (+2 to +4) when overtook == True
     * Jerk/accel penalties should be small (0.01-0.05 scale) to not suppress action
     * Avoid rewarding stationary behaviour or unnecessary lane changes
-    * ANTI-PASSIVE-DRIVING: zero crashes alone is NOT success. When front_dist > 50
-      and ttc > 5, the agent MUST be rewarded for speed >= 24 m/s and penalised for
-      sustained speed < 22 m/s. Do NOT stack so many safety penalties that crawling
-      at 18-20 m/s becomes optimal. Do NOT make safe_gap or front_dist bonuses so
-      large that slowing down (which increases front_dist) becomes profitable.
+    * ANTI-PASSIVE-DRIVING: zero crashes alone is NOT success. When front_dist > 40
+      and ttc > 5 (clear road), penalise speed > 22 m/s without overtakes (cruise_tax)
+      and speed < 22 m/s (slow_penalty). Do NOT use large safe_gap / front_dist
+      bonuses — they let passive cruising farm reward without overtaking.
     * SPEED INCENTIVE TEST: the validation pipeline will execute your function at
       28 m/s and 14 m/s with identical safe conditions (front_dist=40, ttc=12,
       no collision). Your function MUST return strictly more reward at 28 m/s.
@@ -626,7 +639,7 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _full_validation_pipeline(code: str) -> tuple[bool, str]:
+def _full_validation_pipeline(code: str) -> tuple[bool, str, str]:
     """
     Two-stage smoke test, run in sequence:
 
@@ -648,18 +661,19 @@ def _full_validation_pipeline(code: str) -> tuple[bool, str]:
                         without ever crashing, lane-thrashing, or
                         accel/jerk spam with no net speed gain.
 
-    Returns (ok, error_message). On Stage B failure, error_message is the
-    full per-pair violation report from evaluate_consistency(), suitable
-    for feeding straight back into the LLM repair prompt.
+    Returns (ok, full_error_message, console_summary). On Stage B failure,
+    full_error_message is the per-pair violation report for the LLM repair
+    prompt; console_summary is a one-line summary for terminal logs.
     """
     stage_a_ok, stage_a_err = _smoke_test_reward_code(code)
     if not stage_a_ok:
-        return False, stage_a_err
+        return False, stage_a_err, stage_a_err
 
     try:
         reward_fn = compile_reward_function(code)
     except Exception as exc:
-        return False, f"Compile error during Stage B setup: {type(exc).__name__}: {exc}"
+        msg = f"Compile error during Stage B setup: {type(exc).__name__}: {exc}"
+        return False, msg, msg
 
     def _timed_fn(state: dict):
         return execute_reward(
@@ -669,16 +683,16 @@ def _full_validation_pipeline(code: str) -> tuple[bool, str]:
             compiled_fn=reward_fn,
         )
 
-    stage_b_ok, stage_b_report = evaluate_consistency(
+    stage_b_ok, stage_b_report, stage_b_console = evaluate_consistency(
         _timed_fn,
         bank=_TRAJECTORY_BANK,
         max_violation_rate=_BANK_MAX_VIOLATION_RATE,
         min_fitness_gap=_BANK_MIN_FITNESS_GAP,
     )
     if not stage_b_ok:
-        return False, stage_b_report
+        return False, stage_b_report, stage_b_console
 
-    return True, ""
+    return True, "", "PASS"
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -831,9 +845,9 @@ class RewardDesigner:
         restored_code = entry["reward_code"]
 
         ok, err = validate_reward_code(restored_code)
-        smoke_ok, smoke_err = (False, "(skipped: structural validation failed)")
+        smoke_ok, smoke_err, smoke_console = (False, "(skipped: structural validation failed)", "")
         if ok:
-            smoke_ok, smoke_err = _full_validation_pipeline(restored_code)
+            smoke_ok, smoke_err, _smoke_console = _full_validation_pipeline(restored_code)
 
         if ok and smoke_ok:
             self._save_reward_program(restored_code)
@@ -1043,7 +1057,6 @@ class RewardDesigner:
         new_code = self._call_generate_with_repair(archive_context)
 
         if new_code is None:
-            print("[designer] LLM generation failed -- keeping current reward.")
             self._active_generation = entry["generation"]
             self._episode_stats = overflow_stats
             return False
@@ -1072,6 +1085,9 @@ class RewardDesigner:
 
         raw: str | None = None
         repair_error: str = ""
+
+        if self.verbose:
+            print(f"[designer] Generating reward ({max_retries} attempts max)...")
 
         for attempt in range(1, max_retries + 1):
             # On attempt 1, use the standard generation prompt.
@@ -1108,37 +1124,52 @@ class RewardDesigner:
                     idx = raw.index("def compute_reward")
                     raw = raw[idx:]
             except Exception as exc:
-                print(
-                    f"[designer] Generate attempt {attempt}/{max_retries} failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+                if self.verbose:
+                    print(
+                        f"[designer] attempt {attempt}/{max_retries}: "
+                        f"API error — {type(exc).__name__}: {exc}"
+                    )
                 if attempt < max_retries:
                     time.sleep(2**attempt)
                 raw = None
                 repair_error = f"API error: {exc}"
                 continue
 
-            if self.verbose:
-                print(f"[designer] Generated reward ({len(raw)} chars)")
-
             # ── Structural validation (AST) ───────────────────────────────
             ok, err = validate_reward_code(raw)
             if not ok:
-                print(f"[designer] Validation failed (attempt {attempt}): {err}")
+                if self.verbose:
+                    print(
+                        f"[designer] attempt {attempt}/{max_retries}: "
+                        f"AST fail — {err}"
+                    )
                 repair_error = f"Structural validation error: {err}"
                 continue
 
             # ── Smoke-test: Stage A (fast) then Stage B (full bank) ────────
-            smoke_ok, smoke_err = _full_validation_pipeline(raw)
+            smoke_ok, smoke_err, smoke_console = _full_validation_pipeline(raw)
             if not smoke_ok:
-                print(f"[designer] Smoke-test failed (attempt {attempt}):\n{smoke_err}")
+                if self.verbose:
+                    print(
+                        f"[designer] attempt {attempt}/{max_retries}: "
+                        f"smoke fail — {smoke_console}"
+                    )
                 repair_error = smoke_err
                 continue
 
+            if self.verbose:
+                print(
+                    f"[designer] attempt {attempt}/{max_retries}: "
+                    f"accepted ({len(raw)} chars)"
+                )
             # Both checks passed — return the valid code.
             return raw
 
-        print(f"[designer] All {max_retries} attempts failed — keeping current reward.")
+        if self.verbose:
+            print(
+                f"[designer] evolution skipped — all {max_retries} attempts "
+                f"failed smoke-test; keeping current reward"
+            )
         return None
 
     # ── LLM: legacy generate (kept for internal use; routes to repair loop) ──

@@ -5,27 +5,12 @@ import os
 import tempfile
 
 from reward_archive import RewardArchive
-from reward_designer import RewardDesigner, _is_placeholder_code
+from reward_designer import RewardDesigner, _is_placeholder_code, DEFAULT_BOOTSTRAP_REWARD_BODY
 from trajectory_bank import build_trajectory_bank, evaluate_consistency
 
 
 def _passing_reward_code() -> str:
-    return (
-        "def compute_reward(state):\n"
-        '    if state["collided"]:\n'
-        "        return -30.0\n"
-        "    reward = 0.0\n"
-        '    reward += 0.2 * (state["speed_ms"] / 30.0) ** 2\n'
-        '    reward += 3.5 if state["overtook"] else 0.0\n'
-        '    reward += 0 if state["ttc"] > 3 else -0.2 * (3 - state["ttc"])\n'
-        '    reward -= 0.02 * abs(state["long_jerk"])\n'
-        '    reward -= 0.02 * abs(state["lat_jerk"])\n'
-        '    reward += (0.2 if state["speed_ms"] >= 24 else -0.1) if state["front_dist"] > 50 and state["ttc"] > 5 else 0\n'
-        '    reward += -0.2 if state["front_dist"] < 20 else 0.0\n'
-        '    reward += -0.1 if state["lane_changed"] and not state["overtook"] else 0.0\n'
-        '    reward += -0.2 if state["front_dist"] > 50 and state["ttc"] > 5 and state["speed_ms"] < 20 else 0.0\n'
-        "    return reward\n"
-    )
+    return DEFAULT_BOOTSTRAP_REWARD_BODY.strip()
 
 
 def test_trajectory_metrics_include_robust_ttc():
@@ -47,7 +32,7 @@ def test_hard_violations_fail_consistency_gate():
     def bad_reward(state):
         return 100.0 if state["collided"] else 0.0
 
-    ok, report = evaluate_consistency(bad_reward, bank=bank, max_violation_rate=1.0)
+    ok, report, _ = evaluate_consistency(bad_reward, bank=bank, max_violation_rate=1.0)
     assert not ok
     assert "hard safety violations" in report
 
@@ -110,5 +95,5 @@ def test_archive_remove_generation():
 def test_generation_pipeline_validation():
     from reward_designer import _full_validation_pipeline
 
-    ok, err = _full_validation_pipeline(_passing_reward_code())
+    ok, err, _ = _full_validation_pipeline(_passing_reward_code())
     assert ok, err

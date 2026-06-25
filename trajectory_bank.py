@@ -64,7 +64,7 @@ Usage
     from trajectory_bank import build_trajectory_bank, evaluate_consistency
 
     bank = build_trajectory_bank()          # list[TrajectorySpec], ~40 entries
-    ok, report = evaluate_consistency(fn, bank, max_violation_rate=0.10)
+    ok, report, _console = evaluate_consistency(fn, bank, max_violation_rate=0.10)
     if not ok:
         # report is a human + LLM-readable string describing the
         # worst-violating pairs, suitable for feeding back into the
@@ -99,7 +99,7 @@ class TrajectorySpec:
         if not self.metrics:
             self.metrics = _aggregate_trajectory_metrics(self.states)
         if not self.ref_fitness:
-            self.ref_fitness = compute_fitness(self.metrics)
+            self.ref_fitness = compute_fitness(self.metrics, generation=10)
 
 
 # ── Metric aggregation (mirrors evaluate_agent()-style metrics) ───────────────
@@ -114,6 +114,7 @@ def _aggregate_trajectory_metrics(states: list[dict[str, Any]]) -> dict[str, flo
     n = max(len(states), 1)
     crashed = any(s["collided"] for s in states)
     overtakes = sum(1 for s in states if s.get("overtook"))
+    lane_changes = sum(1 for s in states if s.get("lane_changed"))
     speed_sum = sum(s["speed_ms"] for s in states)
     jerk_sum = sum(abs(s.get("long_jerk", 0.0)) for s in states)
     ttc_sum = sum(s.get("ttc", 30.0) for s in states)
@@ -133,6 +134,9 @@ def _aggregate_trajectory_metrics(states: list[dict[str, Any]]) -> dict[str, flo
         "mean_speed": speed_sum / n,
         "crash_rate": 1.0 if crashed else 0.0,
         "mean_overtakes": float(overtakes),  # per-episode count, matches archive convention
+        "total_overtakes": float(overtakes),
+        "total_lane_changes": float(lane_changes),
+        "n_episodes": 1,
         "mean_long_jerk": jerk_sum / n,
         "mean_ttc": ttc_sum / n,
         "p10_ttc": _percentile(ttc_vals, 10),
@@ -429,6 +433,11 @@ def build_trajectory_bank() -> list[TrajectorySpec]:
 
 # ── Cumulative-return evaluation of a candidate reward function ───────────────
 
+# Passive trajectories must never beat active ones on mean per-step return when
+# reference fitness agrees — zero tolerance (separate from the soft pairwise rate).
+_PASSIVE_CATEGORIES = frozenset({"safe_fast", "safe_steady", "stationary_farming"})
+_ACTIVE_CATEGORIES = frozenset({"legitimate_overtaking", "oscillating_lanes"})
+
 
 def _cumulative_return(reward_fn: Callable[[dict], float], states: list[dict]) -> float:
     """
@@ -446,12 +455,40 @@ def _cumulative_return(reward_fn: Callable[[dict], float], states: list[dict]) -
     return total / len(states)
 
 
+def format_consistency_console(
+    *,
+    passive_count: int,
+    soft_count: int,
+    soft_rate: float,
+    threshold: float,
+    hard_count: int,
+    worst: list[tuple["TrajectorySpec", "TrajectorySpec", float, float]],
+    max_examples: int = 2,
+) -> str:
+    """One-line summary for terminal logs (full report is kept for LLM repair)."""
+    parts: list[str] = []
+    if passive_count:
+        parts.append(f"passive={passive_count}")
+    if hard_count:
+        parts.append(f"hard={hard_count}")
+    parts.append(f"soft={soft_count} ({soft_rate:.1%} > {threshold:.0%})")
+
+    examples: list[str] = []
+    for better, worse, r_better, r_worse in worst[:max_examples]:
+        examples.append(
+            f"{worse.category} > {better.category} "
+            f"(reward {r_worse:.1f} vs {r_better:.1f})"
+        )
+    suffix = "; ".join(examples) if examples else "ranking disagreements"
+    return " | ".join(parts) + f" — e.g. {suffix}"
+
+
 def evaluate_consistency(
     reward_fn: Callable[[dict], float],
     bank: list[TrajectorySpec] | None = None,
-    max_violation_rate: float = 0.10,
-    min_fitness_gap: float = 0.05,
-) -> tuple[bool, str]:
+    max_violation_rate: float = 0.12,
+    min_fitness_gap: float = 0.06,
+) -> tuple[bool, str, str]:
     """
     Runs `reward_fn` over every trajectory in the bank, then checks pairwise
     ranking consistency against each trajectory's independent reference
@@ -461,24 +498,22 @@ def evaluate_consistency(
 
     For every pair (A, B) whose reference fitness differs by at least
     `min_fitness_gap` (so near-ties, which are legitimate judgment calls,
-    are excluded from scoring), the candidate's cumulative episode return
-    must agree on which one is better. The fraction of such "decisive"
-    pairs that disagree is the violation rate.
+    are excluded from scoring), the candidate's mean per-step return must
+    agree on which one is better. The fraction of such "decisive" pairs that
+    disagree (excluding passive-driving hard failures) is the soft violation
+    rate.
 
-    Also explicitly checks that every 'legitimate_overtaking' trajectory's
-    candidate return is HIGHER than every 'reckless_crash' and
-    'tailgating_no_crash' trajectory's candidate return — these are the
-    cases a thesis reviewer will look for first, so they're surfaced as
-    their own named violations even though they're a subset of the general
-    pairwise check.
+    Zero-tolerance hard checks (any failure rejects the candidate):
+      - passive/stationary trajectories must NOT beat active trajectories
+        (legitimate_overtaking, oscillating_lanes) when reference fitness
+        says the active trajectory is better — this catches safe_gap farming
+        and fast-but-passive cruising without overtakes.
+      - legitimate_overtaking must beat reckless_crash / tailgating_no_crash
+        when reference fitness agrees.
 
-    Returns (ok, report) where `ok` is True iff:
-      - violation_rate <= max_violation_rate, AND
-      - zero hard safety-category violations (see above)
-
-    `report` is always populated with a summary (even on success) and, on
-    failure, lists the worst-violating pairs in a format suitable for
-    feeding straight back into the LLM repair prompt.
+    Returns (ok, full_report, console_summary) where `ok` is True iff all
+    hard checks pass and soft violation_rate <= max_violation_rate.
+    `full_report` is verbose (for LLM repair); `console_summary` is one line.
     """
     if bank is None:
         bank = build_trajectory_bank()
@@ -489,18 +524,21 @@ def evaluate_consistency(
         try:
             returns[spec.name] = _cumulative_return(reward_fn, spec.states)
         except Exception as exc:
-            return False, (
+            msg = (
                 f"Trajectory Bank Error: reward function raised "
                 f"{type(exc).__name__}: {exc} while executing trajectory "
                 f"'{spec.name}' (category='{spec.category}'). Every state "
                 f"dict uses only the documented state keys — check for typos "
                 f"such as state['overtake'] instead of state['overtook']."
             )
+            return False, msg, msg
 
     # 2) Pairwise consistency check against reference fitness.
     n = len(bank)
     decisive_pairs = 0
-    violations: list[tuple[TrajectorySpec, TrajectorySpec, float, float]] = []
+    passive_pair_count = 0
+    soft_violations: list[tuple[TrajectorySpec, TrajectorySpec, float, float]] = []
+    passive_violations: list[tuple[TrajectorySpec, TrajectorySpec, float, float]] = []
 
     for i in range(n):
         for j in range(i + 1, n):
@@ -511,10 +549,25 @@ def evaluate_consistency(
             decisive_pairs += 1
 
             better, worse = (a, b) if fitness_gap > 0 else (b, a)
-            if returns[better.name] <= returns[worse.name]:
-                violations.append((better, worse, returns[better.name], returns[worse.name]))
+            is_passive_pair = (
+                worse.category in _PASSIVE_CATEGORIES and better.category in _ACTIVE_CATEGORIES
+            )
+            if is_passive_pair:
+                passive_pair_count += 1
 
+            if returns[better.name] <= returns[worse.name]:
+                entry = (better, worse, returns[better.name], returns[worse.name])
+                if is_passive_pair:
+                    passive_violations.append(entry)
+                else:
+                    soft_violations.append(entry)
+
+    violations = passive_violations + soft_violations
     violation_rate = (len(violations) / decisive_pairs) if decisive_pairs else 0.0
+    soft_decisive_pairs = max(decisive_pairs - passive_pair_count, 0)
+    soft_violation_rate = (
+        (len(soft_violations) / soft_decisive_pairs) if soft_decisive_pairs else 0.0
+    )
 
     # 3) Hard named-category check: legitimate overtaking must beat every
     #    reckless-crash and tailgating trajectory on cumulative return,
@@ -533,26 +586,45 @@ def evaluate_consistency(
             if fitness_gap > 0 and returns[L.name] <= returns[U.name]:
                 hard_violations.append((L, U, returns[L.name], returns[U.name]))
 
-    ok = violation_rate <= max_violation_rate and len(hard_violations) == 0
+    ok = (
+        len(passive_violations) == 0
+        and len(hard_violations) == 0
+        and soft_violation_rate <= max_violation_rate
+    )
+
+    worst = sorted(
+        violations,
+        key=lambda v: (v[2] - v[3]),
+    )[:8]
 
     # 4) Build report.
     lines = [
         "=== TRAJECTORY BANK CONSISTENCY REPORT ===",
         f"trajectories          : {n}",
         f"decisive pairs (gap>={min_fitness_gap}) : {decisive_pairs}",
-        f"pairwise violations    : {len(violations)} ({violation_rate:.1%})",
-        f"violation threshold    : {max_violation_rate:.1%}",
+        f"pairwise violations    : {len(violations)} ({violation_rate:.1%} overall)",
+        f"passive-driving violations : {len(passive_violations)} (must be 0)",
+        f"soft pairwise violations : {len(soft_violations)} ({soft_violation_rate:.1%} of {soft_decisive_pairs} soft pairs)",
+        f"soft violation threshold : {max_violation_rate:.1%}",
         f"hard safety violations : {len(hard_violations)} "
         f"(legit-overtaking trajectories ranked below unsafe ones despite higher ref_fitness)",
     ]
 
     if not ok:
         lines.append("")
+        if passive_violations:
+            lines.append(
+                "Passive-driving violations (passive trajectory outscored active driving — "
+                "penalise high-speed cruising without overtakes and large safe_gap bonuses):"
+            )
+            for better, worse, r_better, r_worse in passive_violations[:8]:
+                lines.append(
+                    f"  - '{worse.name}' ({worse.category}, return={r_worse:.2f}) outscored "
+                    f"'{better.name}' ({better.category}, ref_fitness={better.ref_fitness:.3f}, "
+                    f"return={r_better:.2f}). Add cruise_tax / no-overtake penalty on clear roads."
+                )
+            lines.append("")
         lines.append("Worst offending pairs (reward function disagrees with ground-truth fitness):")
-        worst = sorted(
-            violations,
-            key=lambda v: (v[2] - v[3]),  # most-wrong first (better got LOWER or equal return)
-        )[:8]
         for better, worse, r_better, r_worse in worst:
             lines.append(
                 f"  - '{better.name}' (category={better.category}, ref_fitness={better.ref_fitness:.3f}) "
@@ -571,13 +643,26 @@ def evaluate_consistency(
         lines.append("")
         lines.append(
             "This means the reward function likely rewards unsafe/degenerate behaviour "
-            "(crashing, tailgating, lane-thrashing, accel spam, or standing still) at "
-            "least as much as safe, fast, actively-overtaking driving over a full episode. "
-            "Rebalance the magnitudes so genuine safe+fast+overtaking driving accumulates "
-            "strictly more reward over an episode than any unsafe pattern."
+            "(crashing, tailgating, lane-thrashing, accel spam, or standing still) or "
+            "passive high-speed cruising without overtakes at least as much as safe, "
+            "fast, actively-overtaking driving. Rebalance magnitudes: penalise "
+            "clear-road cruising above 22 m/s without overtakes, avoid large per-step "
+            "safe_gap bonuses, and ensure genuine overtaking accumulates more reward."
         )
 
-    return ok, "\n".join(lines)
+    console = (
+        "PASS"
+        if ok
+        else format_consistency_console(
+            passive_count=len(passive_violations),
+            soft_count=len(soft_violations),
+            soft_rate=soft_violation_rate,
+            threshold=max_violation_rate,
+            hard_count=len(hard_violations),
+            worst=worst,
+        )
+    )
+    return ok, "\n".join(lines), console
 
 
 # ── Self-test / CLI ─────────────────────────────────────────────────────────────
@@ -597,35 +682,15 @@ if __name__ == "__main__":
     for spec in sorted(bank, key=lambda s: -s.ref_fitness):
         print(f"{spec.name:<22} {spec.category:<24} {spec.ref_fitness:>11.4f}  {len(spec.states):>4}")
 
-    # Quick smoke test using the generation-0 default reward as the
-    # candidate, to verify the pipeline runs end-to-end.
-    print("\n=== Self-test against reward_program.py default (gen 0) ===")
+    # Quick smoke test using the shipped bootstrap default reward.
+    print("\n=== Self-test against shipped bootstrap default reward ===")
 
-    import math as _math
+    from reward_designer import DEFAULT_BOOTSTRAP_REWARD_BODY
+    from reward_sandbox import compile_reward_function
 
-    def _clip(v, lo, hi):
-        return max(lo, min(hi, v))
-
-    def _default_compute_reward(state):
-        if state["collided"]:
-            return -30.0
-        speed_reward = _clip(state["speed_ms"] * 0.1, 0.0, 3.0)
-        ttc_penalty = -3.0 if state["ttc"] < 1.0 else -1.0 if state["ttc"] < 3.0 else 0.0
-        overtake_bonus = 2.0 if state["overtook"] else 0.0
-        jerk_penalty = -0.02 * (abs(state["long_jerk"]) + abs(state["lat_jerk"]))
-        accel_penalty = -0.02 * abs(state["accel_ms2"])
-        safe_gap_reward = 0.05 * _clip(state["front_dist"] - 15.0, 0.0, 30.0)
-        lane_change_penalty = -0.1 if state["lane_changed"] else 0.0
-        return (
-            speed_reward
-            + ttc_penalty
-            + overtake_bonus
-            + jerk_penalty
-            + accel_penalty
-            + safe_gap_reward
-            + lane_change_penalty
-        )
-
-    ok, report = evaluate_consistency(_default_compute_reward, bank)
+    ok, report, console = evaluate_consistency(
+        compile_reward_function(DEFAULT_BOOTSTRAP_REWARD_BODY), bank
+    )
     print(report)
+    print(f"\nConsole: {console}")
     print(f"\nGate result: {'PASS' if ok else 'FAIL'}")

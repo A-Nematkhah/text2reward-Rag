@@ -8,26 +8,12 @@ import pytest
 
 from evaluate import _pool_ttc_metrics, _write_validated_archive_reward
 from reward_archive import RewardArchive
+from reward_designer import DEFAULT_BOOTSTRAP_REWARD_BODY
 from reward_sandbox import validate_reward_code
 
 
 def _passing_reward_code() -> str:
-    return (
-        "def compute_reward(state):\n"
-        '    if state["collided"]:\n'
-        "        return -30.0\n"
-        "    reward = 0.0\n"
-        '    reward += 0.2 * (state["speed_ms"] / 30.0) ** 2\n'
-        '    reward += 3.5 if state["overtook"] else 0.0\n'
-        '    reward += 0 if state["ttc"] > 3 else -0.2 * (3 - state["ttc"])\n'
-        '    reward -= 0.02 * abs(state["long_jerk"])\n'
-        '    reward -= 0.02 * abs(state["lat_jerk"])\n'
-        '    reward += (0.2 if state["speed_ms"] >= 24 else -0.1) if state["front_dist"] > 50 and state["ttc"] > 5 else 0\n'
-        '    reward += -0.2 if state["front_dist"] < 20 else 0.0\n'
-        '    reward += -0.1 if state["lane_changed"] and not state["overtook"] else 0.0\n'
-        '    reward += -0.2 if state["front_dist"] > 50 and state["ttc"] > 5 and state["speed_ms"] < 20 else 0.0\n'
-        "    return reward\n"
-    )
+    return DEFAULT_BOOTSTRAP_REWARD_BODY.strip()
 
 
 def test_pool_ttc_metrics_uses_step_values():

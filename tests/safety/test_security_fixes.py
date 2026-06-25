@@ -215,25 +215,10 @@ def test_restore_rejects_corrupted_archive_entry():
 
 def _pipeline_passing_reward_code() -> str:
     """Reward source that passes the full AST + trajectory-bank restore pipeline."""
-    # Self-contained fixture — do not read reward_program.py (bootstrap default
-    # is intentionally weaker and may not pass Stage B).
-    code = (
-        "def compute_reward(state):\n"
-        '    if state["collided"]:\n'
-        "        return -30.0\n"
-        "    reward = 0.0\n"
-        '    reward += 0.2 * (state["speed_ms"] / 30.0) ** 2\n'
-        '    reward += 3.5 if state["overtook"] else 0.0\n'
-        '    reward += 0 if state["ttc"] > 3 else -0.2 * (3 - state["ttc"])\n'
-        '    reward -= 0.02 * abs(state["long_jerk"])\n'
-        '    reward -= 0.02 * abs(state["lat_jerk"])\n'
-        '    reward += (0.2 if state["speed_ms"] >= 24 else -0.1) if state["front_dist"] > 50 and state["ttc"] > 5 else 0\n'
-        '    reward += -0.2 if state["front_dist"] < 20 else 0.0\n'
-        '    reward += -0.1 if state["lane_changed"] and not state["overtook"] else 0.0\n'
-        '    reward += -0.2 if state["front_dist"] > 50 and state["ttc"] > 5 and state["speed_ms"] < 20 else 0.0\n'
-        "    return reward\n"
-    )
-    ok, err = rd._full_validation_pipeline(code)
+    from reward_designer import DEFAULT_BOOTSTRAP_REWARD_BODY
+
+    code = DEFAULT_BOOTSTRAP_REWARD_BODY.strip()
+    ok, err, _ = rd._full_validation_pipeline(code)
     assert ok, f"fixture reward must pass restore pipeline: {err}"
     return code
 
