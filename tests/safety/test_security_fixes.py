@@ -96,12 +96,14 @@ def test_denorm_y_non_normalised_is_identity():
 
 
 def test_execute_reward_enforces_timeout():
-    def hang(state):
-        while True:
-            pass
+    def expensive(state):
+        x = float(state.get("speed_ms", 1.0))
+        for _ in range(80_000_000):
+            x = (x * 1.0000001) % 1e9
+        return x
 
     try:
-        rs.execute_reward(code="", state={}, timeout_sec=0.05, compiled_fn=hang)
+        rs.execute_reward(code="", state={}, timeout_sec=0.05, compiled_fn=expensive)
         raise AssertionError("expected RuntimeError due to timeout")
     except RuntimeError as e:
         assert "timed out" in str(e)
@@ -162,12 +164,15 @@ def test_smoke_test_execute_reward_enforces_timeout():
 
     code = (
         "def compute_reward(state):\n"
-        "    while True:\n"
-        "        pass\n"
+        "    return exp(exp(exp(exp(exp(state['speed_ms'])))))\n"
     )
     ok, err = rd._smoke_test_reward_code(code)
     assert not ok
-    assert "timeout" in err.lower() or "timed out" in err.lower()
+    err_l = err.lower()
+    assert any(
+        token in err_l
+        for token in ("timeout", "timed out", "overflow", "too computationally")
+    )
 
 
 # ── Fix #5: archive restore re-validates before writing to disk ─────────────

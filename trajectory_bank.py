@@ -99,7 +99,11 @@ class TrajectorySpec:
         if not self.metrics:
             self.metrics = _aggregate_trajectory_metrics(self.states)
         if not self.ref_fitness:
-            self.ref_fitness = compute_fitness(self.metrics, generation=10)
+            self.ref_fitness = compute_fitness(
+                self.metrics,
+                generation=10,
+                version=TRAJECTORY_REF_FITNESS_VERSION,
+            )
 
 
 # ── Metric aggregation (mirrors evaluate_agent()-style metrics) ───────────────
@@ -433,7 +437,18 @@ def build_trajectory_bank() -> list[TrajectorySpec]:
 
 # ── Cumulative-return evaluation of a candidate reward function ───────────────
 
-# Passive trajectories must never beat active ones on mean per-step return when
+# Pinned fitness version for trajectory-bank reference rankings.  Independent of
+# FITNESS_VERSION_DEFAULT so archive evolution can upgrade (v8) without reshuffling
+# the synthetic ground-truth ordering used by the smoke-test gate.
+TRAJECTORY_REF_FITNESS_VERSION = 7
+
+# Stage B gate defaults (shared with reward_designer._full_validation_pipeline).
+# Raised from 12% → 13% after calibration: bootstrap scores ~6.6% soft violations
+# while plausible LLM rewards cluster ~12–15%; 13% keeps hard/passive checks strict
+# but avoids rejecting marginally-misaligned yet repairable candidates.
+BANK_MAX_VIOLATION_RATE = 0.13
+BANK_MIN_FITNESS_GAP = 0.06
+
 # reference fitness agrees — zero tolerance (separate from the soft pairwise rate).
 _PASSIVE_CATEGORIES = frozenset({"safe_fast", "safe_steady", "stationary_farming"})
 _ACTIVE_CATEGORIES = frozenset({"legitimate_overtaking", "oscillating_lanes"})
@@ -483,11 +498,133 @@ def format_consistency_console(
     return " | ".join(parts) + f" — e.g. {suffix}"
 
 
+@dataclass
+class GateStats:
+    """Pairwise consistency statistics for Stage B calibration."""
+
+    n_trajectories: int
+    decisive_pairs: int
+    soft_decisive_pairs: int
+    passive_pair_count: int
+    soft_violations: int
+    passive_violations: int
+    hard_violations: int
+    soft_violation_rate: float
+    violation_rate: float
+    passive_violation_pairs: list[tuple["TrajectorySpec", "TrajectorySpec", float, float]]
+    soft_violation_pairs: list[tuple["TrajectorySpec", "TrajectorySpec", float, float]]
+    hard_violation_pairs: list[tuple["TrajectorySpec", "TrajectorySpec", float, float]]
+    worst: list[tuple["TrajectorySpec", "TrajectorySpec", float, float]]
+
+
+def measure_gate_stats(
+    reward_fn: Callable[[dict], float],
+    bank: list[TrajectorySpec] | None = None,
+    *,
+    min_fitness_gap: float = BANK_MIN_FITNESS_GAP,
+) -> GateStats:
+    """
+    Run Stage B pairwise checks and return counts/rates without applying the
+    pass/fail threshold.  Used for calibration scripts and unit tests.
+
+    Raises RuntimeError if the reward function fails on any trajectory.
+    """
+    if bank is None:
+        bank = build_trajectory_bank()
+
+    returns: dict[str, float] = {}
+    for spec in bank:
+        try:
+            returns[spec.name] = _cumulative_return(reward_fn, spec.states)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Trajectory Bank Error: reward function raised "
+                f"{type(exc).__name__}: {exc} while executing trajectory "
+                f"'{spec.name}' (category='{spec.category}'). Every state "
+                f"dict uses only the documented state keys — check for typos "
+                f"such as state['overtake'] instead of state['overtook']."
+            ) from exc
+
+    return _gate_stats_from_returns(returns, bank, min_fitness_gap=min_fitness_gap)
+
+
+def _gate_stats_from_returns(
+    returns: dict[str, float],
+    bank: list[TrajectorySpec],
+    *,
+    min_fitness_gap: float,
+) -> GateStats:
+    n = len(bank)
+    decisive_pairs = 0
+    passive_pair_count = 0
+    soft_violations: list[tuple[TrajectorySpec, TrajectorySpec, float, float]] = []
+    passive_violations: list[tuple[TrajectorySpec, TrajectorySpec, float, float]] = []
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = bank[i], bank[j]
+            fitness_gap = a.ref_fitness - b.ref_fitness
+            if abs(fitness_gap) < min_fitness_gap:
+                continue
+            decisive_pairs += 1
+
+            better, worse = (a, b) if fitness_gap > 0 else (b, a)
+            is_passive_pair = (
+                worse.category in _PASSIVE_CATEGORIES
+                and better.category in _ACTIVE_CATEGORIES
+            )
+            if is_passive_pair:
+                passive_pair_count += 1
+
+            if returns[better.name] <= returns[worse.name]:
+                entry = (better, worse, returns[better.name], returns[worse.name])
+                if is_passive_pair:
+                    passive_violations.append(entry)
+                else:
+                    soft_violations.append(entry)
+
+    soft_decisive_pairs = max(decisive_pairs - passive_pair_count, 0)
+    soft_violation_rate = (
+        (len(soft_violations) / soft_decisive_pairs) if soft_decisive_pairs else 0.0
+    )
+    violations = passive_violations + soft_violations
+    violation_rate = (len(violations) / decisive_pairs) if decisive_pairs else 0.0
+
+    legit = [s for s in bank if s.category == "legitimate_overtaking"]
+    unsafe = [s for s in bank if s.category in ("reckless_crash", "tailgating_no_crash")]
+    hard_violations: list[tuple[TrajectorySpec, TrajectorySpec, float, float]] = []
+    for L in legit:
+        for U in unsafe:
+            fitness_gap = L.ref_fitness - U.ref_fitness
+            if abs(fitness_gap) < min_fitness_gap:
+                continue
+            if fitness_gap > 0 and returns[L.name] <= returns[U.name]:
+                hard_violations.append((L, U, returns[L.name], returns[U.name]))
+
+    worst = sorted(violations, key=lambda v: (v[2] - v[3]))[:8]
+
+    return GateStats(
+        n_trajectories=n,
+        decisive_pairs=decisive_pairs,
+        soft_decisive_pairs=soft_decisive_pairs,
+        passive_pair_count=passive_pair_count,
+        soft_violations=len(soft_violations),
+        passive_violations=len(passive_violations),
+        hard_violations=len(hard_violations),
+        soft_violation_rate=soft_violation_rate,
+        violation_rate=violation_rate,
+        passive_violation_pairs=passive_violations,
+        soft_violation_pairs=soft_violations,
+        hard_violation_pairs=hard_violations,
+        worst=worst,
+    )
+
+
 def evaluate_consistency(
     reward_fn: Callable[[dict], float],
     bank: list[TrajectorySpec] | None = None,
-    max_violation_rate: float = 0.12,
-    min_fitness_gap: float = 0.06,
+    max_violation_rate: float = BANK_MAX_VIOLATION_RATE,
+    min_fitness_gap: float = BANK_MIN_FITNESS_GAP,
 ) -> tuple[bool, str, str]:
     """
     Runs `reward_fn` over every trajectory in the bank, then checks pairwise
@@ -518,84 +655,28 @@ def evaluate_consistency(
     if bank is None:
         bank = build_trajectory_bank()
 
-    # 1) Compute candidate cumulative return for every trajectory.
-    returns: dict[str, float] = {}
-    for spec in bank:
-        try:
-            returns[spec.name] = _cumulative_return(reward_fn, spec.states)
-        except Exception as exc:
-            msg = (
-                f"Trajectory Bank Error: reward function raised "
-                f"{type(exc).__name__}: {exc} while executing trajectory "
-                f"'{spec.name}' (category='{spec.category}'). Every state "
-                f"dict uses only the documented state keys — check for typos "
-                f"such as state['overtake'] instead of state['overtook']."
-            )
-            return False, msg, msg
+    try:
+        stats = measure_gate_stats(reward_fn, bank=bank, min_fitness_gap=min_fitness_gap)
+    except RuntimeError as exc:
+        msg = str(exc)
+        return False, msg, msg
 
-    # 2) Pairwise consistency check against reference fitness.
-    n = len(bank)
-    decisive_pairs = 0
-    passive_pair_count = 0
-    soft_violations: list[tuple[TrajectorySpec, TrajectorySpec, float, float]] = []
-    passive_violations: list[tuple[TrajectorySpec, TrajectorySpec, float, float]] = []
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            a, b = bank[i], bank[j]
-            fitness_gap = a.ref_fitness - b.ref_fitness
-            if abs(fitness_gap) < min_fitness_gap:
-                continue  # near-tie in ground truth — not a decisive pair
-            decisive_pairs += 1
-
-            better, worse = (a, b) if fitness_gap > 0 else (b, a)
-            is_passive_pair = (
-                worse.category in _PASSIVE_CATEGORIES and better.category in _ACTIVE_CATEGORIES
-            )
-            if is_passive_pair:
-                passive_pair_count += 1
-
-            if returns[better.name] <= returns[worse.name]:
-                entry = (better, worse, returns[better.name], returns[worse.name])
-                if is_passive_pair:
-                    passive_violations.append(entry)
-                else:
-                    soft_violations.append(entry)
-
+    n = stats.n_trajectories
+    decisive_pairs = stats.decisive_pairs
+    passive_violations = stats.passive_violation_pairs
+    soft_violations = stats.soft_violation_pairs
+    hard_violations = stats.hard_violation_pairs
+    soft_decisive_pairs = stats.soft_decisive_pairs
+    soft_violation_rate = stats.soft_violation_rate
+    violation_rate = stats.violation_rate
+    worst = stats.worst
     violations = passive_violations + soft_violations
-    violation_rate = (len(violations) / decisive_pairs) if decisive_pairs else 0.0
-    soft_decisive_pairs = max(decisive_pairs - passive_pair_count, 0)
-    soft_violation_rate = (
-        (len(soft_violations) / soft_decisive_pairs) if soft_decisive_pairs else 0.0
-    )
-
-    # 3) Hard named-category check: legitimate overtaking must beat every
-    #    reckless-crash and tailgating trajectory on cumulative return,
-    #    BUT only when the reference fitness ALSO says legit > unsafe.
-    #    If the reference fitness says the unsafe trajectory is genuinely
-    #    better (e.g. tailgate at 29 m/s vs a slow legit overtaker),
-    #    then the reward agreeing with the reference is correct.
-    legit = [s for s in bank if s.category == "legitimate_overtaking"]
-    unsafe = [s for s in bank if s.category in ("reckless_crash", "tailgating_no_crash")]
-    hard_violations: list[tuple[TrajectorySpec, TrajectorySpec, float, float]] = []
-    for L in legit:
-        for U in unsafe:
-            fitness_gap = L.ref_fitness - U.ref_fitness
-            if abs(fitness_gap) < min_fitness_gap:
-                continue  # near-tie, not a clear violation
-            if fitness_gap > 0 and returns[L.name] <= returns[U.name]:
-                hard_violations.append((L, U, returns[L.name], returns[U.name]))
 
     ok = (
-        len(passive_violations) == 0
-        and len(hard_violations) == 0
+        stats.passive_violations == 0
+        and stats.hard_violations == 0
         and soft_violation_rate <= max_violation_rate
     )
-
-    worst = sorted(
-        violations,
-        key=lambda v: (v[2] - v[3]),
-    )[:8]
 
     # 4) Build report.
     lines = [

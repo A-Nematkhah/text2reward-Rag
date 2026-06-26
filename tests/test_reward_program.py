@@ -17,4 +17,4 @@ def test_collision_penalty():
         "long_jerk": 0.0,
         "lat_jerk": 0.0,
     }
-    assert compute_reward(state) < -5
+    assert compute_reward(state) <= -40.0

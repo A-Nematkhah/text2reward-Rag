@@ -91,6 +91,7 @@ agent (26 m/s, 0 overtakes) gets gate=0.10. A slow-but-active agent (18 m/s,
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -267,7 +268,7 @@ def _passive_driving_gate(
 
 
 # ── Fitness v7 parameters ─────────────────────────────────────────────────────
-FITNESS_VERSION_DEFAULT = 7
+FITNESS_VERSION_DEFAULT = 8
 
 _V7_W = {
     "activity": 0.35,
@@ -311,6 +312,33 @@ _V7_HARD_CRASH_LIMIT = 0.50
 _V7_PASSIVE_CAP = 0.12
 _V7_STATIONARY_SPEED_MAX = 5.0
 _V7_STATIONARY_PENALTY = 0.30
+
+# ── Fitness v8 parameters ─────────────────────────────────────────────────────
+# v8 removes the v7 hard flatline (fitness=0.01 when crash>50%) and replaces it
+# with a continuous survival score so the archive retains gradient signal even
+# when every episode crashes.  Lower crash_rate always yields higher survival;
+# within the same crash band, speed/overtaking/comfort still differentiate.
+_V8_CRASH_FLOOR = 0.02
+_V8_CRASH_SURVIVAL_EXP = 1.35
+_V8_W = {
+    "activity": 0.30,
+    "speed": 0.15,
+    "overtake": 0.15,
+    "lane_eff": 0.10,
+    "ttc": 0.15,
+    "comfort": 0.15,
+}
+assert abs(sum(_V8_W.values()) - 1.0) < 1e-9
+_V8_JERK_SPAM_JERK_REF = 2.5
+_V8_JERK_SPAM_ACCEL_REF = 3.0
+_V8_JERK_SPAM_LAMBDA = 0.14
+_V8_LANE_OSC_LAMBDA = 0.12
+_V8_NEAR_MISS_LAMBDA = 0.12
+_V8_NEAR_MISS_RATE_LAMBDA = 0.10
+_V8_NEAR_MISS_RATE_THRESHOLD = 2.0
+_V8_TIEBREAK_SCALE = 0.015
+_V8_ELITE_FLOOR = 0.90
+_V8_ELITE_SPAN = 0.10
 
 
 def _speed_score_v7(mean_speed: float) -> float:
@@ -398,6 +426,287 @@ def _curriculum_ceiling_v7(crash_rate: float, phase: int) -> float:
         return 1.0
     span = max(c_ceil - c_floor, 1e-6)
     return float(((c_ceil - cr) / span) ** _V7_CURRICULUM_ETA)
+
+
+def _survival_score_v8(crash_rate: float) -> float:
+    """
+    Continuous survival multiplier ∈ [_V8_CRASH_FLOOR, 1].
+
+    Monotonic: lower crash_rate → higher score, including above 50% crash.
+    At 100% crash the floor is _V8_CRASH_FLOOR (not a hard-coded flat fitness).
+    """
+    cr = min(1.0, max(0.0, float(crash_rate)))
+    return float(
+        _V8_CRASH_FLOOR + (1.0 - _V8_CRASH_FLOOR) * ((1.0 - cr) ** _V8_CRASH_SURVIVAL_EXP)
+    )
+
+
+def safe_overtake_ratio(metrics: dict[str, Any]) -> float:
+    """Fraction of lane changes that produced an overtake (0–1)."""
+    lane_changes = max(int(metrics.get("total_lane_changes", 0)), 0)
+    if lane_changes <= 0:
+        return 1.0 if float(metrics.get("total_overtakes", 0)) > 0 else 0.0
+    total_overtakes = metrics.get("total_overtakes")
+    if total_overtakes is None:
+        n_eps = max(int(metrics.get("n_episodes", 1)), 1)
+        total_overtakes = float(metrics.get("mean_overtakes", 0.0)) * n_eps
+    return float(min(1.0, float(total_overtakes) / lane_changes))
+
+
+def lane_change_rate(metrics: dict[str, Any]) -> float:
+    """Mean lane changes per episode."""
+    n_eps = max(int(metrics.get("n_episodes", 1)), 1)
+    return float(metrics.get("total_lane_changes", 0)) / n_eps
+
+
+def near_miss_rate(metrics: dict[str, Any], *, threshold: float = _V8_NEAR_MISS_RATE_THRESHOLD) -> float:
+    """
+    Fraction of steps with TTC below ``threshold`` (default 2 s).
+
+    Uses per-step ``ttc_vals`` when present (aggregated from episode_stats).
+    Falls back to ``min_ttc`` / ``p10_ttc`` for legacy archive entries.
+    """
+    vals = metrics.get("ttc_vals")
+    if isinstance(vals, list) and vals:
+        n = len(vals)
+        return float(sum(1 for v in vals if float(v) < threshold) / n)
+
+    min_ttc = float(metrics.get("min_ttc", -1.0))
+    p10_ttc = float(metrics.get("p10_ttc", -1.0))
+    if min_ttc < 0 and p10_ttc < 0:
+        return 0.0
+    effective_min = min_ttc if min_ttc >= 0 else p10_ttc
+    if effective_min < threshold:
+        return float(min(1.0, 0.4 + 0.6 * (1.0 - effective_min / threshold)))
+    if p10_ttc >= 0 and p10_ttc < threshold:
+        return 0.20
+    return 0.0
+
+
+def enrich_fitness_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Attach derived v8 metrics used by fitness and LLM critique."""
+    out = dict(metrics)
+    if "near_miss_rate" not in out:
+        out["near_miss_rate"] = near_miss_rate(out)
+    out["safe_overtake_ratio"] = safe_overtake_ratio(out)
+    out["lane_change_rate"] = lane_change_rate(out)
+    out["curriculum_phase"] = infer_curriculum_phase(out)
+    return out
+
+
+def infer_curriculum_phase(metrics: dict[str, Any]) -> str:
+    """
+    Metrics-driven curriculum (not generation count).
+
+    Phase 1 survive  : crash still dominant — prioritise not crashing
+    Phase 2 speed    : mostly safe — push speed without losing safety
+    Phase 3 overtake : fast enough — reward active overtaking
+    Phase 4 refine   : balance comfort, efficiency, and sustained activity
+    """
+    crash_rate = float(metrics.get("crash_rate", 1.0))
+    mean_speed = float(metrics.get("mean_speed", 0.0))
+    mean_overtakes = float(metrics.get("mean_overtakes", 0.0))
+    if crash_rate > 0.35:
+        return "survive"
+    if crash_rate > 0.12 or mean_speed < 22.0:
+        return "speed"
+    if mean_overtakes < 1.0:
+        return "overtake"
+    return "refine"
+
+
+CURRICULUM_PHASES = ("survive", "speed", "overtake", "refine")
+
+CURRICULUM_GUIDANCE: dict[str, str] = {
+    "survive": (
+        "Agent crashes too often. Prioritise survival: strong collision penalty "
+        "(-70 to -100), stronger TTC/tailgate penalties, moderate speed reward."
+    ),
+    "speed": (
+        "Crashes are improving but speed is low OR still elevated. Balance safety "
+        "with speed — do not remove collision penalty; increase speed incentive only "
+        "under safe TTC/front_dist conditions."
+    ),
+    "overtake": (
+        "Agent is reasonably safe and fast but under-overtaking. Increase overtake "
+        "bonus and cruise_tax on clear roads without overtakes; keep collision penalty."
+    ),
+    "refine": (
+        "All core metrics are reasonable — refine comfort, lane efficiency, and "
+        "avoid jerk/accel spam while maintaining speed and overtakes."
+    ),
+}
+
+
+def curriculum_guidance(phase: str) -> str:
+    """LLM-facing instructions for the current metrics-driven curriculum phase."""
+    return CURRICULUM_GUIDANCE.get(phase, CURRICULUM_GUIDANCE["survive"])
+
+
+def infer_curriculum_transition(
+    prev_metrics: dict[str, Any] | None,
+    current_metrics: dict[str, Any],
+) -> str:
+    """Human-readable phase change summary for critique / logs."""
+    cur_phase = infer_curriculum_phase(current_metrics)
+    if prev_metrics is None:
+        return f"curriculum_phase={cur_phase} (first generation)"
+    prev_phase = infer_curriculum_phase(prev_metrics)
+    if prev_phase == cur_phase:
+        return f"curriculum_phase={cur_phase} (unchanged)"
+    return f"curriculum_phase {prev_phase} → {cur_phase}"
+
+
+def _curriculum_quality_weights(phase: str) -> dict[str, float]:
+    """Re-weight quality components by observed curriculum phase."""
+    base = dict(_V8_W)
+    if phase == "survive":
+        base["ttc"] += 0.10
+        base["comfort"] += 0.05
+        base["speed"] -= 0.08
+        base["overtake"] -= 0.07
+    elif phase == "speed":
+        base["speed"] += 0.10
+        base["activity"] += 0.05
+        base["ttc"] -= 0.08
+        base["lane_eff"] -= 0.07
+    elif phase == "overtake":
+        base["overtake"] += 0.12
+        base["activity"] += 0.08
+        base["speed"] -= 0.10
+        base["comfort"] -= 0.10
+    total = sum(base.values())
+    return {k: v / total for k, v in base.items()}
+
+
+def _jerk_spam_penalty_v8(
+    mean_long_jerk: float,
+    mean_accel: float,
+    mean_speed: float,
+) -> float:
+    """High jerk/accel without proportional speed — acceleration spam."""
+    jerk_excess = max(0.0, float(mean_long_jerk) - _V8_JERK_SPAM_JERK_REF) / 4.0
+    accel_excess = max(0.0, float(mean_accel) - _V8_JERK_SPAM_ACCEL_REF) / 4.0
+    if jerk_excess <= 0.0 and accel_excess <= 0.0:
+        return 0.0
+    speed_cover = min(1.0, float(mean_speed) / 26.0)
+    spam = max(jerk_excess, accel_excess)
+    return float(_V8_JERK_SPAM_LAMBDA * spam * (1.0 - 0.6 * speed_cover))
+
+
+def _lane_oscillation_penalty_v8(metrics: dict[str, Any]) -> float:
+    """Many lane changes with few overtakes — lane thrashing."""
+    ratio = safe_overtake_ratio(metrics)
+    if ratio >= 0.35:
+        return 0.0
+    lc_rate = lane_change_rate(metrics)
+    if lc_rate < 2.0:
+        return 0.0
+    thrash = min(1.0, lc_rate / 8.0)
+    return float(_V8_LANE_OSC_LAMBDA * thrash * (1.0 - ratio))
+
+
+def _near_miss_rate_penalty_v8(near_miss: float, crash_rate: float) -> float:
+    """Penalise sustained near-miss steps (TTC < 2 s) when not yet crashing."""
+    if float(crash_rate) > 0.25:
+        return 0.0
+    if near_miss <= 0.05:
+        return 0.0
+    excess = min(1.0, (near_miss - 0.05) / 0.35)
+    return float(_V8_NEAR_MISS_RATE_LAMBDA * excess)
+
+
+def _tailgate_penalty_v8(min_ttc: float, p10_ttc: float, crash_rate: float) -> float:
+    """Sustained low TTC without crashing yet — tailgating."""
+    if float(crash_rate) > 0.25:
+        return 0.0
+    if min_ttc < 0 or p10_ttc < 0:
+        return 0.0
+    effective = min(float(min_ttc), float(p10_ttc))
+    if effective >= 2.0:
+        return 0.0
+    return float(_V8_NEAR_MISS_LAMBDA * max(0.0, 1.0 - effective / 2.0))
+
+
+def compute_fitness_v8(
+    metrics: dict[str, Any],
+    *,
+    generation: int = 0,
+    prev_metrics: dict[str, Any] | None = None,
+    curriculum_phase: str | None = None,
+) -> float:
+    """
+    Fitness v8 — continuous survival ranking + metrics-driven curriculum.
+
+    Replaces the v7 hard flatline at crash>50% with ``_survival_score_v8`` so
+    100% crash, 90% crash, and 80% crash produce distinct fitness values while
+    still ranking below safer behaviour.
+    """
+    crash_rate = float(metrics.get("crash_rate", 0.5))
+    mean_speed = float(metrics.get("mean_speed", 0.0))
+    mean_overtakes = float(metrics.get("mean_overtakes", 0.0))
+    mean_long_jerk = float(metrics.get("mean_long_jerk", 0.0))
+    mean_accel = float(metrics.get("mean_accel", 0.0))
+    mean_ttc = float(metrics.get("mean_ttc", 30.0))
+    p10_ttc = float(metrics.get("p10_ttc", -1.0))
+    min_ttc = float(metrics.get("min_ttc", -1.0))
+    near_miss = near_miss_rate(metrics)
+
+    survival = _survival_score_v8(crash_rate)
+    phase = curriculum_phase or infer_curriculum_phase(metrics)
+    weights = _curriculum_quality_weights(phase)
+
+    s_activity = _activity_score_v7(mean_speed, mean_overtakes)
+    s_speed = _speed_score_v7(mean_speed)
+    s_overtake = _overtake_score_v7(mean_overtakes)
+    s_lane = _lane_efficiency_score(metrics)
+    s_ttc = _ttc_score(mean_ttc, p10_ttc, min_ttc)
+    s_comfort = _comfort_score(mean_long_jerk)
+    s_safe_ot = safe_overtake_ratio(metrics)
+
+    quality = (
+        weights["activity"] * s_activity
+        + weights["speed"] * s_speed
+        + weights["overtake"] * s_overtake
+        + weights["lane_eff"] * (0.7 * s_lane + 0.3 * s_safe_ot)
+        + weights["ttc"] * s_ttc
+        + weights["comfort"] * s_comfort
+    )
+
+    behavioral_penalty = (
+        _safety_penalty_v7(crash_rate)
+        + _tailgate_penalty_v8(min_ttc, p10_ttc, crash_rate)
+        + _near_miss_rate_penalty_v8(near_miss, crash_rate)
+        + _jerk_spam_penalty_v8(mean_long_jerk, mean_accel, mean_speed)
+        + _lane_oscillation_penalty_v8(metrics)
+        + _passive_penalty_v7(mean_speed, mean_overtakes, crash_rate)
+        + _stationary_penalty_v7(mean_speed)
+        + _trend_penalty_v7(metrics, prev_metrics)
+    )
+
+    quality_adj = max(0.0, min(1.0, quality - behavioral_penalty))
+
+    # Survival anchors fitness in high-crash regimes; quality modulates within each
+    # crash band so 100% != 90% != 80%, and faster/safer behaviour ranks higher
+    # at the same crash rate.
+    raw_fitness = (
+        survival
+        + survival * quality_adj * 0.75
+        + _V8_TIEBREAK_SCALE * quality_adj * (1.0 - crash_rate)
+    )
+
+    if raw_fitness >= 1.0:
+        # Low-crash agents often exceed 1.0 before clamping; map quality_adj into
+        # [elite_floor, 1.0] so tailgating / lane thrashing still ranks below
+        # clean active driving at the same crash rate.
+        fitness = _V8_ELITE_FLOOR + _V8_ELITE_SPAN * max(0.0, min(1.0, quality_adj))
+    else:
+        fitness = raw_fitness
+
+    if crash_rate <= 0.05 and mean_speed < 22.0 and mean_overtakes < 0.3:
+        fitness = min(fitness, _V7_PASSIVE_CAP)
+
+    return round(float(max(0.001, min(1.0, fitness))), 4)
 
 
 # ── Public fitness functions ──────────────────────────────────────────────────
@@ -499,7 +808,7 @@ def compute_fitness(
     version: int | None = None,
 ) -> float:
     """
-    Dispatch to the configured fitness version (default: v7).
+    Dispatch to the configured fitness version (default: v8).
 
     Optional ``prev_metrics`` enables the slow-to-survive trend penalty in v7.
   """
@@ -508,6 +817,12 @@ def compute_fitness(
         return compute_fitness_v6(metrics)
     if ver == 7:
         return compute_fitness_v7(metrics, generation=generation, prev_metrics=prev_metrics)
+    if ver == 8:
+        return compute_fitness_v8(
+            metrics,
+            generation=generation,
+            prev_metrics=prev_metrics,
+        )
     raise ValueError(f"Unsupported fitness version: {ver}")
 
 
@@ -647,6 +962,63 @@ def parse_structured_critique(critique_text: str, metrics: dict[str, Any]) -> di
     return meta
 
 
+# ── Archive retrieval helpers (Task 5) ───────────────────────────────────────
+
+_ARCHIVE_MIN_TOP_FITNESS = 0.03
+_ARCHIVE_FAILED_MAX_FITNESS = 0.08
+_CRASH_FARMING_CRASH_MIN = 0.90
+_CRASH_FARMING_SPEED_MIN = 26.0
+
+
+def reward_code_hash(code: str) -> str:
+    return hashlib.sha256(code.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def effective_fitness(entry: dict[str, Any]) -> float:
+    """
+    Fitness used for archive ranking.  Always recomputed from metrics with the
+    current default fitness version so stale stored scores (v7 flatlines or
+    misleadingly high crash-farming fitness) do not dominate retrieval.
+    """
+    metrics = enrich_fitness_metrics(dict(entry.get("metrics", {})))
+    gen = int(entry.get("generation", 0))
+    return float(compute_fitness(metrics, generation=gen, prev_metrics=None))
+
+
+def is_crash_farming(metrics: dict[str, Any]) -> bool:
+    """Fast driving with near-universal crashes — local optimum to avoid."""
+    return (
+        float(metrics.get("crash_rate", 0.0)) >= _CRASH_FARMING_CRASH_MIN
+        and float(metrics.get("mean_speed", 0.0)) >= _CRASH_FARMING_SPEED_MIN
+    )
+
+
+def is_stationary_farming(metrics: dict[str, Any]) -> bool:
+    return float(metrics.get("mean_speed", 0.0)) < _V7_STATIONARY_SPEED_MAX
+
+
+def is_pathological_for_retrieval(entry: dict[str, Any]) -> bool:
+    """Entries that should not appear in top-k when healthier alternatives exist."""
+    m = entry.get("metrics", {})
+    return is_crash_farming(m) or is_stationary_farming(m)
+
+
+def dedupe_entries_by_code(
+    entries: list[dict[str, Any]],
+    *,
+    key: str = "reward_code",
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        h = reward_code_hash(entry.get(key, ""))
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append(entry)
+    return out
+
+
 # ── Archive class ─────────────────────────────────────────────────────────────
 
 
@@ -678,6 +1050,8 @@ class RewardArchive:
                     e["critique_meta"] = parse_structured_critique(
                         e.get("critique", ""), e.get("metrics", {})
                     )
+                if "fitness_version" not in e:
+                    e["fitness_version"] = 6
             print(f"[archive] Loaded {len(self.entries)} entries from '{self.path}'")
         except Exception as ex:
             print(f"[archive] Failed to load '{self.path}': {ex} — starting fresh")
@@ -707,16 +1081,17 @@ class RewardArchive:
     ) -> dict[str, Any]:
         prev_metrics = self.entries[-1]["metrics"] if self.entries else None
         generation = len(self.entries)
+        enriched = enrich_fitness_metrics(dict(metrics))
         fitness = compute_fitness(
-            metrics,
+            enriched,
             generation=generation,
             prev_metrics=prev_metrics,
         )
-        critique_meta = parse_structured_critique(critique, metrics)
+        critique_meta = parse_structured_critique(critique, enriched)
         entry: dict[str, Any] = {
             "generation": generation,
             "reward_code": reward_code,
-            "metrics": dict(metrics),
+            "metrics": enriched,
             "fitness": fitness,
             "fitness_version": FITNESS_VERSION_DEFAULT,
             "critique": critique,
@@ -760,9 +1135,102 @@ class RewardArchive:
 
     # ── Core retrieval ────────────────────────────────────────────────────────
 
-    def get_top_k(self, k: int = 3) -> list[dict[str, Any]]:
-        """Returns the k entries with highest fitness score."""
-        return sorted(self.entries, key=lambda e: e["fitness"], reverse=True)[:k]
+    def get_top_k(self, k: int = 3, *, min_fitness: float = _ARCHIVE_MIN_TOP_FITNESS) -> list[dict[str, Any]]:
+        """
+        Returns up to k entries with highest effective fitness, excluding
+        near-duplicate code and pathological crash-farming clones when better
+        alternatives exist in the archive.
+        """
+        return self._select_diverse_top(
+            self.entries,
+            k=k,
+            min_fitness=min_fitness,
+        )
+
+    @staticmethod
+    def _reward_code_hash(code: str) -> str:
+        return reward_code_hash(code)
+
+    def _select_diverse_top(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        k: int,
+        min_fitness: float,
+    ) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+
+        ranked = sorted(
+            candidates,
+            key=lambda e: (effective_fitness(e), -float(e.get("metrics", {}).get("crash_rate", 1.0))),
+            reverse=True,
+        )
+
+        has_non_pathological = any(
+            not is_pathological_for_retrieval(e) for e in ranked
+        )
+        pool = ranked
+        if has_non_pathological:
+            non_path = [e for e in ranked if not is_pathological_for_retrieval(e)]
+            above_min = [e for e in non_path if effective_fitness(e) > min_fitness]
+            if len(above_min) >= k:
+                pool = above_min
+            elif non_path:
+                pool = non_path
+
+        selected: list[dict[str, Any]] = []
+        seen_hashes: set[str] = set()
+        seen_crash_bands: set[int] = set()
+
+        def _crash_band(cr: float) -> int:
+            if cr >= 0.5:
+                return 3
+            if cr >= 0.15:
+                return 2
+            return 1
+
+        for entry in pool:
+            code = entry.get("reward_code", "")
+            h = reward_code_hash(code)
+            if h in seen_hashes:
+                continue
+            m = entry.get("metrics", {})
+            cr = float(m.get("crash_rate", 1.0))
+            band = _crash_band(cr)
+            # Prefer behavioural spread when filling slots 2..k
+            if (
+                len(selected) >= 1
+                and len(selected) < k
+                and band in seen_crash_bands
+                and any(_crash_band(float(x.get("metrics", {}).get("crash_rate", 1.0))) not in seen_crash_bands for x in pool)
+            ):
+                continue
+            if (
+                selected
+                and is_crash_farming(m)
+                and not is_crash_farming(selected[0].get("metrics", {}))
+                and effective_fitness(entry) <= effective_fitness(selected[0]) * 1.05
+            ):
+                continue
+            selected.append(entry)
+            seen_hashes.add(h)
+            seen_crash_bands.add(band)
+            if len(selected) >= k:
+                break
+
+        if len(selected) < k:
+            for entry in ranked:
+                if has_non_pathological and is_pathological_for_retrieval(entry):
+                    continue
+                h = reward_code_hash(entry.get("reward_code", ""))
+                if h in seen_hashes or entry in selected:
+                    continue
+                selected.append(entry)
+                seen_hashes.add(h)
+                if len(selected) >= k:
+                    break
+        return selected[:k]
 
     def get_latest(self) -> dict[str, Any] | None:
         return self.entries[-1] if self.entries else None
@@ -783,24 +1251,31 @@ class RewardArchive:
         """Most recently archived k entries (newest first)."""
         return list(reversed(self.entries))[:k]
 
-    def get_failed_rewards(self, k: int = 3, max_fitness: float = 0.15) -> list[dict[str, Any]]:
+    def get_failed_rewards(
+        self, k: int = 3, max_fitness: float = _ARCHIVE_FAILED_MAX_FITNESS
+    ) -> list[dict[str, Any]]:
         """
-        Entries with fitness below max_fitness — useful as negative examples
-        so the LLM knows what NOT to replicate.
-
-        Also includes "passive but safe" entries (low crash, low speed/overtakes)
-        even when fitness is above max_fitness, so the LLM does not copy
-        slow-to-survive strategies from the top-k list.
+        Negative examples for LLM context: low effective fitness, passive-but-safe
+        traps, and crash-farming rewards (even when fitness is misleadingly high
+        under legacy scoring).
         """
-        failed = [e for e in self.entries if e["fitness"] <= max_fitness]
+        failed = [e for e in self.entries if effective_fitness(e) <= max_fitness]
         passive = [
             e for e in self.entries
-            if e not in failed and is_passive_driving(e["metrics"])
+            if e not in failed and is_passive_driving(e.get("metrics", {}))
         ]
-        combined = sorted(failed, key=lambda e: e["fitness"]) + sorted(
-            passive, key=lambda e: e["fitness"]
+        crash_farm = [
+            e for e in self.entries
+            if e not in failed
+            and is_crash_farming(e.get("metrics", {}))
+            and not is_passive_driving(e.get("metrics", {}))
+        ]
+        combined = (
+            sorted(failed, key=lambda e: effective_fitness(e))
+            + sorted(passive, key=lambda e: effective_fitness(e))
+            + sorted(crash_farm, key=lambda e: -effective_fitness(e))
         )
-        return combined[:k]
+        return dedupe_entries_by_code(combined)[:k]
 
     def get_similar_failure_rewards(
         self, failure_mode: str, k: int = 3
@@ -814,7 +1289,7 @@ class RewardArchive:
             e for e in self.entries
             if failure_mode in e.get("critique_meta", {}).get("failure_modes", [])
         ]
-        return sorted(matched, key=lambda e: e["fitness"], reverse=True)[:k]
+        return sorted(matched, key=lambda e: effective_fitness(e), reverse=True)[:k]
 
     def get_entries_by_failure_modes(
         self, modes: list[str], k: int = 3
@@ -825,7 +1300,7 @@ class RewardArchive:
             if any(m in e.get("critique_meta", {}).get("failure_modes", []) for m in modes)
         ]
         # Sort: highest fitness first so the LLM sees "least bad" examples
-        return sorted(matched, key=lambda e: e["fitness"], reverse=True)[:k]
+        return sorted(matched, key=lambda e: effective_fitness(e), reverse=True)[:k]
 
     # ── Improvement #5: Archive-guided hill-climbing context ─────────────────
 
@@ -833,11 +1308,13 @@ class RewardArchive:
         self,
         k: int = 3,
         current_failure_modes: list[str] | None = None,
+        curriculum_phase: str | None = None,
     ) -> str:
         """
         Improvement #5: richly formatted context for archive-guided hill climbing.
 
         Sections:
+          0) Current curriculum phase (metrics-driven, when provided)
           A) Top-k by fitness
           B) Most recent reward (trend context)
           C) Up to 2 known-failed rewards (negative examples)
@@ -848,11 +1325,18 @@ class RewardArchive:
         k                     : top-k entries to include in section A
         current_failure_modes : failure modes detected in the LATEST generation,
                                 used to surface targeted repair examples (section D)
+        curriculum_phase      : metrics-inferred phase for the next LLM generation
         """
         if not self.entries:
             return "No previous reward programs in archive."
 
         lines: list[str] = []
+
+        if curriculum_phase:
+            lines.append(
+                f"=== CURRENT CURRICULUM PHASE: {curriculum_phase} ===\n"
+                f"{curriculum_guidance(curriculum_phase)}\n"
+            )
 
         # ── A) Top performers ────────────────────────────────────────────────
         top = self.get_top_rewards(k)
@@ -943,11 +1427,11 @@ class RewardArchive:
     def summary(self) -> str:
         if not self.entries:
             return "Archive is empty."
-        fitnesses = [e["fitness"] for e in self.entries]
-        best = max(self.entries, key=lambda e: e["fitness"])
+        fitnesses = [effective_fitness(e) for e in self.entries]
+        best = max(self.entries, key=lambda e: effective_fitness(e))
         return (
             f"Archive: {len(self.entries)} generations | "
-            f"best fitness={best['fitness']:.4f} (gen {best['generation']}) | "
+            f"best fitness={effective_fitness(best):.4f} (gen {best['generation']}) | "
             f"avg fitness={sum(fitnesses)/len(fitnesses):.4f} | "
             f"speed range: "
             f"{min(e['metrics'].get('mean_speed',0) for e in self.entries):.1f}"
@@ -965,7 +1449,7 @@ def _format_entry(entry: dict[str, Any], show_code: bool) -> str:
     meta = entry.get("critique_meta", {})
     lines = [
         f"--- Generation {entry['generation']} "
-        f"(fitness={entry['fitness']:.4f}) ---\n"
+        f"(fitness={effective_fitness(entry):.4f}) ---\n"
         f"Metrics:\n"
         f"  mean_speed     : {m.get('mean_speed',      0):.2f} m/s\n"
         f"  crash_rate     : {m.get('crash_rate',      0):.1%}\n"
@@ -975,6 +1459,7 @@ def _format_entry(entry: dict[str, Any], show_code: bool) -> str:
         f"  mean_long_jerk : {m.get('mean_long_jerk',  0):.3f} m/s³\n"
         f"  completion_rate: {m.get('completion_rate', 0):.1%}\n"
         f"  mean_steps     : {m.get('mean_steps',      0):.0f}\n"
+        f"  curriculum     : {m.get('curriculum_phase', infer_curriculum_phase(m))}\n"
         f"Fitness breakdown:\n"
         f"  speed_score    : {_speed_score(m.get('mean_speed', 0)):.3f}\n"
         f"  overtake_score : {_overtake_score(m.get('mean_overtakes', 0)):.3f}\n"

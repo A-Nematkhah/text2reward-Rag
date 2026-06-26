@@ -301,7 +301,9 @@ def plot_llm_impact(
 
     for i, upd in enumerate(llm_updates):
         ep = upd["episode"]
-        update_labels.append(f"#{i+1}\nep{ep}")
+        phase = (upd.get("stats_window") or {}).get("curriculum_phase")
+        phase_suffix = f"\n{phase}" if phase else ""
+        update_labels.append(f"#{i+1}\nep{ep}{phase_suffix}")
 
         pre_eps = [ep_map[n] for n in range(ep - window, ep) if n in ep_map]
         post_eps = [ep_map[n] for n in range(ep, ep + window) if n in ep_map]

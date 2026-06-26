@@ -51,7 +51,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from typing import Any, Callable
 
 # Bounded pool caps how many timed-out reward calls can linger as orphans.
-_TIMEOUT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="reward_timeout")
+_TIMEOUT_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="reward_timeout")
 
 # ── Whitelist of allowed AST node types ──────────────────────────────────────
 _ALLOWED_NODES = frozenset(
@@ -375,6 +375,7 @@ def run_callable_with_timeout(
     try:
         return future.result(timeout=timeout_sec)
     except FuturesTimeout:
+        future.cancel()
         raise RuntimeError(
             f"Callable timed out after {timeout_sec}s "
             "(possible infinite loop or too-complex computation)"

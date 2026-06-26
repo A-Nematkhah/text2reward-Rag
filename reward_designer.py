@@ -65,13 +65,25 @@ import re
 import time
 import math
 from collections import deque
-from typing import Deque
+from typing import Any, Deque
 
 from groq import Groq
 
 from reward_sandbox import validate_reward_code, extract_reward_body, execute_reward, compile_reward_function
-from reward_archive import RewardArchive
-from trajectory_bank import build_trajectory_bank, evaluate_consistency
+from reward_archive import (
+    CURRICULUM_GUIDANCE,
+    RewardArchive,
+    curriculum_guidance,
+    enrich_fitness_metrics,
+    infer_curriculum_phase,
+    infer_curriculum_transition,
+)
+from trajectory_bank import (
+    BANK_MAX_VIOLATION_RATE as _BANK_MAX_VIOLATION_RATE,
+    BANK_MIN_FITNESS_GAP as _BANK_MIN_FITNESS_GAP,
+    build_trajectory_bank,
+    evaluate_consistency,
+)
 from key_manager import call_with_rotation  # ← چرخش خودکار کلید
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -85,27 +97,32 @@ REWARD_PROGRAM_PATH = "reward_program.py"
 DEFAULT_BOOTSTRAP_REWARD_BODY = """\
 def compute_reward(state):
     if state["collided"]:
-        return -30.0
+        return -80.0
     speed = state["speed_ms"]
+    open_road = state["front_dist"] > 35.0 and state["ttc"] > 5.0
     clear_road = state["front_dist"] > 40.0 and state["ttc"] > 5.0
-    speed_reward = clip(speed * 0.12, 0.0, 4.0)
-    slow_penalty = -0.6 if clear_road and speed < 22.0 else 0.0
-    cruise_tax = -2.0 if clear_road and not state["overtook"] and speed > 22.0 else 0.0
+    speed_reward = clip(speed * 0.09, 0.0, 3.0)
+    slow_penalty = -0.5 if clear_road and speed < 22.0 else 0.0
+    passive_band_tax = -0.65 if open_road and not state["overtook"] and speed > 18.0 and speed <= 22.0 else 0.0
+    static_passive_tax = -0.35 if open_road and not state["overtook"] and not state["lane_changed"] else 0.0
+    cruise_tax = -1.8 if open_road and not state["overtook"] and speed > 22.0 else 0.0
     no_overtake_tax = (
-        -1.1
-        if clear_road and not state["overtook"] and not state["lane_changed"]
-        else (-0.45 if clear_road and not state["overtook"] else 0.0)
+        -0.85
+        if open_road and not state["overtook"] and not state["lane_changed"]
+        else (-0.4 if open_road and not state["overtook"] else 0.0)
     )
-    ttc_penalty = -3.0 if state["ttc"] < 1.0 else -1.5 if state["ttc"] < 3.0 else 0.0
-    tailgate_penalty = -1.2 if state["front_dist"] < 20.0 and state["ttc"] < 4.0 else 0.0
+    ttc_penalty = -4.0 if state["ttc"] < 1.0 else -2.0 if state["ttc"] < 3.0 else 0.0
+    tailgate_penalty = -1.8 if state["front_dist"] < 20.0 and state["ttc"] < 4.0 else 0.0
     overtake_bonus = 3.0 if state["overtook"] else 0.0
-    jerk_penalty = -0.08 * (abs(state["long_jerk"]) + abs(state["lat_jerk"]))
-    accel_penalty = -0.05 * abs(state["accel_ms2"])
-    gap_bonus = 0.008 * clip(state["front_dist"] - 25.0, 0.0, 15.0) if speed >= 22.0 else 0.0
-    lc_penalty = -0.35 if state["lane_changed"] and not state["overtook"] else 0.0
+    jerk_penalty = -0.45 * (abs(state["long_jerk"]) + abs(state["lat_jerk"]))
+    accel_penalty = -0.20 * abs(state["accel_ms2"])
+    gap_bonus = 0.003 * clip(state["front_dist"] - 25.0, 0.0, 10.0) if speed >= 22.0 else 0.0
+    lc_penalty = -0.55 if state["lane_changed"] and not state["overtook"] else 0.0
     return (
         speed_reward
         + slow_penalty
+        + passive_band_tax
+        + static_passive_tax
         + cruise_tax
         + no_overtake_tax
         + ttc_penalty
@@ -151,12 +168,7 @@ def write_default_reward_program(path: str = REWARD_PROGRAM_PATH) -> None:
 # bound at all.
 _SMOKE_TEST_TIMEOUT_SEC = 0.5
 
-# Stage B (trajectory bank) gate parameters. Kept here rather than in
-# trajectory_bank.py so the designer's repair-loop tolerance is tunable
-# independently of the bank/gate module itself.
-_BANK_MAX_VIOLATION_RATE = 0.12
-_BANK_MIN_FITNESS_GAP = 0.06
-
+# Stage B gate parameters — canonical values live in trajectory_bank.py.
 # Built once at import time: the bank is deterministic (fixed seed), so
 # there is no reason to rebuild it for every single generation/repair
 # attempt. ~40 trajectories x up to a few hundred steps each is cheap to
@@ -199,11 +211,11 @@ The agent drives on a 4-lane highway. Goal: high-speed, safe, efficient driving 
 HARD RULES (violation = sandbox rejection):
     * Function signature: def compute_reward(state):
     * HARD SAFETY CHECK: If state["collided"] is True, the function MUST immediately
-      return the collision penalty (e.g., -30.0) without any other positive terms,
+      return the collision penalty (e.g., -80.0) without any other positive terms,
       speed rewards, or bonuses calculated or added in that same step. You MUST use
       exactly this pattern at the very beginning of the function body:
           if state["collided"]:
-              return -30.0
+              return -80.0
     * No import statements
     * No attribute access (no obj.method)
     * No loops (for/while)
@@ -213,26 +225,22 @@ HARD RULES (violation = sandbox rejection):
     * Single local variables allowed; no nested functions
 
 DESIGN PRINCIPLES:
-    * Collision penalty should dominate (-10 to -30) to prevent reward hacking
-    * Speed reward should be continuous and always incentivise going faster (target 24-30 m/s)
-    * TTC penalty should activate only below 3 s -- not for normal driving
-    * Overtake bonus: large one-shot reward (+2 to +4) when overtook == True
-    * Jerk/accel penalties should be small (0.01-0.05 scale) to not suppress action
-    * Avoid rewarding stationary behaviour or unnecessary lane changes
-    * ANTI-PASSIVE-DRIVING: zero crashes alone is NOT success. When front_dist > 40
-      and ttc > 5 (clear road), penalise speed > 22 m/s without overtakes (cruise_tax)
-      and speed < 22 m/s (slow_penalty). Do NOT use large safe_gap / front_dist
-      bonuses — they let passive cruising farm reward without overtaking.
-    * SPEED INCENTIVE TEST: the validation pipeline will execute your function at
-      28 m/s and 14 m/s with identical safe conditions (front_dist=40, ttc=12,
-      no collision). Your function MUST return strictly more reward at 28 m/s.
-      If the gap between fast and slow reward is too small, the agent will not
-      learn to drive faster. Ensure the speed term coefficient is large enough.
-    * The archive fitness function applies a multiplicative passive-driving gate:
-      once crash_rate is below 20%, fitness = base × speed_factor × overtake_factor,
-      where speed_factor = (mean_speed/24)² and overtake_factor = (mean_overtakes/1.5)^0.5.
-      An agent at 20 m/s with 0 overtakes gets gate = 0.10 — 90% fitness penalty.
-      Programs that are "safe but slow" score very poorly — do not copy them.
+    * Collision penalty MUST dominate (-60 to -100). A typical episode is ~40 steps;
+      per-step speed reward must NOT make crashing net-profitable. Rule of thumb:
+      40 steps × max per-step reward < |collision penalty|.
+    * Speed reward: moderate coefficient (0.06–0.10), cap ≤ 3.0 — enough to prefer
+      28 m/s over 14 m/s under safe conditions, but not so large it pays to crash.
+    * TTC penalty should activate below 3 s and be strong enough to prevent tailgating.
+    * Overtake bonus: one-shot (+2 to +4) when overtook == True
+    * Jerk/accel penalties: 0.10–0.20 scale — must penalise jerk_accel_spam trajectories
+    * Avoid large safe_gap / front_dist bonuses — passive cruising exploit
+    * Lane change without overtake: penalise (-0.4 to -0.6)
+    * ANTI-CRASH-FARMING: the validation pipeline simulates a 39-step fast drive plus
+      a collision; that episodic total MUST be lower than a full safe cautious episode.
+    * ANTI-PASSIVE-DRIVING: cruise_tax on clear road above 22 m/s without overtakes
+    * SPEED INCENTIVE TEST: 28 m/s must beat 14 m/s at identical safe conditions
+    * Fitness v8 ranks lower crash_rate higher even above 50% crash — but crashing
+      every episode still scores poorly; survival requires actually reducing crashes.
 
 {state_schema}
 
@@ -268,6 +276,9 @@ Valid strength tags: high_speed, good_overtaking, safe_driving, smooth_driving
 _GENERATION_USER_TEMPLATE = """\
 === DRIVING GOAL ===
 {goal}
+
+=== CURRICULUM PHASE: {curriculum_phase} ===
+{curriculum_guidance}
 
 === ARCHIVE MEMORY ===
 {archive_context}
@@ -305,6 +316,10 @@ _CRITIQUE_USER_TEMPLATE = """\
   mean_ttc         : {mean_ttc:.2f} s
   p10_ttc          : {p10_ttc:.2f} s   (10th-percentile TTC — near-miss indicator)
   min_ttc          : {min_ttc:.2f} s   (worst single-step TTC)
+  near_miss_rate   : {near_miss_rate:.1%} (fraction of steps with TTC < 2 s)
+  safe_ot_ratio    : {safe_overtake_ratio:.2f} (overtakes / lane changes)
+  lane_change_rate : {lane_change_rate:.2f} per episode
+  curriculum_phase : {curriculum_phase}
   mean_long_jerk   : {mean_long_jerk:.3f} m/s3
   mean_accel       : {mean_accel:.3f} m/s2
   total_lc         : {total_lane_changes} lane changes
@@ -385,7 +400,7 @@ _SAMPLE_STATE_OVERTAKE: dict = {
 # Gate 2b requires that fast_safe gives strictly more reward than slow_safe.
 _SAMPLE_STATE_FAST_SAFE: dict = {
     "speed_ms": 28.0,
-    "front_dist": 40.0,
+    "front_dist": 33.0,
     "ttc": 12.0,
     "rel_vel_ms": 0.0,
     "lane": 1,
@@ -400,7 +415,7 @@ _SAMPLE_STATE_FAST_SAFE: dict = {
 
 _SAMPLE_STATE_SLOW_SAFE: dict = {
     "speed_ms": 14.0,       # clearly below any acceptable minimum
-    "front_dist": 40.0,     # identical — tests speed term in isolation
+    "front_dist": 33.0,     # identical — moderate traffic, not open-road cruising
     "ttc": 12.0,            # identical
     "rel_vel_ms": 0.0,
     "lane": 1,
@@ -482,8 +497,8 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
             return False, (f"Runtime error on sample state '{name}': " f"{type(exc).__name__}: {exc}")
 
     # ── Gate 1b: collision branch must be strictly worse than normal driving ─
-    _COLLISION_SEVERITY_MAX = -10.0
-    _MIN_GAP_WHEN_NORMAL_POSITIVE = 20.0
+    _COLLISION_SEVERITY_MAX = -40.0
+    _MIN_GAP_WHEN_NORMAL_POSITIVE = 45.0
     if "collision" in rewards and "normal" in rewards:
         normal_r = rewards["normal"]
         collision_r = rewards["collision"]
@@ -636,6 +651,60 @@ def _smoke_test_reward_code(code: str) -> tuple[bool, str]:
             f"in practice) becomes the optimal strategy."
         )
 
+    # ── Gate 2c: Crash-farming gate ─────────────────────────────────────────
+    # Simulate "drive fast then crash" vs a full cautious episode (~40 steps).
+    fast_pre_crash = 0.0
+    cautious_episode = 0.0
+    try:
+        fast_step = {
+            "speed_ms": 29.0,
+            "front_dist": 55.0,
+            "ttc": 12.0,
+            "rel_vel_ms": 0.0,
+            "lane": 1,
+            "overtook": False,
+            "lane_changed": False,
+            "collided": False,
+            "nearby_vehicles": 2,
+            "accel_ms2": 0.5,
+            "long_jerk": 0.3,
+            "lat_jerk": 0.0,
+        }
+        crash_step = dict(fast_step)
+        crash_step["collided"] = True
+        crash_step["front_dist"] = 0.0
+        crash_step["ttc"] = 0.0
+        for _ in range(39):
+            fast_pre_crash += execute_reward(
+                "",
+                fast_step,
+                timeout_sec=_SMOKE_TEST_TIMEOUT_SEC,
+                compiled_fn=reward_fn,
+            )
+        fast_episode_total = fast_pre_crash + execute_reward(
+            "",
+            crash_step,
+            timeout_sec=_SMOKE_TEST_TIMEOUT_SEC,
+            compiled_fn=reward_fn,
+        )
+        for _ in range(40):
+            cautious_episode += execute_reward(
+                "",
+                _SAMPLE_STATE_SLOW_SAFE,
+                timeout_sec=_SMOKE_TEST_TIMEOUT_SEC,
+                compiled_fn=reward_fn,
+            )
+    except Exception as exc:
+        return False, f"Runtime error during crash-farming gate: {type(exc).__name__}: {exc}"
+
+    if fast_episode_total >= cautious_episode:
+        return False, (
+            f"Crash-Farming Gate Violation: a 39-step fast drive plus collision "
+            f"scored {fast_episode_total:.2f}, but a 40-step cautious safe episode "
+            f"scored {cautious_episode:.2f}. Crashing must NOT be net-profitable — "
+            f"increase |collision penalty| or reduce per-step speed bonuses."
+        )
+
     return True, ""
 
 
@@ -750,6 +819,7 @@ class RewardDesigner:
 
         self._current_code: str = ""
         self._active_generation = 0
+        self._last_evolution_metrics: dict[str, Any] | None = None
         self._current_code = self._load_current_code()
         self._reconcile_disk_with_archive()
         self._sync_active_generation()
@@ -883,6 +953,10 @@ class RewardDesigner:
         """Compatibility stub. Returns active generation info for logging."""
         return {"generation": self._active_generation, "reward_path": self.reward_path}
 
+    def get_last_evolution_metrics(self) -> dict[str, Any] | None:
+        """Metrics from the most recent evolution window (after warmup)."""
+        return self._last_evolution_metrics
+
     # ── Code management -------------------------------------------------------
 
     def _load_current_code(self) -> str:
@@ -997,7 +1071,9 @@ class RewardDesigner:
         overflow_stats = self._episode_stats[self.evolve_every :]
 
         metrics = self._aggregate_metrics(window_stats)
+        self._last_evolution_metrics = metrics
         current_gen = self._active_generation
+        phase = metrics.get("curriculum_phase", infer_curriculum_phase(metrics))
 
         if self.verbose:
             print(
@@ -1005,7 +1081,8 @@ class RewardDesigner:
                 f"episodes={len(window_stats)} | "
                 f"speed={metrics.get('mean_speed', 0):.2f} m/s | "
                 f"crash={metrics.get('crash_rate', 0):.1%} | "
-                f"overtakes={metrics.get('mean_overtakes', 0):.2f}/ep"
+                f"overtakes={metrics.get('mean_overtakes', 0):.2f}/ep | "
+                f"curriculum={phase}"
             )
 
         current_code = self._current_code or self._load_current_code()
@@ -1014,8 +1091,12 @@ class RewardDesigner:
                 "[designer] WARNING: no usable reward code on disk — "
                 "skipping archive (will not pollute RAG with placeholder)."
             )
-            archive_context = self.archive.format_for_llm(k=3)
-            new_code = self._call_generate_with_repair(archive_context)
+            archive_context = self.archive.format_for_llm(
+                k=3, curriculum_phase=phase,
+            )
+            new_code = self._call_generate_with_repair(
+                archive_context, curriculum_phase=phase,
+            )
             if new_code is None:
                 print("[designer] LLM generation failed -- keeping current reward.")
             else:
@@ -1032,6 +1113,8 @@ class RewardDesigner:
             metrics=metrics,
             critique="",
         )
+        self._last_evolution_metrics = dict(entry["metrics"])
+        self._last_evolution_metrics["fitness"] = entry["fitness"]
 
         # ── 3+4. Critique the entry we just archived ─────────────────────────
         traj_summary = self._format_trajectory_samples(window_stats[-5:])
@@ -1052,9 +1135,14 @@ class RewardDesigner:
         # Improvement #5: pass current failure modes for targeted retrieval
         current_failure_modes = entry.get("critique_meta", {}).get("failure_modes", [])
         archive_context = self.archive.format_for_llm(
-            k=3, current_failure_modes=current_failure_modes
+            k=3,
+            current_failure_modes=current_failure_modes,
+            curriculum_phase=metrics.get("curriculum_phase", phase),
         )
-        new_code = self._call_generate_with_repair(archive_context)
+        new_code = self._call_generate_with_repair(
+            archive_context,
+            curriculum_phase=metrics.get("curriculum_phase", phase),
+        )
 
         if new_code is None:
             self._active_generation = entry["generation"]
@@ -1069,6 +1157,7 @@ class RewardDesigner:
         self,
         archive_context: str,
         max_retries: int = 3,
+        curriculum_phase: str = "survive",
     ) -> str | None:
         """
         Generate a reward function, then validate (AST) + smoke-test (execution,
@@ -1078,9 +1167,12 @@ class RewardDesigner:
         total failure.
         """
         system = _GENERATION_SYSTEM.format(state_schema=_STATE_SCHEMA)
+        phase = curriculum_phase if curriculum_phase in CURRICULUM_GUIDANCE else "survive"
         user = _GENERATION_USER_TEMPLATE.format(
             goal=self.goal,
             archive_context=archive_context,
+            curriculum_phase=phase,
+            curriculum_guidance=curriculum_guidance(phase),
         )
 
         raw: str | None = None
@@ -1201,6 +1293,10 @@ class RewardDesigner:
             mean_ttc=metrics.get("mean_ttc", 0.0),
             p10_ttc=metrics.get("p10_ttc", -1.0),
             min_ttc=metrics.get("min_ttc", -1.0),
+            near_miss_rate=metrics.get("near_miss_rate", 0.0),
+            safe_overtake_ratio=metrics.get("safe_overtake_ratio", 0.0),
+            lane_change_rate=metrics.get("lane_change_rate", 0.0),
+            curriculum_phase=metrics.get("curriculum_phase", "survive"),
             mean_long_jerk=metrics.get("mean_long_jerk", 0.0),
             mean_accel=metrics.get("mean_accel", 0.0),
             total_lane_changes=metrics.get("total_lane_changes", 0),
@@ -1246,8 +1342,20 @@ class RewardDesigner:
         if goal:
             self.goal = goal
 
-        archive_context = self.archive.format_for_llm(k=3)
-        new_code = self._call_generate_with_repair(archive_context)
+        latest = self.archive.get_latest()
+        bootstrap_phase = "survive"
+        if latest:
+            bootstrap_phase = latest.get("metrics", {}).get(
+                "curriculum_phase",
+                infer_curriculum_phase(latest.get("metrics", {})),
+            )
+
+        archive_context = self.archive.format_for_llm(
+            k=3, curriculum_phase=bootstrap_phase,
+        )
+        new_code = self._call_generate_with_repair(
+            archive_context, curriculum_phase=bootstrap_phase,
+        )
 
         if new_code is None:
             print("[designer] Bootstrap generation failed — no reward program written.")
@@ -1291,7 +1399,7 @@ class RewardDesigner:
             p10_ttc = sum(s.get("p10_ttc", 30.0) for s in episode_stats) / n
             min_ttc = min((s.get("min_ttc", 30.0) for s in episode_stats), default=30.0)
 
-        return {
+        aggregated = {
             "n_episodes": n,
             "mean_speed": sum(s.get("mean_speed", 0) for s in episode_stats) / n,
             "crash_rate": crashes / n,
@@ -1309,6 +1417,11 @@ class RewardDesigner:
             "total_lane_changes": sum(s.get("total_lane_changes", 0) for s in episode_stats),
             "max_steps": 300,
         }
+        if all_ttc:
+            aggregated["near_miss_rate"] = sum(
+                1 for v in all_ttc if float(v) < 2.0
+            ) / len(all_ttc)
+        return enrich_fitness_metrics(aggregated)
 
     @staticmethod
     def _format_trend(current_metrics: dict, previous_entry: dict | None) -> str:
@@ -1322,6 +1435,7 @@ class RewardDesigner:
             return "(no previous generation to compare against — this is generation 0)"
 
         prev = previous_entry["metrics"]
+        transition = infer_curriculum_transition(prev, current_metrics)
 
         def _delta(key: str, fmt: str = "{:+.2f}") -> str:
             cur_v = current_metrics.get(key, 0.0)
@@ -1345,6 +1459,7 @@ class RewardDesigner:
             )
 
         return (
+            f"  {transition}\n"
             f"  previous generation : {previous_entry['generation']}\n"
             f"  mean_speed     delta: {speed_delta} m/s\n"
             f"  mean_overtakes delta: {overtake_delta} per episode\n"

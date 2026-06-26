@@ -34,7 +34,7 @@ Structure
     {
       "episode", "timestep",
       "generation_before", "generation_after",
-      "stats_window",
+      "stats_window",   # includes curriculum_phase, crash_rate, mean_speed, ...
       "policy_snap"
     }
   ]

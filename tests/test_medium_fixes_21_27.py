@@ -124,8 +124,8 @@ def test_smoke_test_uses_execute_reward_path():
     code = (
         "def compute_reward(state):\n"
         "    if state['collided']:\n"
-        "        return -30.0\n"
-        "    return float(state['speed_ms']) * 0.01\n"
+        "        return -80.0\n"
+        "    return float(state['speed_ms']) * 0.09\n"
     )
     ok, err = _smoke_test_reward_code(code)
     assert ok, err

@@ -138,12 +138,21 @@ class RewardEvolutionCallback(BaseCallback):
             if self.designer.maybe_evolve():
                 meta_after = self.designer.get_weights()
                 policy_snap = self.designer.get_policy_snapshot()
+                evo_metrics = self.designer.get_last_evolution_metrics() or {}
+                stats_window = {
+                    "generation": meta_after.get("generation"),
+                    "mean_speed": evo_metrics.get("mean_speed"),
+                    "crash_rate": evo_metrics.get("crash_rate"),
+                    "mean_overtakes": evo_metrics.get("mean_overtakes"),
+                    "curriculum_phase": evo_metrics.get("curriculum_phase"),
+                    "fitness": evo_metrics.get("fitness"),
+                }
                 self.training_logger.log_llm_update(
                     episode=self.training_logger._episode_n,
                     timestep=self.num_timesteps,
                     weights_before=meta_before,
                     weights_after=meta_after,
-                    stats_window={"generation": meta_after.get("generation")},
+                    stats_window=stats_window,
                     policy_snap=policy_snap,
                 )
 

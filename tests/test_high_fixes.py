@@ -48,7 +48,7 @@ def test_active_generation_unchanged_when_llm_fails(monkeypatch):
     designer = RewardDesigner(archive_path=archive_path, reward_path=reward_path, verbose=False)
     before = designer.get_weights()["generation"]
 
-    monkeypatch.setattr(designer, "_call_generate_with_repair", lambda _ctx: None)
+    monkeypatch.setattr(designer, "_call_generate_with_repair", lambda _ctx, **_: None)
     designer._episode_stats = [{"mean_speed": 20, "collisions": 0, "steps": 10, "total_overtakes": 0}]
     designer._episode_count = designer.warmup_episodes
     designer._evolve()
@@ -66,7 +66,7 @@ def test_placeholder_not_archived(monkeypatch):
     monkeypatch.setattr(
         designer,
         "_call_generate_with_repair",
-        lambda _ctx: 'def compute_reward(state):\n    return 1.0\n',
+        lambda _ctx, **_: 'def compute_reward(state):\n    return 1.0\n',
     )
     designer._episode_stats = [{"mean_speed": 20, "collisions": 0, "steps": 10, "total_overtakes": 0}]
     designer._episode_count = designer.warmup_episodes
