@@ -1,22 +1,32 @@
-import os
+"""Shared pytest configuration."""
+
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from tests.helpers import passing_reward_code  # noqa: E402
+
 
 def pytest_configure(config):
-    """Ensure project root is on sys.path for tests run by pytest/CI."""
-    root = Path(__file__).resolve().parents[1]
-    root_path = str(root)
-    if root_path not in sys.path:
-        sys.path.insert(0, root_path)
     config.addinivalue_line(
         "markers",
-        "evolution: Task 7 evolution-system tests (fitness, bank, archive, curriculum)",
+        "integration: end-to-end pipeline tests (metrics → archive → evolution)",
     )
 
 
 def pytest_collection_modifyitems(config, items):
-    """Tag the consolidated Task 7 module for selective runs."""
     for item in items:
         if "test_evolution_system.py" in str(item.fspath):
-            item.add_marker("evolution")
+            item.add_marker("integration")
+
+
+@pytest.fixture
+def passing_reward() -> str:
+    return passing_reward_code()

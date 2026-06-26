@@ -1,0 +1,33 @@
+"""Smoke-test gates, sandbox timeouts, and trajectory-bank calibration.
+
+Stage A uses ``SMOKE_TEST_TIMEOUT_SEC``; Stage B pairwise checks use
+``BANK_*`` thresholds against ``TRAJECTORY_REF_FITNESS_VERSION`` ground truth.
+Constants only — no side effects on import.
+"""
+
+from __future__ import annotations
+
+# Per-step shaped reward execution in LLMRewardWrapper.
+REWARD_STEP_TIMEOUT_SEC = 0.05
+
+# Default execute_reward() wall-clock limit (sandbox).
+SANDBOX_EXECUTE_TIMEOUT_SEC = 0.1
+
+# Stage A smoke-test scenarios (validation.py).
+SMOKE_TEST_TIMEOUT_SEC = 0.5
+
+# Stage B trajectory-bank pairwise consistency gate.
+# Raised from 12% → 13% after calibration (see scripts/calibrate_smoke_gate.py).
+BANK_MAX_VIOLATION_RATE = 0.13
+BANK_MIN_FITNESS_GAP = 0.06
+
+# Pinned reference fitness version for stable Stage B ground truth.
+TRAJECTORY_REF_FITNESS_VERSION = 7
+
+# Fixed seed for reproducible synthetic trajectories.
+TRAJECTORY_BANK_SEED = 20260620
+
+# Sandbox DoS limits (AST validation).
+MAX_REWARD_SOURCE_CHARS = 16_384
+MAX_REWARD_AST_NODES = 2_500
+MAX_REWARD_STRING_LITERAL_CHARS = 256

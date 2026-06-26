@@ -27,7 +27,8 @@ import os
 import tempfile
 import time
 
-import reward_sandbox as rs
+import pytest
+import txt2reward.sandbox.sandbox as rs
 
 # reward_wrapper.py and reward_designer.py pull in gymnasium / groq
 # respectively, which are heavy, optional dependencies that may not be
@@ -36,14 +37,15 @@ import reward_sandbox as rs
 # file on import -- mirrors this project's existing convention of falling
 # back to plain assertions when pytest/optional deps aren't available.
 try:
-    import reward_wrapper as rw
+    import txt2reward.reward.wrapper as rw
 
     _HAS_WRAPPER = True
 except ImportError:
     _HAS_WRAPPER = False
 
 try:
-    import reward_designer as rd
+    import txt2reward.llm.designer as rd
+    import txt2reward.llm.validation as rv
 
     _HAS_DESIGNER = True
 except ImportError:
@@ -154,6 +156,29 @@ def test_validate_allows_small_pow_exponent():
     assert ok is True
 
 
+def test_validate_rejects_oversized_source():
+    padding = " " * (20_000)
+    code = f'def compute_reward(state):\n    return state["speed_ms"]{padding}\n'
+    ok, err = rs.validate_reward_code(code)
+    assert ok is False
+    assert "too large" in err.lower()
+
+
+def test_validate_rejects_walrus_operator():
+    code = 'def compute_reward(state):\n    return (x := state["speed_ms"])\n'
+    ok, err = rs.validate_reward_code(code)
+    assert ok is False
+    assert "NamedExpr" in err or "Forbidden" in err
+
+
+def test_execute_reward_rejects_non_finite():
+    def bad(state):
+        return float("inf")
+
+    with pytest.raises(TypeError, match="finite"):
+        rs.execute_reward(code="", state={}, timeout_sec=0.05, compiled_fn=bad)
+
+
 # ── Fix #3: smoke-test enforces a timeout ────────────────────────────────────
 
 
@@ -162,17 +187,11 @@ def test_smoke_test_execute_reward_enforces_timeout():
     if not _HAS_DESIGNER:
         return
 
-    code = (
-        "def compute_reward(state):\n"
-        "    return exp(exp(exp(exp(exp(state['speed_ms'])))))\n"
-    )
-    ok, err = rd._smoke_test_reward_code(code)
+    code = "def compute_reward(state):\n    return exp(exp(exp(exp(exp(state['speed_ms'])))))\n"
+    ok, err = rv._smoke_test_reward_code(code)
     assert not ok
     err_l = err.lower()
-    assert any(
-        token in err_l
-        for token in ("timeout", "timed out", "overflow", "too computationally")
-    )
+    assert any(token in err_l for token in ("timeout", "timed out", "overflow", "too computationally"))
 
 
 # ── Fix #5: archive restore re-validates before writing to disk ─────────────
@@ -220,7 +239,7 @@ def test_restore_rejects_corrupted_archive_entry():
 
 def _pipeline_passing_reward_code() -> str:
     """Reward source that passes the full AST + trajectory-bank restore pipeline."""
-    from reward_designer import DEFAULT_BOOTSTRAP_REWARD_BODY
+    from txt2reward.llm.prompts import DEFAULT_BOOTSTRAP_REWARD_BODY
 
     code = DEFAULT_BOOTSTRAP_REWARD_BODY.strip()
     ok, err, _ = rd._full_validation_pipeline(code)

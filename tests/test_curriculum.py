@@ -4,19 +4,17 @@ import os
 import tempfile
 
 import pytest
-
-from reward_archive import (
+from txt2reward.archive.archive import (
     CURRICULUM_GUIDANCE,
     CURRICULUM_PHASES,
     RewardArchive,
     _curriculum_quality_weights,
-    compute_fitness_v8,
     curriculum_guidance,
     enrich_fitness_metrics,
     infer_curriculum_phase,
     infer_curriculum_transition,
 )
-from reward_designer import RewardDesigner
+from txt2reward.llm.designer import RewardDesigner
 
 
 def test_curriculum_phase_independent_of_generation():
@@ -36,18 +34,6 @@ def test_curriculum_transition_detects_phase_change():
 
 
 def test_fitness_v8_weights_shift_by_curriculum_phase():
-    metrics = {
-        "crash_rate": 0.08,
-        "mean_speed": 27.0,
-        "mean_overtakes": 0.5,
-        "mean_long_jerk": 1.5,
-        "mean_ttc": 4.0,
-        "p10_ttc": 3.0,
-        "min_ttc": 2.0,
-        "total_lane_changes": 10,
-        "total_overtakes": 5,
-        "n_episodes": 10,
-    }
     overtake_w = _curriculum_quality_weights("overtake")
     speed_w = _curriculum_quality_weights("speed")
     assert overtake_w["overtake"] > speed_w["overtake"]

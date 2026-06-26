@@ -1,4 +1,4 @@
-from reward_wrapper import _fallback_reward
+from txt2reward.reward.wrapper import _fallback_reward
 
 
 def test_fallback_collision_penalty():

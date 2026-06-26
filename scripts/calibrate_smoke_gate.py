@@ -1,4 +1,5 @@
 """Calibrate Stage B trajectory-bank gate thresholds (Task 4 analysis)."""
+
 from __future__ import annotations
 
 import sys
@@ -7,12 +8,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from reward_designer import (  # noqa: E402
-    DEFAULT_BOOTSTRAP_REWARD_BODY,
-    _full_validation_pipeline,
-)
-from reward_sandbox import compile_reward_function  # noqa: E402
-from trajectory_bank import (  # noqa: E402
+from txt2reward.llm.prompts import DEFAULT_BOOTSTRAP_REWARD_BODY
+from txt2reward.llm.validation import _full_validation_pipeline
+from txt2reward.sandbox.sandbox import compile_reward_function
+from txt2reward.trajectory.bank import (  # noqa: E402
     BANK_MAX_VIOLATION_RATE,
     BANK_MIN_FITNESS_GAP,
     TRAJECTORY_REF_FITNESS_VERSION,

@@ -1,0 +1,52 @@
+[project]
+name = "txt2reward"
+version = "2.0.0"
+description = "LLM-driven reward evolution for highway-env PPO"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["txt2reward", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Sandbox injects clip/sqrt/... at runtime for LLM-generated reward programs.
+"reward_program.py" = ["F821"]
+# Script adjusts sys.path before package imports when run as a file.
+"scripts/calibrate_smoke_gate.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.10"
+packages = ["txt2reward"]
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+no_implicit_optional = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
+
+# Dynamic import/exec paths and Gym wrapper hot-reload are intentionally loose.
+[[tool.mypy.overrides]]
+module = [
+    "txt2reward.sandbox.sandbox",
+    "txt2reward.reward.wrapper",
+    "txt2reward.trajectory.bank",
+    "txt2reward.llm.key_manager",
+    "txt2reward.training.env_factory",
+]
+disable_error_code = [
+    "no-any-return",
+    "assignment",
+    "union-attr",
+    "arg-type",
+    "operator",
+]

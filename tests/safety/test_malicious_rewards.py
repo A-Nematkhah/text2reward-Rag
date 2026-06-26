@@ -1,4 +1,4 @@
-from reward_sandbox import validate_reward_code
+from txt2reward.sandbox.sandbox import validate_reward_code
 
 
 def test_os_attack_rejected():

@@ -62,6 +62,7 @@ an evolutionary search over reward *code*, not just reward *weights*.
 - [Output files](#output-files)
 - [Migrating from the weight-tuning version](#migrating-from-the-weight-tuning-version)
 - [Known limitations](#known-limitations)
+- [License](#license)
 - [References](#references)
 
 ---
@@ -84,13 +85,13 @@ state object — and iterates on the *code*, not the coefficients.
 
 | Stage | Component | Responsibility |
 |---|---|---|
-| 1 | `RewardDesigner` | Sends the driving goal + archive context to Groq, receives generated reward code |
-| 2 | `reward_sandbox` | AST-validates the code (no imports/exec/eval/loops/attribute access) |
-| 3 | `reward_designer._smoke_test_reward_code` | Executes the function against sample states and synthetic trajectories before it ever reaches disk |
+| 1 | `txt2reward.llm.RewardDesigner` | Sends the driving goal + archive context to Groq, receives generated reward code |
+| 2 | `txt2reward.sandbox` | AST-validates the code (no imports/exec/eval/loops/attribute access) |
+| 3 | `txt2reward.llm.validation` | Smoke tests and trajectory-bank safety gate before code reaches disk |
 | 4 | `reward_program.py` | The current reward function, hot-swapped on disk |
-| 5 | `LLMRewardWrapper` | Per-worker Gym wrapper; reloads and executes `reward_program.py` |
-| 6 | `evaluate_agent()` | Measures speed, crash rate, overtakes, completion rate |
-| 7 | `reward_archive` | Computes fitness, stores every generation, serves RAG-style context for the next generation |
+| 5 | `txt2reward.reward.LLMRewardWrapper` | Per-worker Gym wrapper; reloads and executes `reward_program.py` |
+| 6 | `txt2reward.evaluation.evaluate_agent()` | Measures speed, crash rate, overtakes, completion rate |
+| 7 | `txt2reward.archive` | Computes fitness, stores every generation, serves RAG-style context for the next generation |
 | 8 | LLM critique | Flags reward-hacking patterns and proposes concrete fixes |
 
 ---
@@ -98,21 +99,32 @@ state object — and iterates on the *code*, not the coefficients.
 ## Project structure
 
 ```
-txt2reward-v2/
-├── train.py              # Entry point — PPO training with the evolutionary loop
-├── reward_wrapper.py      # Gym wrapper: loads + executes reward_program.py, collects stats
-├── reward_designer.py     # LLM pipeline: generate / critique / evolve reward programs
-├── reward_sandbox.py      # Secure sandbox: AST validation + restricted execution
-├── reward_archive.py      # Persistent archive + fitness function + RAG retrieval
-├── reward_program.py      # Current generated reward function (hot-swapped at runtime)
-├── reward_components.py   # Legacy weight-based reward, kept for evaluate.py --no-shaped
-├── evaluate.py            # Evaluate a trained model against any generation's reward
-├── plot_training.py       # Training / evolution / fitness charts
-├── training_logger.py     # Per-episode and per-generation training history
-├── key_manager.py         # Multi-key Groq client with automatic rate-limit rotation
-├── requirements.txt       # Python dependencies
-└── colab_setup.ipynb      # Ready-to-run Google Colab notebook
+text2reward-Rag/
+├── train.py                 # CLI entry — PPO training + evolution
+├── evaluate.py              # CLI entry — evaluate trained models
+├── plot_training.py         # CLI entry — training / evolution charts
+├── reward_program.py        # Active reward function (hot-reloaded at runtime)
+├── txt2reward/              # Main Python package
+│   ├── config/              # Paths, PPO schedule, LLM, fitness, validation gates
+│   ├── core/                # Metrics, logging, shared types
+│   ├── archive/             # Fitness, archive persistence, RAG retrieval
+│   ├── llm/                 # RewardDesigner, prompts, validation, Groq key rotation
+│   ├── sandbox/             # AST validation + restricted execution
+│   ├── trajectory/          # Synthetic trajectory bank (smoke-test Stage B)
+│   ├── reward/              # LLMRewardWrapper (+ legacy components)
+│   ├── training/            # Training loop, logger, plots
+│   └── evaluation/          # Model evaluation pipeline
+├── scripts/                 # Maintenance utilities (see scripts/README.md)
+├── examples/                # Usage pointers (CLI workflows)
+├── tests/                   # Pytest suite (115 tests)
+├── docs/                    # Layout and design notes
+├── requirements.txt         # Runtime dependencies
+├── requirements-dev.txt     # pytest (includes -r requirements.txt)
+└── LICENSE                  # MIT
 ```
+
+Legacy flat imports (`reward_archive`, `reward_designer`, …) were removed in v2 layout;
+use `txt2reward.<subpackage>` instead (e.g. `from txt2reward.archive import RewardArchive`).
 
 ---
 
@@ -124,6 +136,9 @@ txt2reward-v2/
 
 ```bash
 pip install -r requirements.txt
+
+# Development / tests
+pip install -r requirements-dev.txt
 ```
 
 ---
@@ -132,11 +147,12 @@ pip install -r requirements.txt
 
 ### Google Colab
 
-The fastest path — open **`colab_setup.ipynb`**:
+Use a GPU runtime (**Runtime → Change runtime type → T4 GPU**), clone this repo,
+install dependencies, and run the same CLI commands as local setup. Set
+`GROQ_API_KEY` in the environment (or use `api_keys.json` at the repo root).
+Use `--drive-dir` on `train.py` to sync checkpoints and logs to Google Drive.
 
-1. Set the runtime to GPU (**Runtime → Change runtime type → T4 GPU**)
-2. Paste your `GROQ_API_KEY` when prompted
-3. Run the cells in order
+See `examples/README.md` for command templates.
 
 ### Local setup
 
@@ -154,9 +170,10 @@ python evaluate.py --model ppo_highway_txt2reward.zip --episodes 10
 python evaluate.py --model ppo_highway_txt2reward.zip --generation 2
 ```
 
-> **Multiple Groq keys?** Drop them into `api_keys.json` (see
-> `key_manager.py`) and the designer will automatically rotate to the next
-> available key on rate limits instead of stalling the run.
+> **Multiple Groq keys?** Copy `api_keys.json.example` to `api_keys.json` at the
+> repo root (see `txt2reward.llm.key_manager`) and the designer will
+> automatically rotate to the next available key on rate limits instead of
+> stalling the run.
 
 ---
 
@@ -229,11 +246,12 @@ sandboxed and validated before it can run:
   or loops.
 - Only an approved set of math functions (`sqrt`, `exp`, `log`, trig, `clip`,
   …) and approved state keys.
-- **AST validation** (`reward_sandbox.validate_reward_code`) rejects
+- **AST validation** (`txt2reward.sandbox.validate_reward_code`) rejects
   structurally unsafe or malformed code before it is ever executed.
-- **Smoke testing** then executes the function against representative
-  sample states — catching runtime errors structural checks can't, such as a
-  `KeyError` from `state["overtake"]` instead of the correct `state["overtook"]`.
+- **Smoke testing** (`txt2reward.llm.validation`) executes the function against
+  representative sample states — catching runtime errors structural checks
+  can't, such as a `KeyError` from `state["overtake"]` instead of the correct
+  `state["overtook"]`.
 - A **trajectory safety gate** simulates a cautious 40-step rollout and a
   reckless, crash-ending 40-step rollout, and rejects any reward function
   under which the reckless trajectory scores *higher* — a direct defence
@@ -273,8 +291,8 @@ Each component is normalised to `[0, 1]` independently, and a two-stage
 multiplicative safety gate suppresses fitness sharply once `crash_rate`
 exceeds 30%, with an additional hard penalty above 80% — ensuring a
 crash-prone agent can never out-score a slower, safer one regardless of raw
-speed or overtake count. See `reward_archive.py` for the full derivation and
-worked examples.
+speed or overtake count. See `txt2reward.archive.fitness` for the full
+derivation and worked examples.
 
 ### Reward-hacking detection
 
@@ -323,7 +341,7 @@ shared state between processes is `reward_program.py` on disk:
 If you used the earlier (weight-tuning) version of this project:
 
 1. `reward_weights.json` is no longer the primary mechanism — it's replaced
-   by `reward_program.py`. `reward_components.py` is kept only as a legacy
+   by `reward_program.py`. `txt2reward.reward.components` is kept only as a legacy
    compatibility layer for `evaluate.py --no-shaped`.
 2. `RewardDesigner` no longer exposes `get_weights()` returning a weight
    dict; it now returns `{"generation": int, "reward_path": str}` for
@@ -341,7 +359,7 @@ If you used the earlier (weight-tuning) version of this project:
 
 - The Groq free tier is rate-limited. The designer backs off exponentially
   (up to 8s) on rate-limit or parse errors, and falls back across multiple
-  keys via `key_manager.py` if configured; if generation still fails, the
+  keys via `txt2reward.llm.key_manager` if configured; if generation still fails, the
   previous reward program is kept.
 - Training on CPU is slow; a GPU is strongly recommended.
 - The sandbox forbids loops and attribute access, so generated reward
@@ -349,6 +367,12 @@ If you used the earlier (weight-tuning) version of this project:
   — a deliberate constraint, and sufficient for per-step reward shaping.
 - Reward program updates happen in the main process only; worker processes
   see the update with a delay of up to `--reload-interval` steps.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ---
 
