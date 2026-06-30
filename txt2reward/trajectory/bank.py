@@ -343,25 +343,33 @@ def _gen_legitimate_overtaking(rng: random.Random, length: int, speed: float, n_
 # ── Bank assembly ───────────────────────────────────────────────────────────────
 
 _BANK_CACHE: list[TrajectorySpec] | None = None
+_LITE_BANK_CACHE: list[TrajectorySpec] | None = None
 
 
-def build_trajectory_bank() -> list[TrajectorySpec]:
-    """
-    Builds the full ~40-trajectory bank, deterministically (fixed seed).
-    Returns a list of TrajectorySpec, each with reference metrics + fitness
-    already computed.
-
-    The bank is built once per process and reused (immutable synthetic data).
-    """
-    global _BANK_CACHE
-    if _BANK_CACHE is not None:
-        return _BANK_CACHE
-
-    rng = random.Random(TRAJECTORY_BANK_SEED)
-    bank: list[TrajectorySpec] = []
+def _populate_bank(rng: random.Random, bank: list[TrajectorySpec], *, lite: bool) -> None:
+    """Append trajectory specs to ``bank`` (full ~40 or lite ~16)."""
 
     def add(name: str, category: str, states: list[dict]) -> None:
         bank.append(TrajectorySpec(name=name, category=category, states=states))
+
+    if lite:
+        add("safe_steady_0", "safe_steady", _gen_safe_steady(rng, 50, 18.0))
+        add("safe_steady_1", "safe_steady", _gen_safe_steady(rng, 50, 24.0))
+        add("safe_fast_0", "safe_fast", _gen_safe_steady(rng, 40, 27.0))
+        add("safe_fast_1", "safe_fast", _gen_safe_steady(rng, 45, 29.5))
+        add("stationary_0", "stationary_farming", _gen_stationary_farming(rng, 45))
+        add("stationary_1", "stationary_farming", _gen_stationary_farming(rng, 60))
+        add("reckless_crash_0", "reckless_crash", _gen_reckless_crash(rng, 40, 26.0, 0.5))
+        add("reckless_crash_1", "reckless_crash", _gen_reckless_crash(rng, 40, 30.0, 0.9))
+        add("tailgate_0", "tailgating_no_crash", _gen_tailgating_no_crash(rng, 50, 22.0))
+        add("tailgate_1", "tailgating_no_crash", _gen_tailgating_no_crash(rng, 50, 27.0))
+        add("osc_lanes_0", "oscillating_lanes", _gen_oscillating_lanes(rng, 40))
+        add("osc_lanes_1", "oscillating_lanes", _gen_oscillating_lanes(rng, 50))
+        add("jerk_spam_0", "jerk_accel_spam", _gen_jerk_accel_spam(rng, 40))
+        add("jerk_spam_1", "jerk_accel_spam", _gen_jerk_accel_spam(rng, 50))
+        add("legit_overtake_0", "legitimate_overtaking", _gen_legitimate_overtaking(rng, 60, 26.0, 3))
+        add("legit_overtake_1", "legitimate_overtaking", _gen_legitimate_overtaking(rng, 70, 28.0, 5))
+        return
 
     # 1) safe_steady — 6 variants across speed levels and episode lengths
     for i, (speed, length) in enumerate([(15.0, 40), (18.0, 50), (20.0, 60), (22.0, 40), (24.0, 50), (26.0, 60)]):
@@ -392,9 +400,6 @@ def build_trajectory_bank() -> list[TrajectorySpec]:
         add(f"jerk_spam_{i}", "jerk_accel_spam", _gen_jerk_accel_spam(rng, length))
 
     # 8) legitimate_overtaking — 7 variants across speed x overtake count
-    #    (this is the category that should sit at/near the top of the
-    #    reference ranking, and the gate explicitly checks it dominates
-    #    every unsafe category below)
     for i, (speed, n_ot, length) in enumerate(
         [
             (24.0, 3, 50),
@@ -412,6 +417,49 @@ def build_trajectory_bank() -> list[TrajectorySpec]:
             _gen_legitimate_overtaking(rng, length, speed, n_ot),
         )
 
+
+def build_trajectory_bank_lite() -> list[TrajectorySpec]:
+    """
+    Lite bank (~16 trajectories): two representative variants per category.
+
+    Used by default during LLM evolution (``TRAJECTORY_BANK_MODE=lite``) to
+    reduce redundant pairwise checks while keeping all eight behavioural categories.
+    """
+    global _LITE_BANK_CACHE
+    if _LITE_BANK_CACHE is not None:
+        return _LITE_BANK_CACHE
+
+    rng = random.Random(TRAJECTORY_BANK_SEED)
+    bank: list[TrajectorySpec] = []
+    _populate_bank(rng, bank, lite=True)
+    _LITE_BANK_CACHE = bank
+    return bank
+
+
+def get_trajectory_bank() -> list[TrajectorySpec]:
+    """Return the active Stage B bank per ``TRAJECTORY_BANK_MODE`` (default lite)."""
+    from txt2reward.config.validation import TRAJECTORY_BANK_MODE
+
+    if TRAJECTORY_BANK_MODE == "full":
+        return build_trajectory_bank()
+    return build_trajectory_bank_lite()
+
+
+def build_trajectory_bank() -> list[TrajectorySpec]:
+    """
+    Builds the full ~40-trajectory bank, deterministically (fixed seed).
+    Returns a list of TrajectorySpec, each with reference metrics + fitness
+    already computed.
+
+    The bank is built once per process and reused (immutable synthetic data).
+    """
+    global _BANK_CACHE
+    if _BANK_CACHE is not None:
+        return _BANK_CACHE
+
+    rng = random.Random(TRAJECTORY_BANK_SEED)
+    bank: list[TrajectorySpec] = []
+    _populate_bank(rng, bank, lite=False)
     _BANK_CACHE = bank
     return bank
 
@@ -496,7 +544,7 @@ def measure_gate_stats(
     Raises RuntimeError if the reward function fails on any trajectory.
     """
     if bank is None:
-        bank = build_trajectory_bank()
+        bank = get_trajectory_bank()
 
     returns: dict[str, float] = {}
     for spec in bank:
@@ -614,7 +662,7 @@ def evaluate_consistency(
     `full_report` is verbose (for LLM repair); `console_summary` is one line.
     """
     if bank is None:
-        bank = build_trajectory_bank()
+        bank = get_trajectory_bank()
 
     try:
         stats = measure_gate_stats(reward_fn, bank=bank, min_fitness_gap=min_fitness_gap)

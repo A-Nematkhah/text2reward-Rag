@@ -31,8 +31,8 @@ from tests.helpers import base_metrics, passing_reward_code
 
 
 def test_ppo_and_evolution_defaults_unchanged():
-    assert DEFAULT_WARMUP_EPISODES == 40
-    assert DEFAULT_EVOLVE_EVERY == 20
+    assert DEFAULT_WARMUP_EPISODES == 80
+    assert DEFAULT_EVOLVE_EVERY == 100
     assert PPO_N_STEPS == 512
     assert PPO_BATCH_SIZE == 64
     assert PPO_N_EPOCHS == 5

@@ -9,11 +9,16 @@ from __future__ import annotations
 # Reward program hot-reload cadence (env steps per worker).
 DEFAULT_RELOAD_INTERVAL = 200
 
+# Per-step shaped reward clip in LLMRewardWrapper — stabilises PPO value learning
+# when LLM-generated penalties grow large (e.g. collision -100, stacked taxes).
+REWARD_STEP_CLIP_MIN = -10.0
+REWARD_STEP_CLIP_MAX = 10.0
+
 # Evolution: episodes before the first LLM reward generation.
-DEFAULT_WARMUP_EPISODES = 40
+DEFAULT_WARMUP_EPISODES = 80
 
 # Evolution: generate a new reward every N completed episodes (after warmup).
-DEFAULT_EVOLVE_EVERY = 20
+DEFAULT_EVOLVE_EVERY = 100
 
 # Natural-language goal sent to the LLM on bootstrap / evolution.
 DEFAULT_DRIVING_GOAL = (

@@ -186,8 +186,8 @@ python evaluate.py --model ppo_highway_txt2reward.zip --generation 2
 | `--timesteps` | `200000` | Total environment steps |
 | `--n-envs` | `4` | Number of parallel environments |
 | `--reload-interval` | `200` | Steps between `reward_program.py` reloads in each worker |
-| `--evolve-every` | `20` | Generate a new reward program every N episodes (after warmup) |
-| `--warmup-episodes` | `40` | Episodes before the first LLM reward generation |
+| `--evolve-every` | `100` | Generate a new reward program every N episodes (after warmup) |
+| `--warmup-episodes` | `80` | Episodes before the first LLM reward generation |
 | `--goal` | *(driving goal)* | Natural-language goal sent to the LLM |
 | `--reward-path` | `reward_program.py` | Output path for the generated reward program |
 | `--archive-file` | `reward_archive.json` | Path to the reward archive |

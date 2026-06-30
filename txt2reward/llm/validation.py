@@ -25,11 +25,11 @@ from txt2reward.sandbox.sandbox import (
     validate_reward_code,
 )
 from txt2reward.trajectory.bank import (
-    build_trajectory_bank,
     evaluate_consistency,
+    get_trajectory_bank,
 )
 
-_TRAJECTORY_BANK = build_trajectory_bank()
+_TRAJECTORY_BANK = get_trajectory_bank()
 
 
 # ── Smoke-test helper ─────────────────────────────────────────────────────────

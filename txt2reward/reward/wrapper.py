@@ -51,7 +51,11 @@ import gymnasium as gym
 import numpy as np
 
 from txt2reward.config.paths import REWARD_PROGRAM_PATH
-from txt2reward.config.training import DEFAULT_RELOAD_INTERVAL
+from txt2reward.config.training import (
+    DEFAULT_RELOAD_INTERVAL,
+    REWARD_STEP_CLIP_MAX,
+    REWARD_STEP_CLIP_MIN,
+)
 from txt2reward.config.validation import REWARD_STEP_TIMEOUT_SEC
 from txt2reward.core.constants import HIGHWAY_DIST_SCALE, HIGHWAY_SPEED_SCALE
 from txt2reward.core.log import get_logger
@@ -121,6 +125,11 @@ _TRACK_MAX_MISSES = 3
 # plausible single-step jitter but stay well inside _TRACK_MAX_DX_JUMP so it
 # doesn't interfere with genuine re-merge-ahead detection.
 _OVERTAKE_REARM_MARGIN = 2.0  # metres
+
+
+def _clip_shaped_reward(reward: float) -> float:
+    """Clamp per-step shaped reward so PPO critic targets stay bounded."""
+    return float(max(REWARD_STEP_CLIP_MIN, min(REWARD_STEP_CLIP_MAX, reward)))
 
 
 # ── Shared y/lateral de-normalization (SINGLE source of truth) ───────────────
@@ -379,6 +388,8 @@ class LLMRewardWrapper(gym.Wrapper):
             if self._global_step % 1000 == 1:
                 log.warning(f"[wrapper] Reward execution error: {e}")
             shaped_reward = _fallback_reward(state)
+
+        shaped_reward = _clip_shaped_reward(shaped_reward)
 
         # Debug logging
         if os.environ.get("DEBUG_REWARD") and self._global_step % 1000 == 0:
