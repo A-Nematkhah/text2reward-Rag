@@ -1,13 +1,18 @@
 """
-key_manager.py — Smart API Key Manager for Groq
---------------------------------------------------
-Put multiple free keys in ``api_keys.json`` at the repository root.
-Whenever a rate limit occurs, it automatically switches to the next key.
+key_manager.py — Smart API Key Manager for Groq / OpenRouter
+--------------------------------------------------------------
+Put multiple free keys in ``api_keys.json`` at the repository root, under
+either ``groq_keys`` or ``openrouter_keys`` (or both — see
+``api_keys.json.example``). Whenever a rate limit occurs, it automatically
+switches to the next key for the active provider.
+
+Provider selection is controlled by ``txt2reward.config.llm.LLM_PROVIDER``
+(or the ``LLM_PROVIDER`` env var: "groq" | "openrouter").
 
 Usage:
-    from txt2reward.llm.key_manager import get_groq_client, call_with_rotation
+    from txt2reward.llm.key_manager import get_llm_client, call_with_rotation
 
-    client = get_groq_client()   # current active key
+    client = get_llm_client()   # current active key, current provider
     resp = call_with_rotation(
         model="llama-3.3-70b-versatile",
         messages=[...],
@@ -26,11 +31,20 @@ from typing import Any
 import groq
 from groq import Groq
 
+try:
+    import openai
+    from openai import OpenAI
+except ImportError:  # OpenRouter path is optional until needed
+    openai = None
+    OpenAI = None  # type: ignore[misc]
+
 from txt2reward.config.llm import (
     GENERATION_MAX_TOKENS,
     GENERATION_TEMPERATURE,
     KEY_ROTATION_MAX_ROUNDS,
     KEY_ROTATION_WAIT_SEC,
+    LLM_PROVIDER,
+    OPENROUTER_BASE_URL,
 )
 from txt2reward.config.paths import API_KEYS_FILE
 from txt2reward.core.log import get_logger
@@ -46,34 +60,53 @@ _WAIT_ALL_EXHAUSTED = KEY_ROTATION_WAIT_SEC
 # Maximum retry rounds after all keys hit rate limits
 _MAX_FULL_ROTATIONS = KEY_ROTATION_MAX_ROUNDS
 
+# Env var names per provider — keep both supported regardless of which
+# provider is active, so switching providers doesn't require touching env.
+_ENV_VAR_BY_PROVIDER = {
+    "groq": "GROQ_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+_JSON_FIELD_BY_PROVIDER = {
+    "groq": "groq_keys",
+    "openrouter": "openrouter_keys",
+}
+
 
 # ── Load Keys ────────────────────────────────────────────────────────────────
-def _load_keys() -> list[str]:
-    """Loads keys from api_keys.json or environment variables."""
+def _load_keys(provider: str) -> list[str]:
+    """Loads keys for ``provider`` from env var or api_keys.json."""
     keys: list[str] = []
 
-    # Check env var first (if you only have one key)
-    env_key = os.environ.get("GROQ_API_KEY", "").strip()
+    env_var = _ENV_VAR_BY_PROVIDER.get(provider, "GROQ_API_KEY")
+    env_key = os.environ.get(env_var, "").strip()
     if env_key:
         keys.append(env_key)
 
-    # Then load from json file
     if _KEYS_FILE.exists():
         try:
             data = json.loads(_KEYS_FILE.read_text(encoding="utf-8"))
-            file_keys = data.get("groq_keys", [])
+            field = _JSON_FIELD_BY_PROVIDER.get(provider, "groq_keys")
+            file_keys = data.get(field, [])
             for k in file_keys:
                 k = k.strip()
-                if k and k not in keys and not k.startswith("gsk_YOUR"):
+                if k and k not in keys and not k.lower().startswith(("gsk_your", "sk-or-your", "your_")):
                     keys.append(k)
         except Exception as exc:
             log.warning(f"[key_manager] Warning: Failed to read {_KEYS_FILE}: {exc}")
 
     if not keys:
+        if provider == "openrouter":
+            raise EnvironmentError(
+                "\n[ERROR] No OpenRouter API Key found!\n"
+                "Use one of the following methods:\n"
+                "  1) Add keys to api_keys.json under 'openrouter_keys'\n"
+                "  2) export OPENROUTER_API_KEY=sk-or-xxxxxxxx\n"
+                "Get a free key from: https://openrouter.ai/\n"
+            )
         raise EnvironmentError(
             "\n[ERROR] No Groq API Key found!\n"
             "Use one of the following methods:\n"
-            "  1) Add keys to api_keys.json\n"
+            "  1) Add keys to api_keys.json under 'groq_keys'\n"
             "  2) export GROQ_API_KEY=gsk_xxxxxxxx\n"
             "Get a free key from: https://console.groq.com\n"
         )
@@ -81,27 +114,47 @@ def _load_keys() -> list[str]:
     return keys
 
 
-# ── Key Manager (Singleton) ───────────────────────────────────────────────────
+# ── Key Manager (Singleton, provider-aware) ───────────────────────────────────
 class _KeyManager:
-    """Rotating API Key manager with Rate Limit detection."""
+    """Rotating API Key manager with Rate Limit detection, per provider."""
 
-    def __init__(self) -> None:
+    def __init__(self, provider: str | None = None) -> None:
+        self.provider = (provider or LLM_PROVIDER or "groq").strip().lower()
+        if self.provider not in ("groq", "openrouter"):
+            log.warning(f"[key_manager] Unknown LLM_PROVIDER '{self.provider}' — defaulting to 'groq'")
+            self.provider = "groq"
         self._keys: list[str] = []
         self._index: int = 0  # current active key
-        self._clients: dict[str, Groq] = {}
+        self._clients: dict[str, Any] = {}
         self._cooldown_until: dict[str, float] = {}  # key → cooldown expiration time
         self._initialized = False
 
     def _ensure_init(self) -> None:
         if not self._initialized:
-            self._keys = _load_keys()
+            self._keys = _load_keys(self.provider)
             self._index = 0
             self._initialized = True
-            log.info(f"[key_manager] {len(self._keys)} keys loaded.")
+            log.info(f"[key_manager] provider={self.provider} | {len(self._keys)} keys loaded.")
 
-    def _get_client(self, key: str) -> Groq:
+    def _get_client(self, key: str) -> Any:
         if key not in self._clients:
-            self._clients[key] = Groq(api_key=key)
+            if self.provider == "openrouter":
+                if OpenAI is None:
+                    raise EnvironmentError(
+                        "OpenRouter provider selected but the 'openai' package is not installed. "
+                        "Run: pip install openai"
+                    )
+                self._clients[key] = OpenAI(
+                    api_key=key,
+                    base_url=OPENROUTER_BASE_URL,
+                    default_headers={
+                        # Optional but recommended by OpenRouter for routing/analytics.
+                        "HTTP-Referer": "https://github.com/A-Nematkhah/text2reward-Rag",
+                        "X-Title": "txt2reward-v2",
+                    },
+                )
+            else:
+                self._clients[key] = Groq(api_key=key)
         return self._clients[key]
 
     def _current_key(self) -> str:
@@ -120,10 +173,41 @@ class _KeyManager:
                 return True
         return False  # all keys are in cooldown
 
-    def get_active_client(self) -> Groq:
+    def get_active_client(self) -> Any:
         self._ensure_init()
         key = self._current_key()
         return self._get_client(key)
+
+    # ── Provider-specific error classification ────────────────────────────────
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        if self.provider == "groq":
+            return isinstance(exc, groq.RateLimitError)
+        if openai is not None and isinstance(exc, openai.RateLimitError):
+            return True
+        # OpenRouter sometimes surfaces rate limits as generic 429 API errors.
+        status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+        return status == 429
+
+    def _is_auth_error(self, exc: Exception) -> bool:
+        if self.provider == "groq":
+            return isinstance(exc, groq.AuthenticationError)
+        if openai is not None and isinstance(exc, openai.AuthenticationError):
+            return True
+        status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+        return status == 401
+
+    def _retry_after(self, exc: Exception) -> float | None:
+        try:
+            headers = getattr(getattr(exc, "response", None), "headers", None)
+            if not headers:
+                return None
+            val = headers.get("retry-after") or headers.get("x-ratelimit-reset-requests")
+            if val:
+                return float(val)
+        except Exception:
+            pass
+        return None
 
     def call(
         self,
@@ -137,7 +221,9 @@ class _KeyManager:
         Makes an API call with automatic key rotation on Rate Limit.
 
         If all keys hit Rate Limit, waits _WAIT_ALL_EXHAUSTED seconds
-        and retries (up to _MAX_FULL_ROTATIONS rounds).
+        and retries (up to _MAX_FULL_ROTATIONS rounds). Works identically
+        for Groq and OpenRouter — both clients expose the same
+        ``chat.completions.create(...)`` interface.
         """
         self._ensure_init()
 
@@ -166,35 +252,37 @@ class _KeyManager:
                     )
                     return resp  # ✅ success
 
-                except groq.RateLimitError as exc:
-                    # Extract wait time from response headers (if available)
-                    wait = _parse_retry_after(exc) or 60
-                    self._cooldown_until[key] = time.time() + wait
-                    log.warning(f"[key_manager] Key #{self._index + 1} hit rate limit (wait {wait:.0f}s). Switching...")
-                    if not self._rotate():
-                        break  # all keys in cooldown
+                except Exception as exc:
+                    if self._is_rate_limit_error(exc):
+                        wait = self._retry_after(exc) or 60
+                        self._cooldown_until[key] = time.time() + wait
+                        log.warning(
+                            f"[key_manager] Key #{self._index + 1} ({self.provider}) hit rate limit "
+                            f"(wait {wait:.0f}s). Switching..."
+                        )
+                        if not self._rotate():
+                            break  # all keys in cooldown
+                        continue
 
-                except groq.AuthenticationError:
-                    log.warning(f"[key_manager] Key #{self._index + 1} is invalid. Switching...")
-                    self._cooldown_until[key] = float("inf")  # never use this key again
-                    if not self._rotate():
-                        raise RuntimeError("No valid keys remaining!")
+                    if self._is_auth_error(exc):
+                        log.warning(f"[key_manager] Key #{self._index + 1} ({self.provider}) is invalid. Switching...")
+                        self._cooldown_until[key] = float("inf")  # never use this key again
+                        if not self._rotate():
+                            raise RuntimeError("No valid keys remaining!") from exc
+                        continue
 
-                except Exception:
                     raise  # propagate other errors
 
             # Reaching here means all keys hit rate limits
             if rotation < _MAX_FULL_ROTATIONS - 1:
-                # Find when the next key becomes available
                 min_wait = _min_cooldown_wait(self._cooldown_until, self._keys)
                 log.warning(
-                    f"[key_manager] All {n} keys are rate-limited. "
+                    f"[key_manager] All {n} keys ({self.provider}) are rate-limited. "
                     f"Waiting {min_wait:.0f}s ... "
                     f"(round {rotation + 2}/{_MAX_FULL_ROTATIONS})"
                 )
                 _interruptible_sleep(min_wait)
 
-                # After sleep, select the first available key
                 now = time.time()
                 for i, k in enumerate(self._keys):
                     if self._cooldown_until.get(k, 0) <= now:
@@ -202,18 +290,6 @@ class _KeyManager:
                         break
 
         raise RuntimeError(f"[key_manager] No available key after {_MAX_FULL_ROTATIONS} rotation rounds.")
-
-
-def _parse_retry_after(exc: groq.RateLimitError) -> float | None:
-    """Extracts retry time from response headers (if available)."""
-    try:
-        headers = exc.response.headers
-        val = headers.get("retry-after") or headers.get("x-ratelimit-reset-requests")
-        if val:
-            return float(val)
-    except Exception:
-        pass
-    return None
 
 
 def _interruptible_sleep(seconds: float) -> None:
@@ -233,13 +309,27 @@ def _min_cooldown_wait(cooldown_until: dict[str, float], keys: list[str]) -> flo
     return min(waits) if waits else 1.0
 
 
-# ── Public Singleton ──────────────────────────────────────────────────────────
-_manager = _KeyManager()
+# ── Public Singleton (provider-aware, lazily (re)created if provider switches) ─
+_manager: _KeyManager | None = None
 
 
-def get_groq_client() -> Groq:
-    """Returns the Groq client for the currently active key."""
-    return _manager.get_active_client()
+def _get_manager() -> _KeyManager:
+    global _manager
+    active_provider = (LLM_PROVIDER or "groq").strip().lower()
+    if _manager is None or _manager.provider != active_provider:
+        _manager = _KeyManager(provider=active_provider)
+    return _manager
+
+
+def get_llm_client() -> Any:
+    """Returns the active-provider client for the currently active key."""
+    return _get_manager().get_active_client()
+
+
+# Backward-compatible alias (old call sites / external scripts).
+def get_groq_client() -> Any:
+    """Deprecated alias — returns the active client (Groq only if LLM_PROVIDER=groq)."""
+    return get_llm_client()
 
 
 def call_with_rotation(
@@ -250,10 +340,11 @@ def call_with_rotation(
     **kwargs: Any,
 ) -> Any:
     """
-    API call with automatic key rotation.
-    Direct replacement for client.chat.completions.create().
+    API call with automatic key rotation, against whichever provider is
+    configured via LLM_PROVIDER. Direct replacement for
+    client.chat.completions.create().
     """
-    return _manager.call(
+    return _get_manager().call(
         model=model,
         messages=messages,
         temperature=temperature,

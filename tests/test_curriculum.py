@@ -16,6 +16,8 @@ from txt2reward.archive.archive import (
 )
 from txt2reward.llm.designer import RewardDesigner
 
+from tests.helpers import archive_entry, base_metrics
+
 
 def test_curriculum_phase_independent_of_generation():
     low_crash = {"crash_rate": 0.05, "mean_speed": 27.0, "mean_overtakes": 2.0}
@@ -101,3 +103,110 @@ def test_evolve_passes_metrics_curriculum_to_generate(monkeypatch):
 def test_all_phases_have_guidance(phase):
     assert phase in CURRICULUM_GUIDANCE
     assert len(curriculum_guidance(phase)) > 20
+
+
+def test_get_top_k_restricts_to_curriculum_phase_when_enough_entries(tmp_path):
+    archive = RewardArchive(str(tmp_path / "archive.json"))
+    survive_codes = [
+        "def compute_reward(state):\n    return state['speed_ms']\n",
+        "def compute_reward(state):\n    return state.get('speed_ms', 0.0)\n",
+        "def compute_reward(state):\n    return state['speed_ms'] + state.get('lane_offset', 0.0)\n",
+    ]
+    for i, code in enumerate(survive_codes):
+        archive.entries.append(
+            archive_entry(
+                i,
+                code,
+                {**base_metrics(crash_rate=0.45, mean_speed=20.0), "curriculum_phase": "survive"},
+                0.5 + i * 0.05,
+            )
+        )
+    archive.entries.append(
+        archive_entry(
+            3,
+            "def compute_reward(state):\n    return state.get('mean_speed', 0.0)\n",
+            {**base_metrics(crash_rate=0.05, mean_speed=28.0), "curriculum_phase": "refine"},
+            0.9,
+        )
+    )
+    top = archive.get_top_k(k=3, curriculum_phase="refine")
+    assert len(top) == 3
+
+
+def test_get_top_k_activates_phase_restriction_when_enough_same_phase(tmp_path):
+    archive = RewardArchive(str(tmp_path / "archive.json"))
+    archive.entries.append(
+        archive_entry(
+            0,
+            "def compute_reward(state):\n    return state['speed_ms'] * 9.0\n",
+            {**base_metrics(crash_rate=0.05, mean_speed=28.0), "curriculum_phase": "survive"},
+            0.95,
+        )
+    )
+    codes = [
+        "def compute_reward(state):\n    return state['speed_ms']\n",
+        "def compute_reward(state):\n    return state.get('speed_ms', 0.0)\n",
+        "def compute_reward(state):\n    return state['speed_ms'] + state.get('lane_offset', 0.0)\n",
+    ]
+    for i, code in enumerate(codes, start=1):
+        archive.entries.append(
+            archive_entry(
+                i,
+                code,
+                {**base_metrics(crash_rate=0.05, mean_speed=27.0), "curriculum_phase": "refine"},
+                0.70 + i * 0.05,
+            )
+        )
+    top = archive.get_top_k(k=3, curriculum_phase="refine")
+    assert len(top) == 3
+    assert all(e.get("metrics", {}).get("curriculum_phase") == "refine" for e in top)
+    assert 0 not in {e["generation"] for e in top}
+
+
+def test_format_for_llm_shows_failure_mode_recurrence(tmp_path):
+    archive = RewardArchive(str(tmp_path / "archive.json"))
+    archive.entries.append(
+        archive_entry(
+            0,
+            "def compute_reward(state):\n    return state['speed_ms']\n",
+            base_metrics(crash_rate=0.05, mean_speed=27.0, mean_overtakes=2.0),
+            0.98,
+        )
+    )
+    archive.entries[0]["critique_meta"] = {"failure_modes": [], "strengths": [], "summary": ""}
+    for i, code in enumerate(
+        [
+            "def compute_reward(state):\n    return state.get('a', 0.0)\n",
+            "def compute_reward(state):\n    return state.get('b', 0.0)\n",
+        ],
+        start=1,
+    ):
+        entry = archive_entry(
+            i,
+            code,
+            base_metrics(crash_rate=1.0, mean_speed=18.0, mean_overtakes=0.0),
+            0.002,
+        )
+        entry["critique_meta"] = {"failure_modes": ["passive_driving"], "strengths": [], "summary": ""}
+        archive.entries.append(entry)
+    passive_codes = [
+        "def compute_reward(state):\n    return state.get('speed_ms', 0.0) * 0.1\n",
+        "def compute_reward(state):\n    return state['lane_offset']\n",
+        "def compute_reward(state):\n    return state['speed_ms'] + state.get('lane_offset', 0.0)\n",
+        "def compute_reward(state):\n    return state.get('on_road', 1.0)\n",
+        "def compute_reward(state):\n    return state['speed_ms'] - state.get('lane_offset', 0.0)\n",
+        "def compute_reward(state):\n    return state.get('crashed', 0.0)\n",
+        "def compute_reward(state):\n    return state['speed_ms'] * state.get('on_road', 1.0)\n",
+        "def compute_reward(state):\n    return state.get('mean_speed', 0.0)\n",
+    ]
+    for i, code in enumerate(passive_codes, start=3):
+        entry = archive_entry(
+            i,
+            code,
+            base_metrics(crash_rate=0.08, mean_speed=18.0, mean_overtakes=0.0),
+            0.12,
+        )
+        entry["critique_meta"] = {"failure_modes": ["passive_driving"], "strengths": [], "summary": ""}
+        archive.entries.append(entry)
+    text = archive.format_for_llm(k=1, current_failure_modes=["passive_driving"])
+    assert "Recurrence: 'passive_driving' appeared in" in text

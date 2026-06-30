@@ -13,12 +13,12 @@ from txt2reward.archive.fitness import compute_fitness, is_passive_driving
 from txt2reward.archive.retrieval import (
     _format_entry,
     cached_effective_fitness,
-    dedupe_entries_by_code,
     effective_fitness,
     is_crash_farming,
     is_pathological_for_retrieval,
     prefetch_effective_fitness,
     reward_code_hash,
+    reward_code_skeleton_hash,
 )
 from txt2reward.config.fitness import (
     ARCHIVE_FAILED_MAX_FITNESS,
@@ -31,6 +31,17 @@ from txt2reward.core.metrics import enrich_fitness_metrics
 from txt2reward.core.types import ArchiveEntry, FitnessMetrics
 
 log = get_logger("archive")
+
+
+def _failure_mode_frequency(entries: list[ArchiveEntry], mode: str, window: int = 10) -> float:
+    """Fraction of the last `window` archive entries (by archive order, i.e.
+    generation order) whose critique_meta lists `mode` among failure_modes.
+    Returns 0.0 if there are no entries at all."""
+    recent = entries[-window:]
+    if not recent:
+        return 0.0
+    return sum(1 for e in recent if mode in e.get("critique_meta", {}).get("failure_modes", [])) / len(recent)
+
 
 # ── Archive class ─────────────────────────────────────────────────────────────
 
@@ -178,14 +189,27 @@ class RewardArchive:
         *,
         min_fitness: float = ARCHIVE_MIN_TOP_FITNESS,
         fitness_cache: dict[int, float] | None = None,
+        curriculum_phase: str | None = None,
     ) -> list[ArchiveEntry]:
         """
         Returns up to k entries with highest effective fitness, excluding
         near-duplicate code and pathological crash-farming clones when better
         alternatives exist in the archive.
+
+        When curriculum_phase is given and at least k entries in the archive
+        share that phase, restrict the candidate pool to same-phase entries
+        first (falling back to the full archive only if there aren't enough
+        same-phase entries to fill k slots) — this prevents retrieval from
+        surfacing an entry that was a "top performer" under a different,
+        no-longer-relevant curriculum phase.
         """
+        candidates = self.entries
+        if curriculum_phase:
+            same_phase = [e for e in candidates if e.get("metrics", {}).get("curriculum_phase") == curriculum_phase]
+            if len(same_phase) >= k:
+                candidates = same_phase
         return self._select_diverse_top(
-            self.entries,
+            candidates,
             k=k,
             min_fitness=min_fitness,
             fitness_cache=fitness_cache,
@@ -225,6 +249,7 @@ class RewardArchive:
 
         selected: list[ArchiveEntry] = []
         seen_hashes: set[str] = set()
+        seen_skeletons: set[str] = set()
         seen_crash_bands: set[int] = set()
 
         def _crash_band(cr: float) -> int:
@@ -238,6 +263,9 @@ class RewardArchive:
             code = entry.get("reward_code", "")
             h = reward_code_hash(code)
             if h in seen_hashes:
+                continue
+            sk = reward_code_skeleton_hash(code)
+            if selected and sk in seen_skeletons:
                 continue
             m = entry.get("metrics", {})
             cr = float(m.get("crash_rate", 1.0))
@@ -262,6 +290,7 @@ class RewardArchive:
                 continue
             selected.append(entry)
             seen_hashes.add(h)
+            seen_skeletons.add(sk)
             seen_crash_bands.add(band)
             if len(selected) >= k:
                 break
@@ -270,11 +299,16 @@ class RewardArchive:
             for entry in ranked:
                 if has_non_pathological and is_pathological_for_retrieval(entry):
                     continue
-                h = reward_code_hash(entry.get("reward_code", ""))
+                code = entry.get("reward_code", "")
+                h = reward_code_hash(code)
                 if h in seen_hashes or entry in selected:
+                    continue
+                sk = reward_code_skeleton_hash(code)
+                if selected and sk in seen_skeletons:
                     continue
                 selected.append(entry)
                 seen_hashes.add(h)
+                seen_skeletons.add(sk)
                 if len(selected) >= k:
                     break
         return selected[:k]
@@ -301,11 +335,17 @@ class RewardArchive:
         k: int = 3,
         max_fitness: float = ARCHIVE_FAILED_MAX_FITNESS,
         fitness_cache: dict[int, float] | None = None,
+        curriculum_phase: str | None = None,
     ) -> list[ArchiveEntry]:
         """
         Negative examples for LLM context: low effective fitness, passive-but-safe
         traps, and crash-farming rewards (even when fitness is misleadingly high
         under legacy scoring).
+
+        Samples round-robin across the three buckets (failed / passive / crash_farm)
+        rather than concatenating them, so a small k still surfaces at least one
+        example from each distinct failure category when available, instead of
+        being starved by whichever bucket happens to be largest.
         """
 
         def _fit(entry: Mapping[str, Any]) -> float:
@@ -313,17 +353,47 @@ class RewardArchive:
                 return cached_effective_fitness(entry, fitness_cache)
             return effective_fitness(entry)
 
-        failed = [e for e in self.entries if _fit(e) <= max_fitness]
-        passive = [e for e in self.entries if e not in failed and is_passive_driving(e.get("metrics", {}))]
+        pool = self.entries
+        if curriculum_phase:
+            same_phase = [e for e in pool if e.get("metrics", {}).get("curriculum_phase") == curriculum_phase]
+            if len(same_phase) >= k:
+                pool = same_phase
+
+        failed = [e for e in pool if _fit(e) <= max_fitness]
+        passive = [e for e in pool if e not in failed and is_passive_driving(e.get("metrics", {}))]
         crash_farm = [
             e
-            for e in self.entries
+            for e in pool
             if e not in failed
             and is_crash_farming(e.get("metrics", {}))
             and not is_passive_driving(e.get("metrics", {}))
         ]
-        combined = sorted(failed, key=_fit) + sorted(passive, key=_fit) + sorted(crash_farm, key=lambda e: -_fit(e))
-        return cast(list[ArchiveEntry], dedupe_entries_by_code(combined)[:k])
+
+        buckets = [
+            sorted(failed, key=_fit),
+            sorted(passive, key=_fit),
+            sorted(crash_farm, key=lambda e: -_fit(e)),
+        ]
+
+        selected: list[ArchiveEntry] = []
+        seen_hashes: set[str] = set()
+        progressed = True
+        while len(selected) < k and progressed:
+            progressed = False
+            for bucket in buckets:
+                while bucket:
+                    candidate = bucket.pop(0)
+                    h = reward_code_hash(candidate.get("reward_code", ""))
+                    if h in seen_hashes:
+                        continue
+                    selected.append(candidate)
+                    seen_hashes.add(h)
+                    progressed = True
+                    break
+                if len(selected) >= k:
+                    break
+
+        return cast(list[ArchiveEntry], selected[:k])
 
     def get_entries_by_failure_modes(
         self,
@@ -381,7 +451,7 @@ class RewardArchive:
             )
 
         # ── A) Top performers ────────────────────────────────────────────────
-        top = self.get_top_k(k, fitness_cache=fitness_cache)
+        top = self.get_top_k(k, fitness_cache=fitness_cache, curriculum_phase=curriculum_phase)
         lines.append("=== A) TOP REWARD PROGRAMS (by fitness) ===\n")
         for entry in top:
             lines.append(
@@ -405,7 +475,7 @@ class RewardArchive:
             )
 
         # ── C) Failed rewards (negative examples) ────────────────────────────
-        failed = self.get_failed_rewards(k=2, fitness_cache=fitness_cache)
+        failed = self.get_failed_rewards(k=2, fitness_cache=fitness_cache, curriculum_phase=curriculum_phase)
         if failed:
             lines.append(
                 "=== C) FAILED / PASSIVE REWARDS (do NOT repeat these patterns) ===\n"
@@ -432,6 +502,9 @@ class RewardArchive:
             similar = [e for e in similar if e["generation"] not in shown_gens]
             if similar:
                 lines.append(f"=== D) REWARDS WITH SIMILAR FAILURE MODES ({', '.join(current_failure_modes)}) ===\n")
+                for mode in current_failure_modes:
+                    freq = _failure_mode_frequency(self.entries, mode, window=10)
+                    lines.append(f"  Recurrence: '{mode}' appeared in {freq:.0%} of the last 10 generations.\n")
                 lines.append("These previously showed the same issues — study why they failed:\n")
                 for entry in similar:
                     lines.append(

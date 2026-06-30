@@ -11,7 +11,7 @@ import math
 from typing import Any, Mapping
 
 from txt2reward.archive.curriculum import infer_curriculum_phase
-from txt2reward.config.fitness import FITNESS_VERSION_DEFAULT
+from txt2reward.config.fitness import FITNESS_VERSION_DEFAULT, PASSIVE_DRIVING_CRASH_CEILING
 from txt2reward.core.metrics import lane_change_rate, near_miss_rate, safe_overtake_ratio
 from txt2reward.core.types import CurriculumPhase, FitnessMetrics
 
@@ -50,7 +50,6 @@ _HARD_PENALTY_SCALE = 0.10
 # ── Passive-driving gate (v6) ─────────────────────────────────────────────────
 # When the agent is already safe (low crash_rate), suppress fitness if it trades
 # speed/overtaking for survival — the "slow down to stay safe" reward hack.
-_PASSIVE_CRASH_CEILING = 0.20  # wider: gate applies even with ~20% crash rate
 _PASSIVE_SPEED_MIN = 24.0  # m/s — raised: 20-22 m/s is passive, need 24+
 _PASSIVE_OVERTAKE_MIN = 1.5  # overtakes/ep — raised: 0.5 was trivially easy
 _PASSIVE_GATE_FLOOR = 0.10  # lowered: passive agent gets ≤10% of base fitness
@@ -126,11 +125,10 @@ def is_passive_driving(metrics: Mapping[str, Any]) -> bool:
     Uses v7 thresholds when default fitness version is 7.
     """
     crash_rate = float(metrics.get("crash_rate", 1.0))
-    ceiling = _V7_PASSIVE_CRASH_CEIL if FITNESS_VERSION_DEFAULT >= 7 else _PASSIVE_CRASH_CEILING
+    if crash_rate > PASSIVE_DRIVING_CRASH_CEILING:
+        return False
     speed_min = _V7_PASSIVE_SPEED_MIN if FITNESS_VERSION_DEFAULT >= 7 else _PASSIVE_SPEED_MIN
     ot_min = _V7_PASSIVE_OT_MIN if FITNESS_VERSION_DEFAULT >= 7 else _PASSIVE_OVERTAKE_MIN
-    if crash_rate > ceiling:
-        return False
     mean_speed = float(metrics.get("mean_speed", 0.0))
     mean_overtakes = float(metrics.get("mean_overtakes", 0.0))
     return mean_speed < speed_min or mean_overtakes < ot_min
@@ -144,7 +142,7 @@ def _passive_driving_gate(
     """
     Multiplicative gate ∈ [_PASSIVE_GATE_FLOOR, 1.0].
 
-    Inactive (returns 1.0) while crash_rate > _PASSIVE_CRASH_CEILING — don't
+    Inactive (returns 1.0) while crash_rate > PASSIVE_DRIVING_CRASH_CEILING — don't
     punish an agent still learning basic safety.
 
     Once crash_rate is low enough, applies TWO independent multiplicative factors:
@@ -167,7 +165,7 @@ def _passive_driving_gate(
       semi-active (22 m/s, 1 overtake, 5% crash) → gate = 0.73
       good (26 m/s, 3 overtakes, 5% crash) → gate = 1.00
     """
-    if float(crash_rate) > _PASSIVE_CRASH_CEILING:
+    if float(crash_rate) > PASSIVE_DRIVING_CRASH_CEILING:
         return 1.0
 
     # Speed factor: squared for sharp gradient below the minimum
@@ -208,7 +206,6 @@ _V7_SAFETY_GAMMA = 1.2
 _V7_NEAR_MISS_LAMBDA = 0.10
 _V7_NEAR_MISS_TTC = 2.0
 
-_V7_PASSIVE_CRASH_CEIL = 0.40
 _V7_PASSIVE_SPEED_MIN = 24.0
 _V7_PASSIVE_OT_MIN = 1.0
 _V7_PASSIVE_LAMBDA = 0.35
@@ -234,6 +231,8 @@ _V7_STATIONARY_PENALTY = 0.30
 # within the same crash band, speed/overtaking/comfort still differentiate.
 _V8_CRASH_FLOOR = 0.02
 _V8_CRASH_SURVIVAL_EXP = 1.35
+_V8_DANGER_THRESHOLD = 0.50
+_V8_DANGER_EXTRA_EXP = 2.5
 _V8_W = {
     "activity": 0.30,
     "speed": 0.15,
@@ -307,7 +306,7 @@ def _near_miss_penalty_v7(min_ttc: float) -> float:
 
 
 def _passive_penalty_v7(mean_speed: float, mean_overtakes: float, crash_rate: float) -> float:
-    if float(crash_rate) > _V7_PASSIVE_CRASH_CEIL:
+    if float(crash_rate) > PASSIVE_DRIVING_CRASH_CEILING:
         return 0.0
     activity = _activity_product_v7(mean_speed, mean_overtakes)
     return float(_V7_PASSIVE_LAMBDA * max(0.0, _V7_PASSIVE_TARGET - activity))
@@ -344,13 +343,23 @@ def _curriculum_ceiling_v7(crash_rate: float, phase: int) -> float:
 
 def _survival_score_v8(crash_rate: float) -> float:
     """
-    Continuous survival multiplier ∈ [_V8_CRASH_FLOOR, 1].
+    Continuous survival multiplier in [floor, 1].
 
-    Monotonic: lower crash_rate → higher score, including above 50% crash.
-    At 100% crash the floor is _V8_CRASH_FLOOR (not a hard-coded flat fitness).
+    Below _V8_DANGER_THRESHOLD: identical to the original single power-curve
+    (monotonic, smooth gradient — unchanged behavior).
+
+    Above _V8_DANGER_THRESHOLD: an additional multiplicative penalty kicks in,
+    so a 90-100% crash-rate agent falls off much faster than the base curve
+    alone would produce, preventing reckless-but-fast agents from scoring
+    close enough to genuinely safe agents to be mistaken for "top performers"
+    in archive retrieval.
     """
     cr = min(1.0, max(0.0, float(crash_rate)))
-    return float(_V8_CRASH_FLOOR + (1.0 - _V8_CRASH_FLOOR) * ((1.0 - cr) ** _V8_CRASH_SURVIVAL_EXP))
+    base = _V8_CRASH_FLOOR + (1.0 - _V8_CRASH_FLOOR) * ((1.0 - cr) ** _V8_CRASH_SURVIVAL_EXP)
+    if cr > _V8_DANGER_THRESHOLD:
+        danger_frac = (cr - _V8_DANGER_THRESHOLD) / (1.0 - _V8_DANGER_THRESHOLD)
+        base *= (1.0 - danger_frac) ** _V8_DANGER_EXTRA_EXP
+    return float(max(_V8_CRASH_FLOOR * 0.1, base))
 
 
 def _jerk_spam_penalty_v8(
@@ -424,6 +433,23 @@ def _curriculum_quality_weights(phase: str) -> dict[str, float]:
     return {k: v / total for k, v in base.items()}
 
 
+_SAMPLE_CONFIDENCE_MIN_RELIABLE = 30
+_SAMPLE_CONFIDENCE_MAX_PENALTY = 0.05
+
+
+def _sample_confidence_penalty(n_episodes: int, min_reliable: int = _SAMPLE_CONFIDENCE_MIN_RELIABLE) -> float:
+    """
+    Small additive penalty (0 to _SAMPLE_CONFIDENCE_MAX_PENALTY) applied when
+    n_episodes is below min_reliable, so noisy small-sample fitness scores are
+    shrunk slightly rather than treated as equally authoritative as
+    well-sampled ones. Zero penalty once n_episodes reaches min_reliable.
+    """
+    n = max(int(n_episodes), 0)
+    if n >= min_reliable:
+        return 0.0
+    return float(_SAMPLE_CONFIDENCE_MAX_PENALTY * (1.0 - n / min_reliable))
+
+
 def compute_fitness_v8(
     metrics: FitnessMetrics | Mapping[str, Any],
     *,
@@ -478,6 +504,7 @@ def compute_fitness_v8(
         + _passive_penalty_v7(mean_speed, mean_overtakes, crash_rate)
         + _stationary_penalty_v7(mean_speed)
         + _trend_penalty_v7(metrics, prev_metrics)
+        + _sample_confidence_penalty(int(metrics.get("n_episodes", _SAMPLE_CONFIDENCE_MIN_RELIABLE)))
     )
 
     quality_adj = max(0.0, min(1.0, quality - behavioral_penalty))
@@ -495,7 +522,7 @@ def compute_fitness_v8(
     else:
         fitness = raw_fitness
 
-    if crash_rate <= 0.05 and mean_speed < 22.0 and mean_overtakes < 0.3:
+    if crash_rate <= PASSIVE_DRIVING_CRASH_CEILING and mean_speed < 22.0 and mean_overtakes < 0.3:
         fitness = min(fitness, _V7_PASSIVE_CAP)
 
     return round(float(max(0.001, min(1.0, fitness))), 4)
@@ -586,7 +613,7 @@ def compute_fitness_v7(
     ceiling = _curriculum_ceiling_v7(crash_rate, phase)
     fitness = max(0.0, min(1.0, base - penalty)) * ceiling
 
-    if crash_rate <= 0.05 and mean_speed < 22.0 and mean_overtakes < 0.3:
+    if crash_rate <= PASSIVE_DRIVING_CRASH_CEILING and mean_speed < 22.0 and mean_overtakes < 0.3:
         fitness = min(fitness, _V7_PASSIVE_CAP)
 
     return round(float(fitness), 4)

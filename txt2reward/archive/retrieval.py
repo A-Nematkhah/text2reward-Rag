@@ -7,6 +7,7 @@ behaviours (crash farming, stationary farming), and format entries for prompts.
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any, Iterable, Mapping, Sequence
 
 from txt2reward.archive.curriculum import infer_curriculum_phase
@@ -28,6 +29,20 @@ from txt2reward.core.metrics import enrich_fitness_metrics
 def reward_code_hash(code: str) -> str:
     """Stable 16-hex digest of reward source for deduplication."""
     return hashlib.sha256(code.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def _structural_skeleton(code: str) -> str:
+    """Replace numeric literals with a placeholder so near-duplicate reward
+    functions (differing only in constant coefficients) collapse to the same
+    skeleton hash, while leaving non-numeric structure intact."""
+    return re.sub(r"-?\d+\.?\d*", "#", code.strip())
+
+
+def reward_code_skeleton_hash(code: str) -> str:
+    """Stable 16-hex digest of a reward function's structural skeleton
+    (numeric literals normalised out) — use alongside reward_code_hash for
+    near-duplicate detection, not as a replacement for exact-dedup."""
+    return hashlib.sha256(_structural_skeleton(code).encode("utf-8")).hexdigest()[:16]
 
 
 def effective_fitness(entry: Mapping[str, Any]) -> float:

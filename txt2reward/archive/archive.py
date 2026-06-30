@@ -40,6 +40,7 @@ from txt2reward.archive.retrieval import (
     is_stationary_farming,
     prefetch_effective_fitness,
     reward_code_hash,
+    reward_code_skeleton_hash,
 )
 from txt2reward.archive.store import RewardArchive
 from txt2reward.config.fitness import FITNESS_VERSION_DEFAULT
@@ -80,5 +81,6 @@ __all__ = [
     "parse_structured_critique",
     "prefetch_effective_fitness",
     "reward_code_hash",
+    "reward_code_skeleton_hash",
     "safe_overtake_ratio",
 ]

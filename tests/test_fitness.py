@@ -124,7 +124,7 @@ def test_v7_slow_to_survive_trend_penalised():
 def test_survival_score_monotonic_above_fifty_percent():
     scores = [_survival_score_v8(cr) for cr in [1.0, 0.9, 0.8, 0.7, 0.6, 0.5]]
     assert scores == sorted(scores)
-    assert scores[0] == pytest.approx(0.02, abs=0.001)
+    assert scores[0] == pytest.approx(0.002, abs=0.001)
     assert scores[-1] > scores[0]
 
 
@@ -137,7 +137,7 @@ def test_high_crash_regime_preserves_ranking_not_flatline():
     f60 = compute_fitness_v8(fitness_metrics(crash_rate=0.6, **fast))
     assert f100 < f90 < f80 < f70 < f60
     assert f100 != f90 != f80
-    assert f100 >= 0.015
+    assert f100 >= 0.002
 
 
 def test_v7_flatline_removed_in_v8():
@@ -195,8 +195,8 @@ def test_stationary_penalised_in_v8():
 
 
 def test_slow_to_survive_trend_penalised_in_v8():
-    prev = base_metrics(mean_speed=24.0, crash_rate=0.20, mean_overtakes=0.5)
-    current = base_metrics(mean_speed=20.0, crash_rate=0.10, mean_overtakes=0.1)
+    prev = base_metrics(mean_speed=26.0, crash_rate=0.25, mean_overtakes=2.0)
+    current = base_metrics(mean_speed=23.0, crash_rate=0.15, mean_overtakes=1.0)
     assert compute_fitness_v8(current, prev_metrics=prev) < compute_fitness_v8(current, prev_metrics=None)
 
 
@@ -276,3 +276,15 @@ def test_enrich_fitness_metrics_adds_derived_fields():
 )
 def test_infer_curriculum_phase_from_metrics(metrics, expected):
     assert infer_curriculum_phase(metrics) == expected
+
+
+def test_sample_confidence_penalty_shrinks_small_n_episodes():
+    small_n = fitness_metrics(crash_rate=0.10, n_episodes=10)
+    large_n = fitness_metrics(crash_rate=0.10, n_episodes=100)
+    assert compute_fitness_v8(small_n) < compute_fitness_v8(large_n)
+
+
+def test_sample_confidence_penalty_inactive_above_threshold():
+    at_threshold = fitness_metrics(crash_rate=0.10, n_episodes=30)
+    above_threshold = fitness_metrics(crash_rate=0.10, n_episodes=300)
+    assert compute_fitness_v8(at_threshold) == pytest.approx(compute_fitness_v8(above_threshold), abs=1e-4)

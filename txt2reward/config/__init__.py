@@ -25,6 +25,7 @@ from txt2reward.config.llm import (
     KEY_ROTATION_MAX_ROUNDS,
     KEY_ROTATION_WAIT_SEC,
     LLM_MODEL,
+    LLM_PROVIDER,
 )
 from txt2reward.config.paths import (
     API_KEYS_FILE,
@@ -85,6 +86,7 @@ __all__ = [
     "KEY_ROTATION_MAX_ROUNDS",
     "KEY_ROTATION_WAIT_SEC",
     "LLM_MODEL",
+    "LLM_PROVIDER",
     "LOG_FILE",
     "PPO_BATCH_SIZE",
     "PPO_N_EPOCHS",

@@ -2,5 +2,8 @@
   "groq_keys": [
     "gsk_YOUR_FIRST_KEY_HERE",
     "gsk_YOUR_SECOND_KEY_HERE"
+  ],
+  "openrouter_keys": [
+    "sk-or-YOUR_OPENROUTER_KEY_HERE"
   ]
 }

@@ -21,5 +21,5 @@ LOG_FILE = "training_log.json"
 # Legacy weight-based reward (unused by Text-to-Reward loop).
 WEIGHTS_FILE = "reward_weights.json"
 
-# Groq API key pool at repo root (optional; env var GROQ_API_KEY is also supported).
+# Groq / OpenRouter API key pool at repo root (optional; env vars also supported).
 API_KEYS_FILE = Path(__file__).resolve().parents[2] / "api_keys.json"

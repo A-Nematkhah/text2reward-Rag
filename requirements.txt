@@ -5,8 +5,9 @@ stable-baselines3>=2.3
 numpy>=1.26
 torch>=2.0
 
-# LLM reward generation (Groq API)
-groq>=0.9
+# LLM reward generation
+groq>=0.9          # used when LLM_PROVIDER=groq (default)
+openai>=1.30        # used when LLM_PROVIDER=openrouter (OpenAI-compatible client)
 
 # Visualization (train.py --no-plots to skip; evaluate --render needs pygame via highway-env)
 matplotlib>=3.7
