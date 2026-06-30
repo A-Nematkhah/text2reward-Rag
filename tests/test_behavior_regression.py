@@ -16,6 +16,7 @@ from txt2reward.config.fitness import FITNESS_VERSION_DEFAULT
 from txt2reward.config.training import (
     DEFAULT_EVOLVE_EVERY,
     DEFAULT_WARMUP_EPISODES,
+    EVOLVE_MAX_CRASH_RATE,
     PPO_BATCH_SIZE,
     PPO_N_EPOCHS,
     PPO_N_STEPS,
@@ -33,6 +34,7 @@ from tests.helpers import base_metrics, passing_reward_code
 def test_ppo_and_evolution_defaults_unchanged():
     assert DEFAULT_WARMUP_EPISODES == 80
     assert DEFAULT_EVOLVE_EVERY == 100
+    assert EVOLVE_MAX_CRASH_RATE == pytest.approx(0.70)
     assert PPO_N_STEPS == 512
     assert PPO_BATCH_SIZE == 64
     assert PPO_N_EPOCHS == 5
@@ -121,7 +123,7 @@ def test_evolve_archives_before_llm_generation(monkeypatch):
     designer._episode_stats = [
         {
             "mean_speed": 25.0,
-            "collisions": 1,
+            "collisions": 0,
             "steps": 80,
             "total_overtakes": 1,
             "total_lane_changes": 2,

@@ -199,6 +199,61 @@ def test_placeholder_not_archived(monkeypatch):
     assert not _is_placeholder_code(designer._current_code)
 
 
+def test_evolution_frozen_when_crash_rate_high(monkeypatch):
+    workdir = tempfile.mkdtemp()
+    reward_path = os.path.join(workdir, "reward_program.py")
+    code = passing_reward_code()
+    with open(reward_path, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    designer = RewardDesigner(
+        archive_path=os.path.join(workdir, "reward_archive.json"),
+        reward_path=reward_path,
+        evolve_max_crash_rate=0.70,
+        verbose=False,
+    )
+    generate_called = {"n": 0}
+    monkeypatch.setattr(
+        designer,
+        "_call_generate_with_repair",
+        lambda *_a, **_k: generate_called.__setitem__("n", generate_called["n"] + 1) or None,
+    )
+
+    crashed_ep = {"mean_speed": 28.0, "collisions": 1, "steps": 40, "total_overtakes": 0}
+    designer._episode_stats = [crashed_ep]
+    designer._episode_count = designer.warmup_episodes
+
+    assert designer._evolve() is False
+    assert len(designer.archive.entries) == 0
+    assert generate_called["n"] == 0
+    assert designer._episode_stats == []
+
+
+def test_evolution_proceeds_when_crash_rate_below_threshold(monkeypatch):
+    workdir = tempfile.mkdtemp()
+    reward_path = os.path.join(workdir, "reward_program.py")
+    code = passing_reward_code()
+    with open(reward_path, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    designer = RewardDesigner(
+        archive_path=os.path.join(workdir, "reward_archive.json"),
+        reward_path=reward_path,
+        evolve_max_crash_rate=0.70,
+        verbose=False,
+    )
+    monkeypatch.setattr(designer, "_call_generate_with_repair", lambda *_a, **_k: None)
+    monkeypatch.setattr(designer, "_call_critique", lambda *_a, **_k: "")
+
+    safe_ep = {"mean_speed": 26.0, "collisions": 0, "steps": 100, "total_overtakes": 2}
+    designer._episode_stats = [safe_ep]
+    designer._episode_count = designer.warmup_episodes
+
+    assert designer._evolve() is False
+    assert len(designer.archive.entries) == 1
+    assert designer.archive.entries[0]["metrics"]["crash_rate"] == 0.0
+
+
 def test_archive_remove_generation():
     workdir = tempfile.mkdtemp()
     path = os.path.join(workdir, "reward_archive.json")

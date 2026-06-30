@@ -20,6 +20,10 @@ DEFAULT_WARMUP_EPISODES = 80
 # Evolution: generate a new reward every N completed episodes (after warmup).
 DEFAULT_EVOLVE_EVERY = 100
 
+# Skip LLM archive/generation while window crash_rate is at or above this threshold.
+# Lets PPO improve on a fixed reward before the LLM inflates penalties.
+EVOLVE_MAX_CRASH_RATE = 0.70
+
 # Natural-language goal sent to the LLM on bootstrap / evolution.
 DEFAULT_DRIVING_GOAL = (
     "Drive fast and safely on a 4-lane highway. Overtake slow vehicles. "

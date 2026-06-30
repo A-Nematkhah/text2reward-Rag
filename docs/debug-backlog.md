@@ -41,10 +41,10 @@ Implemented: `build_trajectory_bank_lite()` (16 trajectories), `get_trajectory_b
 
 - [x] Reward step clipping in `LLMRewardWrapper` — clip per-step to `[-10, 10]` (`REWARD_STEP_CLIP_MIN/MAX` in `config/training.py`).
 - [x] Increase default `--evolve-every` to **100** and `--warmup-episodes` to **80**.
+- [x] Skip evolution when `crash_rate >= EVOLVE_MAX_CRASH_RATE` (default **0.70**) — no archive/LLM until agent improves.
 
 **Proposed work (remaining):**
 
-- [ ] Skip evolution when `crash_rate >= 0.90` (train more on fixed reward first).
 - [ ] Reset to bootstrap reward and freeze evolution until crash_rate improves.
 - [ ] Optional: easier env for phase 1 (`vehicles_count=15`).
 

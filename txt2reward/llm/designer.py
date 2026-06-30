@@ -28,7 +28,11 @@ from txt2reward.config.llm import (
     GENERATION_TEMPERATURE,
 )
 from txt2reward.config.paths import ARCHIVE_FILE, REWARD_PROGRAM_PATH
-from txt2reward.config.training import DEFAULT_EVOLVE_EVERY, DEFAULT_WARMUP_EPISODES
+from txt2reward.config.training import (
+    DEFAULT_EVOLVE_EVERY,
+    DEFAULT_WARMUP_EPISODES,
+    EVOLVE_MAX_CRASH_RATE,
+)
 from txt2reward.core.log import get_logger
 from txt2reward.core.types import CurriculumPhase, EpisodeStats, FitnessMetrics
 from txt2reward.llm.aggregation import (
@@ -97,6 +101,7 @@ class RewardDesigner:
         goal: str = "Drive fast, overtake slow vehicles, avoid collisions.",
         evolve_every: int = DEFAULT_EVOLVE_EVERY,
         warmup_episodes: int = DEFAULT_WARMUP_EPISODES,
+        evolve_max_crash_rate: float = EVOLVE_MAX_CRASH_RATE,
         reward_path: str = REWARD_PROGRAM_PATH,
         archive_path: str = ARCHIVE_FILE,
         initial_episode_count: int = 0,
@@ -109,6 +114,8 @@ class RewardDesigner:
             goal: Natural-language driving objective for the LLM.
             evolve_every: Episodes between reward generations (post-warmup).
             warmup_episodes: Episodes before the first LLM generation.
+            evolve_max_crash_rate: Freeze LLM evolution while window crash_rate
+                is at or above this value (archive + generate skipped).
             reward_path: Hot-reloaded ``reward_program.py`` path.
             archive_path: JSON archive for generations and metrics.
             initial_episode_count: Resume episode counter from a prior log.
@@ -122,6 +129,7 @@ class RewardDesigner:
         self.goal = goal
         self.evolve_every = evolve_every
         self.warmup_episodes = warmup_episodes
+        self.evolve_max_crash_rate = float(evolve_max_crash_rate)
         self.reward_path = reward_path
         self.verbose = verbose
 
@@ -149,6 +157,7 @@ class RewardDesigner:
             log.info(
                 f"[designer] Text-to-Reward | goal='{goal[:60]}' | "
                 f"evolve_every={evolve_every} | warmup={warmup_episodes} | "
+                f"evolve_max_crash={self.evolve_max_crash_rate:.0%} | "
                 f"episodes={self._episode_count} | "
                 f"archive={len(self.archive.entries)} entries | "
                 f"active_generation={self._active_generation}"
@@ -403,6 +412,22 @@ class RewardDesigner:
             )
 
         current_code = self._current_code or self._load_current_code()
+        if (
+            current_code
+            and not _is_placeholder_code(current_code)
+            and float(metrics.get("crash_rate", 1.0)) >= self.evolve_max_crash_rate
+        ):
+            if self.verbose:
+                log.info(
+                    "[designer] Evolution frozen — crash_rate=%.1f%% >= %.0f%% threshold; "
+                    "training current reward without archive/LLM update",
+                    float(metrics.get("crash_rate", 0.0)) * 100.0,
+                    self.evolve_max_crash_rate * 100.0,
+                )
+            self._last_evolution_metrics = dict(metrics)
+            self._episode_stats = overflow_stats
+            return False
+
         if not current_code or _is_placeholder_code(current_code):
             log.warning(
                 "[designer] WARNING: no usable reward code on disk — "

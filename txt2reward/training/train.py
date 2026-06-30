@@ -29,6 +29,7 @@ from txt2reward.config.training import (
     DEFAULT_RELOAD_INTERVAL,
     DEFAULT_TOTAL_TIMESTEPS,
     DEFAULT_WARMUP_EPISODES,
+    EVOLVE_MAX_CRASH_RATE,
     PPO_BATCH_SIZE,
     PPO_N_EPOCHS,
     PPO_N_STEPS,
@@ -76,6 +77,12 @@ def main() -> None:
         type=int,
         default=DEFAULT_WARMUP_EPISODES,
         help="Episodes before first LLM reward generation",
+    )
+    parser.add_argument(
+        "--evolve-max-crash-rate",
+        type=float,
+        default=EVOLVE_MAX_CRASH_RATE,
+        help="Freeze LLM evolution while window crash_rate is at or above this value (0–1)",
     )
     parser.add_argument(
         "--goal",
@@ -139,6 +146,7 @@ def main() -> None:
         goal=args.goal,
         evolve_every=args.evolve_every,
         warmup_episodes=args.warmup_episodes,
+        evolve_max_crash_rate=args.evolve_max_crash_rate,
         reward_path=args.reward_path,
         archive_path=args.archive_file,
         initial_episode_count=training_log.episode_count(),

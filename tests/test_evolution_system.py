@@ -55,7 +55,7 @@ class TestEndToEndPipeline:
         designer._episode_stats = [
             {
                 "mean_speed": 25.0,
-                "collisions": 1,
+                "collisions": 0,
                 "steps": 80,
                 "total_overtakes": 1,
                 "total_lane_changes": 2,
