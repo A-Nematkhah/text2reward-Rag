@@ -289,3 +289,20 @@ def test_sample_confidence_penalty_inactive_above_threshold():
     at_threshold = fitness_metrics(crash_rate=0.10, n_episodes=30)
     above_threshold = fitness_metrics(crash_rate=0.10, n_episodes=300)
     assert compute_fitness_v8(at_threshold) == pytest.approx(compute_fitness_v8(above_threshold), abs=1e-4)
+
+
+def test_sample_confidence_penalty_missing_n_episodes_is_pessimistic():
+    reliable = fitness_metrics(crash_rate=0.10, n_episodes=30)
+    missing_n = {
+        "mean_speed": 27.0,
+        "crash_rate": 0.10,
+        "mean_overtakes": 2.0,
+        "mean_long_jerk": 1.5,
+        "mean_accel": 1.0,
+        "mean_ttc": 4.0,
+        "p10_ttc": 3.0,
+        "min_ttc": 1.5,
+        "total_lane_changes": 8,
+        "total_overtakes": 80,
+    }
+    assert compute_fitness_v8(missing_n) < compute_fitness_v8(reliable)

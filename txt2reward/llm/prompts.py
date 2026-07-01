@@ -9,42 +9,53 @@ MODEL = LLM_MODEL
 DEFAULT_BOOTSTRAP_REWARD_BODY = """\
 def compute_reward(state):
     if state["collided"]:
-        return -80.0
+        return -90.0
     speed = state["speed_ms"]
     target_speed = 28.0
-    open_road = state["front_dist"] > 41.0 and state["ttc"] > 6.0
-    speed_reward = clip(speed * 0.09, 0.0, 2.5)
+    speed_reward = clip(speed * 0.085, 0.0, 2.6)
     speed_gap = clip((target_speed - speed) / target_speed, 0.0, 1.0)
-    cruise_tax = -2.0 * speed_gap if open_road and not state["overtook"] else 0.0
+    clear_no_target = (
+        state["front_dist"] > 41.0
+        and state["ttc"] > 6.0
+        and state["rel_vel_ms"] >= -1.0
+    )
+    overtake_opportunity = (
+        state["front_dist"] < 45.0
+        and state["rel_vel_ms"] < -1.0
+        and state["ttc"] > 3.0
+    )
+    cruise_tax = -2.0 * speed_gap if clear_no_target and not state["overtook"] else 0.0
     above_target_passive = (
         -3.5 * clip((speed - 22.0) / 8.0, 0.0, 1.0)
-        if open_road and not state["overtook"] and speed > 22.0
+        if clear_no_target and not state["overtook"] and speed > 22.0
         else 0.0
     )
-    if open_road and not state["overtook"]:
+    if clear_no_target and not state["overtook"]:
         no_overtake_tax = -0.85 * speed_gap if state["lane_changed"] else -1.2 * speed_gap
     else:
         no_overtake_tax = 0.0
-    static_passive = -0.50 if open_road and not state["overtook"] and not state["lane_changed"] else 0.0
+    static_passive = -0.50 if clear_no_target and not state["overtook"] and not state["lane_changed"] else 0.0
+    missed_overtake_tax = -0.85 if overtake_opportunity and not state["overtook"] else 0.0
     ttc_penalty = (
         -5.0 if state["ttc"] < 1.0
         else -2.5 if state["ttc"] < 3.0
         else -1.0 if state["ttc"] < 5.0
         else 0.0
     )
-    tailgate_penalty = -2.2 if state["front_dist"] < 22.0 and state["ttc"] < 4.5 else 0.0
+    tailgate_penalty = -2.5 if state["front_dist"] < 23.0 and state["ttc"] < 4.5 else 0.0
     overtake_bonus = 3.0 if state["overtook"] else 0.0
     harsh_jerk = max(0.0, abs(state["long_jerk"]) - 2.0) + max(0.0, abs(state["lat_jerk"]) - 2.0)
     harsh_accel = max(0.0, abs(state["accel_ms2"]) - 2.5)
     jerk_penalty = -0.90 * harsh_jerk
     accel_penalty = -0.50 * harsh_accel
-    lc_penalty = -0.55 if state["lane_changed"] and not state["overtook"] else 0.0
+    lc_penalty = -0.70 if state["lane_changed"] and not state["overtook"] else 0.0
     return (
         speed_reward
         + cruise_tax
         + above_target_passive
         + no_overtake_tax
         + static_passive
+        + missed_overtake_tax
         + ttc_penalty
         + tailgate_penalty
         + overtake_bonus
@@ -130,6 +141,16 @@ DESIGN PRINCIPLES:
       overtake bonus 1.0–4.0; lane-change-without-overtake -0.3 to -0.6.
       Do NOT inflate every penalty generation-over-generation — keep magnitudes
       inside these bands so PPO value learning stays stable.
+    * OVERTAKE TAXES: never penalise driving fast on a genuinely clear road
+      (large front_dist, safe ttc, no slower vehicle ahead). Only apply a
+      missed-overtake tax when there is a real opportunity — a slower vehicle
+      ahead (rel_vel_ms < -1.0), front_dist < 45 m, and ttc > 3 s. Wrong:
+      open_road = front_dist > 41 and ttc > 6 then tax for not overtaking.
+      Right: overtake_opportunity from rel_vel_ms + front_dist + ttc for
+      missed_overtake_tax only. Passive/cruise taxes (cruise_tax,
+      above_target_passive, no_overtake_tax, static_passive) belong on
+      clear_no_target (front_dist > 41, ttc > 6, rel_vel_ms >= -1.0) —
+      a road with no slower vehicle to pass — not when rel_vel_ms < -1.0.
     * ACCEL/JERK PENALTIES MUST BE THRESHOLD-BASED, NOT ABSOLUTE: only
       penalise accel_ms2 / long_jerk / lat_jerk magnitude ABOVE a harsh
       threshold (e.g. max(0, abs(accel_ms2) - 2.5)), never the raw
@@ -155,7 +176,8 @@ DESIGN PRINCIPLES:
     * Lane change without overtake: penalise (-0.4 to -0.6)
     * ANTI-CRASH-FARMING: the validation pipeline simulates a 39-step fast drive plus
       a collision; that episodic total MUST be lower than a full safe cautious episode.
-    * ANTI-PASSIVE-DRIVING: cruise_tax on clear road above 22 m/s without overtakes
+    * ANTI-PASSIVE-DRIVING: cruise/passive taxes on clear_no_target only;
+      missed_overtake_tax only when overtake_opportunity is true
     * SPEED INCENTIVE TEST: 28 m/s must beat 14 m/s at identical safe conditions
     * Fitness v8 ranks lower crash_rate higher even above 50% crash — but crashing
       every episode still scores poorly; survival requires actually reducing crashes.

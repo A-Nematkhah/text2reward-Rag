@@ -60,6 +60,7 @@ an evolutionary search over reward *code*, not just reward *weights*.
   - [Reward-hacking detection](#reward-hacking-detection)
   - [Multi-process architecture](#multi-process-architecture)
 - [Output files](#output-files)
+- [Safety & observability](#safety--observability)
 - [Migrating from the weight-tuning version](#migrating-from-the-weight-tuning-version)
 - [Known limitations](#known-limitations)
 - [License](#license)
@@ -189,6 +190,7 @@ python evaluate.py --model ppo_highway_txt2reward.zip --generation 2
 | `--evolve-every` | `100` | Generate a new reward program every N episodes (after warmup) |
 | `--warmup-episodes` | `80` | Episodes before the first LLM reward generation |
 | `--evolve-max-crash-rate` | `0.70` | Freeze LLM evolution while window crash_rate ≥ this value |
+| `--max-freeze-windows` | `3` | Force one archive/LLM attempt after this many consecutive frozen windows |
 | `--no-vec-normalize` | off | Disable reward normalisation (VecNormalize; on by default) |
 | `--easy-survive-env` | off | Use `vehicles_count=15` for easier survive-phase training |
 | `--vehicles-count` | `30` | Override highway traffic density |
@@ -337,6 +339,22 @@ shared state between processes is `reward_program.py` on disk:
 | `reward_archive.json` | Every generation: code, metrics, fitness, critique |
 | `training_log.json` | Per-episode and per-generation training history |
 | `tb_logs/` | TensorBoard training logs |
+
+---
+
+## Safety & observability
+
+Key safeguards added after the crash-farming review (details in
+[`docs/structure.md`](docs/structure.md)):
+
+| Mechanism | What it does |
+|-----------|--------------|
+| **Collision clip bypass** | Collision steps use `REWARD_COLLISION_CLIP_*` (`-120…0`) so a `-90` penalty reaches PPO intact; normal steps stay in `[-10, 10]`. |
+| **Validation parity** | Smoke tests and the trajectory bank apply the same per-step clip as `LLMRewardWrapper` — unclipped crash-farming rewards are rejected before training. |
+| **Freeze escape** | After `--max-freeze-windows` consecutive high-crash windows, evolution runs once anyway so the archive does not deadlock at 100% crash. |
+| **Curriculum-aware gates** | Stage B soft-rate ceiling and passive tolerance relax in `survive`/`speed` phases; lite bank also enforces an absolute soft-violation cap. |
+| **`DEBUG_REWARD=1`** | Logs raw → clipped reward on collisions and every 1000 steps during training. |
+| **Gate telemetry** | `python scripts/calibrate_smoke_gate.py` reports `smoke_gate_failure_counts` and writes `docs/baselines/phase4-post-clip-gates.json`. |
 
 ---
 

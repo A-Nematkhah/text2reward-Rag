@@ -55,16 +55,21 @@ def test_lite_bank_has_fewer_decisive_pairs_than_full():
 
 
 def test_bootstrap_passes_lite_bank_stage_b():
+    from txt2reward.config.validation import LITE_BANK_MAX_SOFT_VIOLATIONS
+
     fn = compile_reward_function(DEFAULT_BOOTSTRAP_REWARD_BODY)
-    stats = measure_gate_stats(fn, bank=build_trajectory_bank_lite(), min_fitness_gap=BANK_MIN_FITNESS_GAP)
+    bank = build_trajectory_bank_lite()
+    stats = measure_gate_stats(fn, bank=bank, min_fitness_gap=BANK_MIN_FITNESS_GAP)
     ok, _, console = evaluate_consistency(
         fn,
-        bank=build_trajectory_bank_lite(),
+        bank=bank,
         max_violation_rate=BANK_MAX_VIOLATION_RATE,
         min_fitness_gap=BANK_MIN_FITNESS_GAP,
+        max_soft_violations=LITE_BANK_MAX_SOFT_VIOLATIONS,
     )
     assert stats.passive_violations == 0
     assert stats.hard_violations == 0
+    assert stats.soft_violations <= LITE_BANK_MAX_SOFT_VIOLATIONS
     assert stats.soft_violation_rate <= BANK_MAX_VIOLATION_RATE
     assert ok
     assert console == "PASS"

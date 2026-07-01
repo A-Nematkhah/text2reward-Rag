@@ -15,6 +15,7 @@ from txt2reward.trajectory.bank import (
     TRAJECTORY_REF_FITNESS_VERSION,
     _cumulative_return,
     build_trajectory_bank,
+    build_trajectory_bank_lite,
     evaluate_consistency,
     measure_gate_stats,
 )
@@ -283,20 +284,138 @@ def test_bank_max_violation_rate_looser_in_survive_phase():
     from txt2reward.config.validation import (
         BANK_MAX_VIOLATION_RATE,
         bank_max_violation_rate_for_phase,
+        bank_passive_violation_tolerance_for_phase,
     )
 
     assert bank_max_violation_rate_for_phase("survive") > BANK_MAX_VIOLATION_RATE
     assert bank_max_violation_rate_for_phase("refine") == BANK_MAX_VIOLATION_RATE
     assert bank_max_violation_rate_for_phase(None) == BANK_MAX_VIOLATION_RATE
+    assert bank_passive_violation_tolerance_for_phase("survive") == 2
+    assert bank_passive_violation_tolerance_for_phase("speed") == 1
+    assert bank_passive_violation_tolerance_for_phase("refine") == 0
+    assert bank_passive_violation_tolerance_for_phase(None) == 0
+
+
+_SURVIVE_BORDERLINE_REWARD = BOOTSTRAP.replace("-3.5 * clip", "-2.5 * clip")
+
+
+def test_passive_tolerance_allows_borderline_in_survive_not_refine():
+    from txt2reward.config.validation import (
+        BANK_MAX_VIOLATION_RATE,
+        bank_max_violation_rate_for_phase,
+        bank_passive_violation_tolerance_for_phase,
+        lite_bank_max_soft_violations,
+    )
+    from txt2reward.llm.designer import _full_validation_pipeline
+
+    bank = build_trajectory_bank_lite()
+    fn = compile_reward_function(_SURVIVE_BORDERLINE_REWARD)
+    stats = measure_gate_stats(fn, bank=bank, min_fitness_gap=BANK_MIN_FITNESS_GAP)
+    assert stats.passive_violations == 2
+
+    ok_survive, _, _ = evaluate_consistency(
+        fn,
+        bank=bank,
+        max_violation_rate=bank_max_violation_rate_for_phase("survive"),
+        min_fitness_gap=BANK_MIN_FITNESS_GAP,
+        max_passive_violations=bank_passive_violation_tolerance_for_phase("survive"),
+        max_soft_violations=lite_bank_max_soft_violations(len(bank)),
+    )
+    ok_refine, report, _ = evaluate_consistency(
+        fn,
+        bank=bank,
+        max_violation_rate=bank_max_violation_rate_for_phase("refine"),
+        min_fitness_gap=BANK_MIN_FITNESS_GAP,
+        max_passive_violations=bank_passive_violation_tolerance_for_phase("refine"),
+        max_soft_violations=lite_bank_max_soft_violations(len(bank)),
+    )
+    assert ok_survive
+    assert not ok_refine
+    assert "passive-driving" in report.lower()
+
+    ok_pipeline_survive, _, _ = _full_validation_pipeline(
+        _SURVIVE_BORDERLINE_REWARD,
+        curriculum_phase="survive",
+    )
+    ok_pipeline_refine, _, _ = _full_validation_pipeline(
+        _SURVIVE_BORDERLINE_REWARD,
+        curriculum_phase="refine",
+    )
+    assert ok_pipeline_survive
+    assert not ok_pipeline_refine
+
+
+def test_lite_bank_absolute_soft_violation_floor_rejects_borderline():
+    from txt2reward.config.validation import LITE_BANK_MAX_SOFT_VIOLATIONS
+
+    half_cruise = BOOTSTRAP.replace("cruise_tax = -2.0", "cruise_tax = -1.0")
+    fn = compile_reward_function(half_cruise)
+    bank = build_trajectory_bank_lite()
+    stats = measure_gate_stats(fn, bank=bank, min_fitness_gap=BANK_MIN_FITNESS_GAP)
+    assert stats.soft_violations > LITE_BANK_MAX_SOFT_VIOLATIONS
+    assert stats.soft_violation_rate <= BANK_MAX_VIOLATION_RATE
+
+    ok_rate_only, _, _ = evaluate_consistency(
+        fn,
+        bank=bank,
+        max_violation_rate=BANK_MAX_VIOLATION_RATE,
+        min_fitness_gap=BANK_MIN_FITNESS_GAP,
+    )
+    ok_with_floor, report, _ = evaluate_consistency(
+        fn,
+        bank=bank,
+        max_violation_rate=BANK_MAX_VIOLATION_RATE,
+        min_fitness_gap=BANK_MIN_FITNESS_GAP,
+        max_soft_violations=LITE_BANK_MAX_SOFT_VIOLATIONS,
+    )
+    assert ok_rate_only
+    assert not ok_with_floor
+    assert "lite soft-violation cap" in report
 
 
 def test_smoke_gate_failure_counts_increment():
     from txt2reward.llm.validation import (
+        format_smoke_gate_failure_report,
         record_smoke_gate_failure,
+        reset_smoke_gate_failure_counts,
         smoke_gate_failure_counts,
     )
 
+    reset_smoke_gate_failure_counts()
     before = dict(smoke_gate_failure_counts())
     record_smoke_gate_failure("stage_a_test_gate")
     after = smoke_gate_failure_counts()
     assert after.get("stage_a_test_gate", 0) >= before.get("stage_a_test_gate", 0) + 1
+    report = format_smoke_gate_failure_report(after)
+    assert "stage_a_test_gate=1" in report
+    reset_smoke_gate_failure_counts()
+    assert format_smoke_gate_failure_report() == "smoke_gate_failures: (none)"
+
+
+_CLIP_CRASH_FARM_TRAP = """
+def compute_reward(state):
+    if state["collided"]:
+        return -80.0
+    return state["speed_ms"] * 0.1
+"""
+
+
+def test_crash_farming_gate_uses_runtime_clip_parity():
+    """Symmetric [-10,10] clip made crash-farming profitable; runtime clip must not."""
+    from txt2reward.config.training import REWARD_STEP_CLIP_MIN
+    from txt2reward.llm.validation import _smoke_test_reward_code
+    from txt2reward.reward.clip import clip_shaped_reward
+    from txt2reward.sandbox.sandbox import compile_reward_function
+
+    fn = compile_reward_function(_CLIP_CRASH_FARM_TRAP)
+    per_step_fast = 29.0 * 0.1
+    cautious_per_step = 14.0 * 0.1
+    old_crash_episode = 39 * per_step_fast + REWARD_STEP_CLIP_MIN
+    cautious_episode = 40 * cautious_per_step
+    assert old_crash_episode > cautious_episode
+
+    clipped_collision_total = 39 * per_step_fast + clip_shaped_reward(-80.0, collided=True)
+    assert clipped_collision_total < cautious_episode
+
+    ok, err = _smoke_test_reward_code(_CLIP_CRASH_FARM_TRAP, compiled_fn=fn)
+    assert ok, err

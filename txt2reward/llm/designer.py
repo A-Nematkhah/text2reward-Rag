@@ -30,6 +30,8 @@ from txt2reward.config.llm import (
 from txt2reward.config.paths import ARCHIVE_FILE, REWARD_PROGRAM_PATH
 from txt2reward.config.training import (
     DEFAULT_EVOLVE_EVERY,
+    DEFAULT_FREEZE_RESET_GRACE_WINDOWS,
+    DEFAULT_MAX_FREEZE_WINDOWS,
     DEFAULT_WARMUP_EPISODES,
     EVOLVE_MAX_CRASH_RATE,
 )
@@ -86,7 +88,7 @@ def write_default_reward_program(path: str = REWARD_PROGRAM_PATH) -> None:
     """Writes the shipped bootstrap reward program to disk."""
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write('"""\nreward_program.py — bootstrap default\n"""\n\n')
+        f.write('"""\nreward_program.py — bootstrap default (phase-3 hybrid, safe tailgate)\n"""\n\n')
         f.write(DEFAULT_BOOTSTRAP_REWARD_BODY)
     os.replace(tmp, path)
     clear_reward_fn_cache(path)
@@ -101,6 +103,8 @@ class RewardDesigner:
         evolve_every: int = DEFAULT_EVOLVE_EVERY,
         warmup_episodes: int = DEFAULT_WARMUP_EPISODES,
         evolve_max_crash_rate: float = EVOLVE_MAX_CRASH_RATE,
+        max_freeze_windows: int = DEFAULT_MAX_FREEZE_WINDOWS,
+        freeze_reset_grace_windows: int = DEFAULT_FREEZE_RESET_GRACE_WINDOWS,
         reward_path: str = REWARD_PROGRAM_PATH,
         archive_path: str = ARCHIVE_FILE,
         initial_episode_count: int = 0,
@@ -115,6 +119,11 @@ class RewardDesigner:
             warmup_episodes: Episodes before the first LLM generation.
             evolve_max_crash_rate: Freeze LLM evolution while window crash_rate
                 is at or above this value (archive + generate skipped).
+            max_freeze_windows: After this many consecutive frozen windows,
+                force one archive/LLM evolution attempt anyway.
+            freeze_reset_grace_windows: While crash_rate is high, keep a newly
+                deployed non-bootstrap reward for this many frozen windows
+                before reverting to bootstrap (0 = revert on first freeze).
             reward_path: Hot-reloaded ``reward_program.py`` path.
             archive_path: JSON archive for generations and metrics.
             initial_episode_count: Resume episode counter from a prior log.
@@ -129,6 +138,8 @@ class RewardDesigner:
         self.evolve_every = evolve_every
         self.warmup_episodes = warmup_episodes
         self.evolve_max_crash_rate = float(evolve_max_crash_rate)
+        self.max_freeze_windows = max(1, int(max_freeze_windows))
+        self.freeze_reset_grace_windows = max(0, int(freeze_reset_grace_windows))
         self.reward_path = reward_path
         self.verbose = verbose
 
@@ -137,6 +148,8 @@ class RewardDesigner:
         self._episode_stats: list[EpisodeStats | Mapping[str, Any]] = []
         self._episode_count = max(0, int(initial_episode_count))
         self._last_evolution_index = int(initial_last_evolution_index)
+        self._consecutive_frozen_windows = 0
+        self._deploy_grace_remaining = 0
 
         _WIN = 10
         self._policy_buf: Deque[dict] = deque(maxlen=_WIN)
@@ -153,6 +166,8 @@ class RewardDesigner:
                 f"[designer] Text-to-Reward | goal='{goal[:60]}' | "
                 f"evolve_every={evolve_every} | warmup={warmup_episodes} | "
                 f"evolve_max_crash={self.evolve_max_crash_rate:.0%} | "
+                f"max_freeze_windows={self.max_freeze_windows} | "
+                f"freeze_reset_grace={self.freeze_reset_grace_windows} | "
                 f"episodes={self._episode_count} | "
                 f"archive={len(self.archive.entries)} entries | "
                 f"active_generation={self._active_generation}"
@@ -282,6 +297,8 @@ class RewardDesigner:
         clear_reward_fn_cache(self.reward_path)
         self._current_code = code
         self._active_generation = gen_label
+        if not _is_bootstrap_code(code):
+            self._deploy_grace_remaining = self.freeze_reset_grace_windows
         log.info(f"[designer] reward_program.py updated (generation {gen_label})")
 
     # ── PPO policy metrics ----------------------------------------------------
@@ -382,29 +399,60 @@ class RewardDesigner:
             )
 
         current_code = self._current_code or self._load_current_code()
-        if (
-            current_code
+        crash_rate = float(metrics.get("crash_rate", 1.0))
+        freeze_due_to_crash = (
+            bool(current_code)
             and not _is_placeholder_code(current_code)
-            and float(metrics.get("crash_rate", 1.0)) >= self.evolve_max_crash_rate
-        ):
+            and crash_rate >= self.evolve_max_crash_rate
+        )
+
+        if freeze_due_to_crash:
+            self._consecutive_frozen_windows += 1
             if not _is_bootstrap_code(current_code):
-                write_default_reward_program(self.reward_path)
-                self._current_code = self._load_current_code()
+                if self._deploy_grace_remaining > 0:
+                    self._deploy_grace_remaining -= 1
+                    if self.verbose:
+                        log.info(
+                            "[designer] Freeze grace — keeping deployed reward "
+                            "(%s window(s) remaining before bootstrap revert)",
+                            self._deploy_grace_remaining,
+                        )
+                else:
+                    write_default_reward_program(self.reward_path)
+                    self._current_code = self._load_current_code()
+                    current_code = self._current_code
+                    self._deploy_grace_remaining = 0
+                    if self.verbose:
+                        log.info(
+                            "[designer] Reset reward_program.py to bootstrap default "
+                            "(crash_rate above freeze threshold; non-bootstrap reward discarded)"
+                        )
+
+            force_evolve = self._consecutive_frozen_windows >= self.max_freeze_windows
+            if not force_evolve:
                 if self.verbose:
                     log.info(
-                        "[designer] Reset reward_program.py to bootstrap default "
-                        "(crash_rate above freeze threshold; non-bootstrap reward discarded)"
+                        "[designer] Evolution frozen — crash_rate=%.1f%% >= %.0f%% threshold "
+                        "(%s/%s windows); training current reward without archive/LLM update",
+                        crash_rate * 100.0,
+                        self.evolve_max_crash_rate * 100.0,
+                        self._consecutive_frozen_windows,
+                        self.max_freeze_windows,
                     )
+                self._last_evolution_metrics = dict(metrics)
+                self._episode_stats = overflow_stats
+                return False
+
+            self._consecutive_frozen_windows = 0
             if self.verbose:
                 log.info(
-                    "[designer] Evolution frozen — crash_rate=%.1f%% >= %.0f%% threshold; "
-                    "training current reward without archive/LLM update",
-                    float(metrics.get("crash_rate", 0.0)) * 100.0,
-                    self.evolve_max_crash_rate * 100.0,
+                    "[designer] Forcing evolution after %s consecutive frozen windows "
+                    "(crash_rate=%.1f%%)",
+                    self.max_freeze_windows,
+                    crash_rate * 100.0,
                 )
-            self._last_evolution_metrics = dict(metrics)
-            self._episode_stats = overflow_stats
-            return False
+        else:
+            self._consecutive_frozen_windows = 0
 
         if not current_code or _is_placeholder_code(current_code):
             log.warning(

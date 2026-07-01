@@ -87,6 +87,7 @@ from txt2reward.config.validation import (
 )
 from txt2reward.core.metrics import aggregate_single_trajectory
 from txt2reward.core.types import RewardFn, RewardState
+from txt2reward.reward.clip import clip_reward_for_state
 
 # Re-exported for backward compatibility (canonical definitions in config.validation).
 
@@ -466,7 +467,7 @@ def build_trajectory_bank() -> list[TrajectorySpec]:
 
 # ── Cumulative-return evaluation of a candidate reward function ───────────────
 
-# reference fitness agrees — zero tolerance (separate from the soft pairwise rate).
+# Passive vs active trajectory pairs use zero tolerance (separate from soft rate).
 _PASSIVE_CATEGORIES = frozenset({"safe_fast", "safe_steady", "stationary_farming"})
 _ACTIVE_CATEGORIES = frozenset({"legitimate_overtaking", "oscillating_lanes"})
 
@@ -483,7 +484,7 @@ def _cumulative_return(reward_fn: Callable[[dict], float], states: list[dict]) -
         return 0.0
     total = 0.0
     for s in states:
-        total += float(reward_fn(s))
+        total += clip_reward_for_state(float(reward_fn(s)), s)
     return total / len(states)
 
 
@@ -634,6 +635,8 @@ def evaluate_consistency(
     bank: list[TrajectorySpec] | None = None,
     max_violation_rate: float = BANK_MAX_VIOLATION_RATE,
     min_fitness_gap: float = BANK_MIN_FITNESS_GAP,
+    max_passive_violations: int = 0,
+    max_soft_violations: int | None = None,
 ) -> tuple[bool, str, str]:
     """
     Runs `reward_fn` over every trajectory in the bank, then checks pairwise
@@ -651,11 +654,11 @@ def evaluate_consistency(
 
     Zero-tolerance hard checks (any failure rejects the candidate):
       - passive/stationary trajectories must NOT beat active trajectories
-        (legitimate_overtaking, oscillating_lanes) when reference fitness
-        says the active trajectory is better — this catches safe_gap farming
-        and fast-but-passive cruising without overtakes.
+        beyond ``max_passive_violations`` (0 in overtake/refine; up to 2 in survive).
       - legitimate_overtaking must beat reckless_crash / tailgating_no_crash
         when reference fitness agrees.
+      - on lite banks, soft violations must also stay below ``max_soft_violations``
+        when that cap is set (rate alone can be misleading with few pairs).
 
     Returns (ok, full_report, console_summary) where `ok` is True iff all
     hard checks pass and soft violation_rate <= max_violation_rate.
@@ -681,20 +684,30 @@ def evaluate_consistency(
     worst = stats.worst
     violations = passive_violations + soft_violations
 
-    ok = stats.passive_violations == 0 and stats.hard_violations == 0 and soft_violation_rate <= max_violation_rate
+    ok = (
+        stats.passive_violations <= max_passive_violations
+        and stats.hard_violations == 0
+        and soft_violation_rate <= max_violation_rate
+        and (max_soft_violations is None or stats.soft_violations <= max_soft_violations)
+    )
 
     # 4) Build report.
+    passive_limit = f"<={max_passive_violations}" if max_passive_violations else "0"
     lines = [
         "=== TRAJECTORY BANK CONSISTENCY REPORT ===",
         f"trajectories          : {n}",
         f"decisive pairs (gap>={min_fitness_gap}) : {decisive_pairs}",
         f"pairwise violations    : {len(violations)} ({violation_rate:.1%} overall)",
-        f"passive-driving violations : {len(passive_violations)} (must be 0)",
+        f"passive-driving violations : {len(passive_violations)} (must be {passive_limit})",
         f"soft pairwise violations : {len(soft_violations)} ({soft_violation_rate:.1%} of {soft_decisive_pairs} soft pairs)",
         f"soft violation threshold : {max_violation_rate:.1%}",
-        f"hard safety violations : {len(hard_violations)} "
-        f"(legit-overtaking trajectories ranked below unsafe ones despite higher ref_fitness)",
     ]
+    if max_soft_violations is not None:
+        lines.append(f"lite soft-violation cap   : {max_soft_violations}")
+    lines.append(
+        f"hard safety violations : {len(hard_violations)} "
+        f"(legit-overtaking trajectories ranked below unsafe ones despite higher ref_fitness)"
+    )
 
     if not ok:
         lines.append("")

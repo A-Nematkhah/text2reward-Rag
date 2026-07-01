@@ -1,0 +1,22 @@
+{
+  "label": "phase0-pre-clip-baseline",
+  "recorded": "2026-07-01",
+  "command": "python train.py --fresh --bootstrap --easy-survive-env --timesteps 70000 --evolve-every 100 --n-envs 4",
+  "notes": "Captured before C1 collision clip bypass and C3 validation parity fixes.",
+  "observations": {
+    "crash_rate": 1.0,
+    "mean_speed_mps": 28.23,
+    "mean_overtakes_per_ep": 0.58,
+    "ep_len_mean_trend": "40.1 -> 25.3 (monotonic decrease)",
+    "ep_rew_mean_trend": "-361 -> -196",
+    "explained_variance_range": [0.025, 0.256],
+    "value_loss_range": [0.151, 0.756],
+    "evolution": "frozen at crash_rate >= 70%",
+    "generation": 0
+  },
+  "phase1_acceptance_targets": {
+    "crash_rate": "should decline within first 300-500 episodes",
+    "ep_len_mean": "should stop shrinking monotonically",
+    "explained_variance": "remain > 0.1 after VecNormalize"
+  }
+}

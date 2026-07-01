@@ -226,7 +226,100 @@ def test_evolution_frozen_when_crash_rate_high(monkeypatch):
     assert designer._evolve() is False
     assert len(designer.archive.entries) == 0
     assert generate_called["n"] == 0
+    assert designer._consecutive_frozen_windows == 1
     assert designer._episode_stats == []
+
+
+def test_evolution_forced_after_max_freeze_windows(monkeypatch):
+    workdir = tempfile.mkdtemp()
+    reward_path = os.path.join(workdir, "reward_program.py")
+    code = passing_reward_code()
+    with open(reward_path, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    designer = RewardDesigner(
+        archive_path=os.path.join(workdir, "reward_archive.json"),
+        reward_path=reward_path,
+        evolve_max_crash_rate=0.70,
+        max_freeze_windows=3,
+        verbose=False,
+    )
+    generate_called = {"n": 0}
+    monkeypatch.setattr(
+        designer,
+        "_call_generate_with_repair",
+        lambda *_a, **_k: generate_called.__setitem__("n", generate_called["n"] + 1) or None,
+    )
+    monkeypatch.setattr(designer, "_call_critique", lambda *_a, **_k: "")
+
+    crashed_ep = {"mean_speed": 28.0, "collisions": 1, "steps": 40, "total_overtakes": 0}
+    for _ in range(2):
+        designer._episode_stats = [crashed_ep]
+        assert designer._evolve() is False
+        assert len(designer.archive.entries) == 0
+        assert generate_called["n"] == 0
+
+    designer._episode_stats = [crashed_ep]
+    assert designer._evolve() is False
+    assert len(designer.archive.entries) == 1
+    assert generate_called["n"] == 1
+    assert designer._consecutive_frozen_windows == 0
+
+
+def test_evolution_forced_on_first_window_when_max_freeze_windows_one(monkeypatch):
+    workdir = tempfile.mkdtemp()
+    reward_path = os.path.join(workdir, "reward_program.py")
+    with open(reward_path, "w", encoding="utf-8") as f:
+        f.write(passing_reward_code())
+
+    designer = RewardDesigner(
+        archive_path=os.path.join(workdir, "reward_archive.json"),
+        reward_path=reward_path,
+        evolve_max_crash_rate=0.70,
+        max_freeze_windows=1,
+        verbose=False,
+    )
+    generate_called = {"n": 0}
+    monkeypatch.setattr(
+        designer,
+        "_call_generate_with_repair",
+        lambda *_a, **_k: generate_called.__setitem__("n", generate_called["n"] + 1) or None,
+    )
+    monkeypatch.setattr(designer, "_call_critique", lambda *_a, **_k: "")
+
+    crashed_ep = {"mean_speed": 28.0, "collisions": 1, "steps": 40, "total_overtakes": 0}
+    designer._episode_stats = [crashed_ep]
+    assert designer._evolve() is False
+    assert len(designer.archive.entries) == 1
+    assert generate_called["n"] == 1
+
+
+def test_evolution_freeze_counter_resets_when_crash_rate_improves(monkeypatch):
+    workdir = tempfile.mkdtemp()
+    reward_path = os.path.join(workdir, "reward_program.py")
+    with open(reward_path, "w", encoding="utf-8") as f:
+        f.write(passing_reward_code())
+
+    designer = RewardDesigner(
+        archive_path=os.path.join(workdir, "reward_archive.json"),
+        reward_path=reward_path,
+        evolve_max_crash_rate=0.70,
+        max_freeze_windows=3,
+        verbose=False,
+    )
+    monkeypatch.setattr(designer, "_call_generate_with_repair", lambda *_a, **_k: None)
+    monkeypatch.setattr(designer, "_call_critique", lambda *_a, **_k: "")
+
+    crashed_ep = {"mean_speed": 28.0, "collisions": 1, "steps": 40, "total_overtakes": 0}
+    designer._episode_stats = [crashed_ep]
+    designer._evolve()
+    assert designer._consecutive_frozen_windows == 1
+
+    safe_ep = {"mean_speed": 26.0, "collisions": 0, "steps": 100, "total_overtakes": 2}
+    designer._episode_stats = [safe_ep]
+    designer._evolve()
+    assert designer._consecutive_frozen_windows == 0
+    assert len(designer.archive.entries) == 1
 
 
 def test_evolution_frozen_resets_non_bootstrap_reward(monkeypatch):
@@ -245,6 +338,7 @@ def test_evolution_frozen_resets_non_bootstrap_reward(monkeypatch):
         archive_path=os.path.join(workdir, "reward_archive.json"),
         reward_path=reward_path,
         evolve_max_crash_rate=0.70,
+        freeze_reset_grace_windows=0,
         verbose=False,
     )
     monkeypatch.setattr(designer, "_call_generate_with_repair", lambda *_a, **_k: None)
@@ -286,6 +380,51 @@ def test_evolution_proceeds_when_crash_rate_below_threshold(monkeypatch):
     assert designer._evolve() is False
     assert len(designer.archive.entries) == 1
     assert designer.archive.entries[0]["metrics"]["crash_rate"] == 0.0
+
+
+def test_freeze_grace_keeps_deployed_reward(monkeypatch):
+    workdir = tempfile.mkdtemp()
+    reward_path = os.path.join(workdir, "reward_program.py")
+    with open(reward_path, "w", encoding="utf-8") as f:
+        f.write(passing_reward_code())
+
+    designer = RewardDesigner(
+        archive_path=os.path.join(workdir, "reward_archive.json"),
+        reward_path=reward_path,
+        evolve_max_crash_rate=0.70,
+        freeze_reset_grace_windows=2,
+        verbose=False,
+    )
+    monkeypatch.setattr(designer, "_call_generate_with_repair", lambda *_a, **_k: None)
+
+    llm_code = (
+        "def compute_reward(state):\n"
+        "    if state['collided']:\n"
+        "        return -90.0\n"
+        "    return 0.05 * state['speed_ms']\n"
+    )
+    designer._save_reward_program(llm_code, generation_label=1)
+    assert designer._deploy_grace_remaining == 2
+
+    crashed_ep = {"mean_speed": 28.0, "collisions": 1, "steps": 40, "total_overtakes": 0}
+    designer._episode_stats = [crashed_ep]
+    designer._evolve()
+    with open(reward_path, encoding="utf-8") as f:
+        assert "0.05 * state" in f.read()
+    assert designer._deploy_grace_remaining == 1
+
+    designer._episode_stats = [crashed_ep]
+    designer._evolve()
+    with open(reward_path, encoding="utf-8") as f:
+        assert "0.05 * state" in f.read()
+    assert designer._deploy_grace_remaining == 0
+
+    designer._episode_stats = [crashed_ep]
+    designer._evolve()
+    with open(reward_path, encoding="utf-8") as f:
+        restored = f.read()
+    assert "bootstrap default" in restored
+    assert "0.05 * state" not in restored
 
 
 def test_archive_remove_generation():

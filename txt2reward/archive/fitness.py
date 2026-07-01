@@ -505,7 +505,7 @@ def compute_fitness_v8(
         + _passive_penalty_v7(mean_speed, mean_overtakes, crash_rate)
         + _stationary_penalty_v7(mean_speed)
         + _trend_penalty_v7(metrics, prev_metrics)
-        + _sample_confidence_penalty(int(metrics.get("n_episodes", _SAMPLE_CONFIDENCE_MIN_RELIABLE)))
+        + _sample_confidence_penalty(int(metrics.get("n_episodes", 0)))
     )
 
     quality_adj = max(0.0, min(1.0, quality - behavioral_penalty))

@@ -1,0 +1,47 @@
+{
+  "phase": "phase4-post-clip-gates",
+  "ref_fitness_version": 7,
+  "smoke_collision_severity_max": -40.0,
+  "bank_max_violation_rate": 0.13,
+  "bank_max_violation_rate_by_phase": {
+    "survive": 0.18,
+    "speed": 0.15,
+    "overtake": 0.13,
+    "refine": 0.13
+  },
+  "bank_passive_violation_tolerance_by_phase": {
+    "survive": 2,
+    "speed": 1,
+    "overtake": 0,
+    "refine": 0
+  },
+  "lite_bank_max_soft_violations": 4,
+  "bootstrap_full": {
+    "soft_violation_rate": 0.06768558951965066,
+    "soft_violations": 31,
+    "passive_violations": 0,
+    "hard_violations": 0
+  },
+  "bootstrap_lite": {
+    "soft_violation_rate": 0.05714285714285714,
+    "soft_violations": 4,
+    "passive_violations": 0,
+    "hard_violations": 0
+  },
+  "survive_phase_rates": {
+    "survive": 0.18,
+    "speed": 0.15,
+    "overtake": 0.13,
+    "refine": 0.13
+  },
+  "survive_phase_passive_tolerance": {
+    "survive": 2,
+    "speed": 1,
+    "overtake": 0,
+    "refine": 0
+  },
+  "smoke_gate_failure_counts": {
+    "stage_a_1b_collision": 1,
+    "stage_a_2c_crash_farming": 1
+  }
+}

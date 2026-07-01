@@ -24,6 +24,8 @@ from txt2reward.config.training import (
     DEFAULT_CHECKPOINT_FREQ,
     DEFAULT_DRIVING_GOAL,
     DEFAULT_EVOLVE_EVERY,
+    DEFAULT_MAX_FREEZE_WINDOWS,
+    DEFAULT_FREEZE_RESET_GRACE_WINDOWS,
     DEFAULT_N_ENVS,
     DEFAULT_PLOT_DIR,
     DEFAULT_PLOT_SMOOTH_WINDOW,
@@ -92,6 +94,18 @@ def main() -> None:
         type=float,
         default=EVOLVE_MAX_CRASH_RATE,
         help="Freeze LLM evolution while window crash_rate is at or above this value (0–1)",
+    )
+    parser.add_argument(
+        "--max-freeze-windows",
+        type=int,
+        default=DEFAULT_MAX_FREEZE_WINDOWS,
+        help="After this many consecutive frozen windows, force one archive/LLM evolution attempt",
+    )
+    parser.add_argument(
+        "--freeze-reset-grace-windows",
+        type=int,
+        default=DEFAULT_FREEZE_RESET_GRACE_WINDOWS,
+        help="Keep a newly deployed reward for this many frozen windows before reverting to bootstrap",
     )
     parser.add_argument(
         "--goal",
@@ -183,6 +197,8 @@ def main() -> None:
         evolve_every=args.evolve_every,
         warmup_episodes=args.warmup_episodes,
         evolve_max_crash_rate=args.evolve_max_crash_rate,
+        max_freeze_windows=args.max_freeze_windows,
+        freeze_reset_grace_windows=args.freeze_reset_grace_windows,
         reward_path=args.reward_path,
         archive_path=args.archive_file,
         initial_episode_count=training_log.episode_count(),

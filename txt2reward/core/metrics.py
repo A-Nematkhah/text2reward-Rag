@@ -201,19 +201,22 @@ def aggregate_episode_stats(
 
 def aggregate_eval_fitness_metrics(
     episode_results: Sequence[EvalEpisodeResult | Mapping[str, Any]],
+    *,
+    enrich: bool = True,
 ) -> FitnessMetrics:
-    """
-    Fitness metric dict for evaluate.py — same keys as the legacy inline builder.
-
-    Omits enriched/extended fields so evaluation fitness stays unchanged.
-    """
+    """Aggregate evaluate.py rollouts into archive-compatible fitness metrics."""
     n = max(len(episode_results), 1)
     crash_rate = sum(1 for r in episode_results if r.get("crashed")) / n
     p10_ttc, min_ttc = pool_ttc_p10_min(episode_results)
-    return {
+    total_overtakes = sum(int(r.get("overtakes", 0)) for r in episode_results)
+    total_lane_changes = sum(int(r.get("lane_changes", 0)) for r in episode_results)
+    aggregated: FitnessMetrics = {
+        "n_episodes": n,
         "mean_speed": sum(r.get("mean_speed", 0) for r in episode_results) / n,
         "crash_rate": crash_rate,
-        "mean_overtakes": sum(r.get("overtakes", 0) for r in episode_results) / n,
+        "mean_overtakes": total_overtakes / n,
+        "total_overtakes": total_overtakes,
+        "total_lane_changes": total_lane_changes,
         "mean_steps": sum(r.get("steps", 0) for r in episode_results) / n,
         "completion_rate": 1.0 - crash_rate,
         "mean_ttc": sum(r.get("mean_ttc", 30.0) for r in episode_results) / n,
@@ -223,3 +226,6 @@ def aggregate_eval_fitness_metrics(
         "mean_accel": sum(r.get("mean_accel", 0) for r in episode_results) / n,
         "max_steps": HIGHWAY_MAX_STEPS,
     }
+    if enrich:
+        return enrich_fitness_metrics(aggregated)
+    return aggregated

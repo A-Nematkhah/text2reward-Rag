@@ -33,6 +33,19 @@ BANK_MAX_VIOLATION_RATE_BY_PHASE: dict[str, float] = {
 }
 BANK_MIN_FITNESS_GAP = 0.06
 
+# Passive-driving hard check: zero tolerance in overtake/refine; relaxed early curriculum.
+BANK_PASSIVE_VIOLATION_TOLERANCE_BY_PHASE: dict[str, int] = {
+    "survive": 2,
+    "speed": 1,
+    "overtake": 0,
+    "refine": 0,
+}
+
+# Lite bank (~16 trajectories): absolute soft-violation cap alongside rate threshold.
+# Calibrated post-clip bootstrap scores 4 soft violations at 5.7% on lite bank.
+LITE_BANK_TRAJECTORY_COUNT = 16
+LITE_BANK_MAX_SOFT_VIOLATIONS = 4
+
 # Pinned reference fitness version for stable Stage B ground truth.
 TRAJECTORY_REF_FITNESS_VERSION = 7
 
@@ -55,3 +68,17 @@ def bank_max_violation_rate_for_phase(phase: str | None) -> float:
     if phase and phase in BANK_MAX_VIOLATION_RATE_BY_PHASE:
         return BANK_MAX_VIOLATION_RATE_BY_PHASE[phase]
     return BANK_MAX_VIOLATION_RATE
+
+
+def bank_passive_violation_tolerance_for_phase(phase: str | None) -> int:
+    """Max allowed passive-driving ranking violations; stricter in later curriculum."""
+    if phase and phase in BANK_PASSIVE_VIOLATION_TOLERANCE_BY_PHASE:
+        return BANK_PASSIVE_VIOLATION_TOLERANCE_BY_PHASE[phase]
+    return 0
+
+
+def lite_bank_max_soft_violations(bank_size: int) -> int | None:
+    """Absolute soft-violation floor for small banks; None for full bank."""
+    if bank_size <= LITE_BANK_TRAJECTORY_COUNT:
+        return LITE_BANK_MAX_SOFT_VIOLATIONS
+    return None

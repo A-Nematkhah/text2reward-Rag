@@ -11,15 +11,12 @@ import gymnasium as gym
 import numpy as np
 
 from txt2reward.config.paths import REWARD_PROGRAM_PATH
-from txt2reward.config.training import (
-    DEFAULT_RELOAD_INTERVAL,
-    REWARD_STEP_CLIP_MAX,
-    REWARD_STEP_CLIP_MIN,
-)
+from txt2reward.config.training import DEFAULT_RELOAD_INTERVAL
 from txt2reward.config.validation import REWARD_STEP_TIMEOUT_SEC
 from txt2reward.core.constants import HIGHWAY_DIST_SCALE, HIGHWAY_SPEED_SCALE
 from txt2reward.core.log import get_logger
 from txt2reward.core.metrics import percentile
+from txt2reward.reward.clip import clip_shaped_reward
 from txt2reward.sandbox.sandbox import (
     build_state,
     execute_reward,
@@ -52,9 +49,9 @@ _TRACK_MAX_MISSES = 3
 _OVERTAKE_REARM_MARGIN = 2.0
 
 
-def _clip_shaped_reward(reward: float) -> float:
-    """Clamp per-step shaped reward so PPO critic targets stay bounded."""
-    return float(max(REWARD_STEP_CLIP_MIN, min(REWARD_STEP_CLIP_MAX, reward)))
+def _clip_shaped_reward(reward: float, *, collided: bool = False) -> float:
+    """Backward-compatible alias for clip_shaped_reward."""
+    return clip_shaped_reward(reward, collided=collided)
 
 
 def _denorm_y(y_raw: float, num_lanes: int, normalised: bool) -> float:
@@ -239,6 +236,7 @@ class LLMRewardWrapper(gym.Wrapper):
 
         # Execute reward function in sandbox (skip when only collecting stats).
         shaped_reward = 0.0
+        raw_reward: float | None = None
         if self.apply_shaped_reward:
             try:
                 shaped_reward = execute_reward(
@@ -253,18 +251,26 @@ class LLMRewardWrapper(gym.Wrapper):
                     log.warning(f"[wrapper] Reward execution error: {e}")
                 shaped_reward = _fallback_reward(state)
 
-            shaped_reward = _clip_shaped_reward(shaped_reward)
+            raw_reward = float(shaped_reward)
+            shaped_reward = _clip_shaped_reward(shaped_reward, collided=collided)
 
-        # Debug logging
-        if self.apply_shaped_reward and os.environ.get("DEBUG_REWARD") and self._global_step % 1000 == 0:
-            log.debug(
-                f"[wrapper] step={self._global_step:6d} "
-                f"speed={state['speed_ms']:.1f} m/s  "
-                f"front={state['front_dist']:.1f} m  "
-                f"ttc={state['ttc']:.1f} s  "
-                f"reward={shaped_reward:.3f}  "
-                f"overtook={state['overtook']}"
-            )
+        # Debug logging: raw vs clipped (collisions always; otherwise every 1000 steps)
+        if self.apply_shaped_reward and os.environ.get("DEBUG_REWARD"):
+            periodic = self._global_step % 1000 == 0
+            if collided or periodic:
+                if raw_reward is not None and abs(raw_reward - shaped_reward) > 1e-6:
+                    reward_part = f"raw={raw_reward:.3f} -> clipped={shaped_reward:.3f}"
+                else:
+                    reward_part = f"reward={shaped_reward:.3f}"
+                log.debug(
+                    f"[wrapper] step={self._global_step:6d} "
+                    f"speed={state['speed_ms']:.1f} m/s  "
+                    f"front={state['front_dist']:.1f} m  "
+                    f"ttc={state['ttc']:.1f} s  "
+                    f"{reward_part}  "
+                    f"collided={collided}  "
+                    f"overtook={state['overtook']}"
+                )
 
         # Carry state forward
         self._prev_speed_ms = parsed["speed_ms"]

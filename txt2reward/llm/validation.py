@@ -19,8 +19,11 @@ from txt2reward.config.validation import (
     SMOKE_COLLISION_SEVERITY_MAX,
     SMOKE_TEST_TIMEOUT_SEC,
     bank_max_violation_rate_for_phase,
+    bank_passive_violation_tolerance_for_phase,
+    lite_bank_max_soft_violations,
 )
 from txt2reward.core.types import RewardFn
+from txt2reward.reward.clip import clip_reward_for_state
 from txt2reward.sandbox.sandbox import (
     compile_reward_function,
     execute_reward,
@@ -30,6 +33,17 @@ from txt2reward.trajectory.bank import (
     evaluate_consistency,
     get_trajectory_bank,
 )
+
+def _runtime_step_reward(reward_fn: RewardFn, state: dict) -> float:
+    """Execute compute_reward and apply the same per-step clip as LLMRewardWrapper."""
+    raw = execute_reward(
+        "",
+        state,
+        timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
+        compiled_fn=reward_fn,
+    )
+    return clip_reward_for_state(float(raw), state)
+
 
 _TRAJECTORY_BANK = get_trajectory_bank()
 
@@ -44,6 +58,20 @@ def record_smoke_gate_failure(gate: str) -> None:
 def smoke_gate_failure_counts() -> dict[str, int]:
     """Copy of Stage A/B gate failure counts since process start."""
     return dict(_SMOKE_GATE_FAILURE_COUNTS)
+
+
+def reset_smoke_gate_failure_counts() -> None:
+    """Clear gate counters (calibration scripts / tests)."""
+    _SMOKE_GATE_FAILURE_COUNTS.clear()
+
+
+def format_smoke_gate_failure_report(counts: dict[str, int] | None = None) -> str:
+    """Human-readable summary of Stage A/B rejection counts."""
+    data = counts if counts is not None else smoke_gate_failure_counts()
+    if not data:
+        return "smoke_gate_failures: (none)"
+    parts = [f"{gate}={n}" for gate, n in sorted(data.items())]
+    return "smoke_gate_failures: " + ", ".join(parts)
 
 
 def _classify_stage_a_failure(err: str) -> str:
@@ -224,12 +252,7 @@ def _smoke_test_reward_code(
         ("collision", _SAMPLE_STATE_COLLIDED),
     ]:
         try:
-            result = execute_reward(
-                "",
-                sample,
-                timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
-                compiled_fn=reward_fn,
-            )
+            result = _runtime_step_reward(reward_fn, sample)
             rewards[name] = float(result)
         except KeyError as exc:
             return _smoke_sample_key_error(name, exc)
@@ -278,12 +301,7 @@ def _smoke_test_reward_code(
                 "long_jerk": 0.0,
                 "lat_jerk": 0.0,
             }
-            cautious_return += execute_reward(
-                "",
-                cautious_state,
-                timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
-                compiled_fn=reward_fn,
-            )
+            cautious_return += _runtime_step_reward(reward_fn, cautious_state)
     except (TimeoutError, RuntimeError, Exception) as exc:
         return _smoke_runtime_failure("during cautious-trajectory smoke test", exc)
 
@@ -306,12 +324,7 @@ def _smoke_test_reward_code(
                 "long_jerk": 1.5,
                 "lat_jerk": 1.0,
             }
-            reckless_return += execute_reward(
-                "",
-                reckless_state,
-                timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
-                compiled_fn=reward_fn,
-            )
+            reckless_return += _runtime_step_reward(reward_fn, reckless_state)
     except (TimeoutError, RuntimeError, Exception) as exc:
         return _smoke_runtime_failure("during reckless-trajectory smoke test", exc)
 
@@ -333,18 +346,8 @@ def _smoke_test_reward_code(
     slow_return = 0.0
     try:
         for _ in range(20):
-            fast_return += execute_reward(
-                "",
-                _SAMPLE_STATE_FAST_SAFE,
-                timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
-                compiled_fn=reward_fn,
-            )
-            slow_return += execute_reward(
-                "",
-                _SAMPLE_STATE_SLOW_SAFE,
-                timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
-                compiled_fn=reward_fn,
-            )
+            fast_return += _runtime_step_reward(reward_fn, _SAMPLE_STATE_FAST_SAFE)
+            slow_return += _runtime_step_reward(reward_fn, _SAMPLE_STATE_SLOW_SAFE)
     except RuntimeError as exc:
         if "timed out" in str(exc).lower():
             return False, _smoke_timeout_message("during speed-incentive gate", exc)
@@ -390,25 +393,10 @@ def _smoke_test_reward_code(
         crash_step["front_dist"] = 0.0
         crash_step["ttc"] = 0.0
         for _ in range(39):
-            fast_pre_crash += execute_reward(
-                "",
-                fast_step,
-                timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
-                compiled_fn=reward_fn,
-            )
-        fast_episode_total = fast_pre_crash + execute_reward(
-            "",
-            crash_step,
-            timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
-            compiled_fn=reward_fn,
-        )
+            fast_pre_crash += _runtime_step_reward(reward_fn, fast_step)
+        fast_episode_total = fast_pre_crash + _runtime_step_reward(reward_fn, crash_step)
         for _ in range(40):
-            cautious_episode += execute_reward(
-                "",
-                _SAMPLE_STATE_SLOW_SAFE,
-                timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
-                compiled_fn=reward_fn,
-            )
+            cautious_episode += _runtime_step_reward(reward_fn, _SAMPLE_STATE_SLOW_SAFE)
     except Exception as exc:
         return False, f"Runtime error during crash-farming gate: {type(exc).__name__}: {exc}"
 
@@ -424,12 +412,7 @@ def _smoke_test_reward_code(
     gradient_rewards = []
     try:
         for spd in _SPEED_GRADIENT_POINTS:
-            r = execute_reward(
-                "",
-                _speed_gradient_state(spd),
-                timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
-                compiled_fn=reward_fn,
-            )
+            r = _runtime_step_reward(reward_fn, _speed_gradient_state(spd))
             gradient_rewards.append(r)
     except Exception as exc:
         return False, f"Runtime error during speed-gradient gate: {type(exc).__name__}: {exc}"
@@ -485,12 +468,8 @@ def _smoke_test_reward_code(
                 "long_jerk": jerk,
                 "lat_jerk": 0.0,
             }
-            ramp_total += execute_reward(
-                "", ramp_state, timeout_sec=SMOKE_TEST_TIMEOUT_SEC, compiled_fn=reward_fn
-            )
-            flat_total += execute_reward(
-                "", _speed_gradient_state(20.0), timeout_sec=SMOKE_TEST_TIMEOUT_SEC, compiled_fn=reward_fn
-            )
+            ramp_total += _runtime_step_reward(reward_fn, ramp_state)
+            flat_total += _runtime_step_reward(reward_fn, _speed_gradient_state(20.0))
     except Exception as exc:
         return False, f"Runtime error during acceleration-ROI gate: {type(exc).__name__}: {exc}"
 
@@ -551,19 +530,19 @@ def _full_validation_pipeline(
         return False, stage_a_err, stage_a_err
 
     def _timed_fn(state: dict):
-        return execute_reward(
-            "",
-            state,
-            timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
-            compiled_fn=reward_fn,
-        )
+        return _runtime_step_reward(reward_fn, state)
 
     max_viol_rate = bank_max_violation_rate_for_phase(curriculum_phase)
+    max_passive = bank_passive_violation_tolerance_for_phase(curriculum_phase)
+    bank = get_trajectory_bank()
+    max_soft_abs = lite_bank_max_soft_violations(len(bank))
     stage_b_ok, stage_b_report, stage_b_console = evaluate_consistency(
         _timed_fn,
-        bank=_TRAJECTORY_BANK,
+        bank=bank,
         max_violation_rate=max_viol_rate,
         min_fitness_gap=BANK_MIN_FITNESS_GAP,
+        max_passive_violations=max_passive,
+        max_soft_violations=max_soft_abs,
     )
     if not stage_b_ok:
         record_smoke_gate_failure("stage_b_trajectory_bank")

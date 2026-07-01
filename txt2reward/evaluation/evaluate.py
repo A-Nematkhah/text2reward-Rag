@@ -172,6 +172,7 @@ def evaluate(
         "use_shaped": use_shaped,
         "deterministic": deterministic,
         "episodes": results,
+        "metrics": metrics,
         "mean_reward": float(np.mean(rewards)),
         "std_reward": float(np.std(rewards)),
         "min_reward": float(np.min(rewards)),
@@ -180,6 +181,10 @@ def evaluate(
         "mean_speed": float(np.mean(speeds)),
         "crash_rate": float(np.mean(crashes)),
         "mean_overtakes": float(np.mean(overtakes)),
+        "total_overtakes": metrics.get("total_overtakes", 0),
+        "total_lane_changes": metrics.get("total_lane_changes", 0),
+        "safe_overtake_ratio": metrics.get("safe_overtake_ratio", 0.0),
+        "lane_change_rate": metrics.get("lane_change_rate", 0.0),
         "fitness": fitness,
     }
 
@@ -189,6 +194,12 @@ def evaluate(
     log.info(f"  Mean steps    : {summary['mean_steps']:.1f}")
     log.info(f"  Mean speed    : {summary['mean_speed']:.2f} m/s")
     log.info(f"  Mean overtakes: {summary['mean_overtakes']:.2f} per episode")
+    log.info(
+        f"  Lane / overtake: {summary['total_lane_changes']} lane changes, "
+        f"{summary['total_overtakes']} overtakes | "
+        f"safe_ot_ratio={summary['safe_overtake_ratio']:.2f} | "
+        f"lc_rate={summary['lane_change_rate']:.2f}/ep"
+    )
     log.info(f"  Crash rate    : {float(np.mean(crashes)) * 100:.1f}%  ({sum(crashes)}/{n_episodes})")
     log.info(f"  Fitness score : {fitness:.4f}")
     log.info("─" * 65)
