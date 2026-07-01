@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections import Counter
 
 from txt2reward.config.validation import (
-    BANK_MAX_VIOLATION_RATE,
     BANK_MIN_FITNESS_GAP,
+    SMOKE_COLLISION_SEVERITY_MAX,
     SMOKE_TEST_TIMEOUT_SEC,
+    bank_max_violation_rate_for_phase,
 )
 from txt2reward.core.types import RewardFn
 from txt2reward.sandbox.sandbox import (
@@ -30,6 +32,39 @@ from txt2reward.trajectory.bank import (
 )
 
 _TRAJECTORY_BANK = get_trajectory_bank()
+
+_SMOKE_GATE_FAILURE_COUNTS: Counter[str] = Counter()
+
+
+def record_smoke_gate_failure(gate: str) -> None:
+    """Increment failure counter for calibration / designer diagnostics."""
+    _SMOKE_GATE_FAILURE_COUNTS[gate] += 1
+
+
+def smoke_gate_failure_counts() -> dict[str, int]:
+    """Copy of Stage A/B gate failure counts since process start."""
+    return dict(_SMOKE_GATE_FAILURE_COUNTS)
+
+
+def _classify_stage_a_failure(err: str) -> str:
+    lower = err.lower()
+    if "speed gradient" in lower:
+        return "stage_a_2d_speed_gradient"
+    if "acceleration roi" in lower:
+        return "stage_a_2e_accel_roi"
+    if "crash-farming" in lower or "crash farming" in lower:
+        return "stage_a_2c_crash_farming"
+    if "speed incentive" in lower:
+        return "stage_a_2b_speed_incentive"
+    if "trajectory gate" in lower or "reward hacking" in lower:
+        return "stage_a_2_trajectory"
+    if "safety gate" in lower or "collision" in lower:
+        return "stage_a_1b_collision"
+    if "compile error" in lower:
+        return "stage_a_compile"
+    if "runtime error" in lower or "keyerror" in lower:
+        return "stage_a_runtime"
+    return "stage_a_other"
 
 
 # ── Smoke-test helper ─────────────────────────────────────────────────────────
@@ -202,7 +237,6 @@ def _smoke_test_reward_code(
             return _smoke_runtime_failure(f"on sample state '{name}'", exc)
 
     # ── Gate 1b: collision branch must be strictly worse than normal driving ─
-    _COLLISION_SEVERITY_MAX = -40.0
     _MIN_GAP_WHEN_NORMAL_POSITIVE = 45.0
     if "collision" in rewards and "normal" in rewards:
         normal_r = rewards["normal"]
@@ -212,11 +246,11 @@ def _smoke_test_reward_code(
                 "Safety Gate Violation: collided-state reward must be strictly lower "
                 f"than normal-state reward (normal={normal_r:.2f}, collision={collision_r:.2f})."
             )
-        if collision_r > _COLLISION_SEVERITY_MAX:
+        if collision_r > SMOKE_COLLISION_SEVERITY_MAX:
             return False, (
                 "Safety Gate Violation: collision penalty is too weak — "
                 f"collided-state reward {collision_r:.2f} must be <= "
-                f"{_COLLISION_SEVERITY_MAX:.1f}."
+                f"{SMOKE_COLLISION_SEVERITY_MAX:.1f}."
             )
         if normal_r > 0 and (normal_r - collision_r) < _MIN_GAP_WHEN_NORMAL_POSITIVE:
             return False, (
@@ -474,7 +508,11 @@ def _smoke_test_reward_code(
     return True, ""
 
 
-def _full_validation_pipeline(code: str) -> tuple[bool, str, str]:
+def _full_validation_pipeline(
+    code: str,
+    *,
+    curriculum_phase: str | None = None,
+) -> tuple[bool, str, str]:
     """
     Two-stage smoke test, run in sequence:
 
@@ -504,10 +542,12 @@ def _full_validation_pipeline(code: str) -> tuple[bool, str, str]:
         reward_fn = compile_reward_function(code)
     except Exception as exc:
         msg = f"Compile error: {type(exc).__name__}: {exc}"
+        record_smoke_gate_failure("stage_a_compile")
         return False, msg, msg
 
     stage_a_ok, stage_a_err = _smoke_test_reward_code(code, compiled_fn=reward_fn)
     if not stage_a_ok:
+        record_smoke_gate_failure(_classify_stage_a_failure(stage_a_err))
         return False, stage_a_err, stage_a_err
 
     def _timed_fn(state: dict):
@@ -518,13 +558,15 @@ def _full_validation_pipeline(code: str) -> tuple[bool, str, str]:
             compiled_fn=reward_fn,
         )
 
+    max_viol_rate = bank_max_violation_rate_for_phase(curriculum_phase)
     stage_b_ok, stage_b_report, stage_b_console = evaluate_consistency(
         _timed_fn,
         bank=_TRAJECTORY_BANK,
-        max_violation_rate=BANK_MAX_VIOLATION_RATE,
+        max_violation_rate=max_viol_rate,
         min_fitness_gap=BANK_MIN_FITNESS_GAP,
     )
     if not stage_b_ok:
+        record_smoke_gate_failure("stage_b_trajectory_bank")
         return False, stage_b_report, stage_b_console
 
     return True, "", "PASS"

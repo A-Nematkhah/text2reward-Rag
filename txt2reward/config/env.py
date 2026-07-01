@@ -4,8 +4,16 @@
 env reward terms are zeroed because shaping comes from ``reward_program.py``.
 """
 
+from __future__ import annotations
+
+import copy
+
+DEFAULT_VEHICLES_COUNT = 30
+# Lighter traffic for survive-phase training when the agent still crashes every episode.
+SURVIVE_PHASE_VEHICLES_COUNT = 15
+
 ENV_CONFIG = {
-    "vehicles_count": 30,
+    "vehicles_count": DEFAULT_VEHICLES_COUNT,
     "simulation_frequency": 15,
     "policy_frequency": 5,
     "duration": 60,
@@ -27,3 +35,11 @@ ENV_CONFIG = {
     "right_lane_reward": 0.0,
     "lane_change_reward": 0.0,
 }
+
+
+def build_env_config(*, vehicles_count: int | None = None) -> dict:
+    """Return a copy of ``ENV_CONFIG`` with optional ``vehicles_count`` override."""
+    config = copy.deepcopy(ENV_CONFIG)
+    if vehicles_count is not None:
+        config["vehicles_count"] = int(vehicles_count)
+    return config

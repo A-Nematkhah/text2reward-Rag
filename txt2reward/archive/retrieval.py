@@ -91,6 +91,16 @@ def is_pathological_for_retrieval(entry: Mapping[str, Any]) -> bool:
     return is_crash_farming(m) or is_stationary_farming(m)
 
 
+def all_entries_crash_rate_above(
+    entries: Sequence[Mapping[str, Any]],
+    threshold: float,
+) -> bool:
+    """True when every entry's crash_rate is strictly above ``threshold``."""
+    if not entries:
+        return False
+    return all(float(e.get("metrics", {}).get("crash_rate", 1.0)) > threshold for e in entries)
+
+
 def dedupe_entries_by_code(
     entries: Sequence[Mapping[str, Any]],
     *,

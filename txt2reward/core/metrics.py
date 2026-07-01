@@ -16,7 +16,7 @@ def safe_overtake_ratio(metrics: FitnessMetrics | Mapping[str, Any]) -> float:
     """Fraction of lane changes that produced an overtake (0–1)."""
     lane_changes = max(int(metrics.get("total_lane_changes", 0)), 0)
     if lane_changes <= 0:
-        return 1.0 if float(metrics.get("total_overtakes", 0)) > 0 else 0.0
+        return 0.0
     total_overtakes = metrics.get("total_overtakes")
     if total_overtakes is None:
         n_eps = max(int(metrics.get("n_episodes", 1)), 1)

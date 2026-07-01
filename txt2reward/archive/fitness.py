@@ -35,7 +35,7 @@ _OVERTAKE_REF = 5.0  # 3 overtakes/ep now gives 0.60 score, not 0.30
 _COMFORT_K = 0.5
 _TTC_SAFE = 5.0  # s — normalisation ceiling for all TTC components
 
-# Robust TTC sub-weights (must sum to 1.0) — improvement #2
+# Robust TTC sub-weights (sum to 1.0)
 _TTC_W_MEAN = 0.40
 _TTC_W_P10 = 0.35
 _TTC_W_MIN = 0.25
@@ -322,7 +322,8 @@ def _trend_penalty_v7(metrics: Mapping[str, Any], prev_metrics: Mapping[str, Any
     return float(_V7_TREND_LAMBDA * (-delta_speed))
 
 
-def _curriculum_phase(generation: int, crash_rate: float) -> int:
+def _generation_curriculum_tier_v7(generation: int, crash_rate: float) -> int:
+    """Legacy v7 tier index from generation + crash_rate (not metrics-driven phase)."""
     if float(crash_rate) > 0.40 or generation <= 1:
         return 0
     if generation <= 4 or float(crash_rate) > 0.15:
@@ -609,7 +610,7 @@ def compute_fitness_v7(
         + _trend_penalty_v7(metrics, prev_metrics)
     )
 
-    phase = _curriculum_phase(generation, crash_rate)
+    phase = _generation_curriculum_tier_v7(generation, crash_rate)
     ceiling = _curriculum_ceiling_v7(crash_rate, phase)
     fitness = max(0.0, min(1.0, base - penalty)) * ceiling
 

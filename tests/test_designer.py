@@ -229,6 +229,40 @@ def test_evolution_frozen_when_crash_rate_high(monkeypatch):
     assert designer._episode_stats == []
 
 
+def test_evolution_frozen_resets_non_bootstrap_reward(monkeypatch):
+    workdir = tempfile.mkdtemp()
+    reward_path = os.path.join(workdir, "reward_program.py")
+    bad_code = (
+        "def compute_reward(state):\n"
+        "    if state['collided']:\n"
+        "        return -999.0\n"
+        "    return state['speed_ms'] * 50.0\n"
+    )
+    with open(reward_path, "w", encoding="utf-8") as f:
+        f.write(bad_code)
+
+    designer = RewardDesigner(
+        archive_path=os.path.join(workdir, "reward_archive.json"),
+        reward_path=reward_path,
+        evolve_max_crash_rate=0.70,
+        verbose=False,
+    )
+    monkeypatch.setattr(designer, "_call_generate_with_repair", lambda *_a, **_k: None)
+
+    crashed_ep = {"mean_speed": 28.0, "collisions": 1, "steps": 40, "total_overtakes": 0}
+    designer._episode_stats = [crashed_ep]
+    designer._episode_count = designer.warmup_episodes
+
+    assert designer._evolve() is False
+    with open(reward_path, encoding="utf-8") as f:
+        restored = f.read()
+    assert "bootstrap default" in restored
+    assert "return -999.0" not in restored
+    from txt2reward.llm.designer import _is_bootstrap_code
+
+    assert _is_bootstrap_code(restored)
+
+
 def test_evolution_proceeds_when_crash_rate_below_threshold(monkeypatch):
     workdir = tempfile.mkdtemp()
     reward_path = os.path.join(workdir, "reward_program.py")

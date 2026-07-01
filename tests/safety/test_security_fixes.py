@@ -1,24 +1,4 @@
-"""
-test_security_fixes.py
-───────────────────────
-Regression tests for the 6 urgent (🔴) fixes from the audit report
-(txt2reward-v2_audit_report.md):
-
-  1. Lane / dy_m de-normalization scale mismatch         (reward_wrapper.py)
-  2. execute_reward() bypassed -> no timeout on hot path  (reward_wrapper.py / reward_sandbox.py)
-  3. Smoke-test had no timeout                            (reward_designer.py)
-  4. AST validator allowed unbounded Pow exponents        (reward_sandbox.py)
-  5. Archive restore skipped re-validation                (reward_designer.py)
-  6. _load_reward_fn left real Python builtins reachable  (reward_wrapper.py)
-
-Runs under pytest if available:
-    pytest test_security_fixes.py -v
-
-Otherwise (pytest not installed -- e.g. offline/sandboxed environments),
-run directly and it will execute every test_*() function and report
-PASS/FAIL/ERROR with plain assertions:
-    python3 test_security_fixes.py
-"""
+"""Security regression tests for sandbox, wrapper, and archive restore."""
 
 from __future__ import annotations
 
@@ -51,8 +31,6 @@ try:
 except ImportError:
     _HAS_DESIGNER = False
 
-
-# ── Fix #1: shared, consistent y de-normalization ────────────────────────────
 
 
 def test_denorm_y_consistent_between_ego_and_other_vehicles():
@@ -94,8 +72,6 @@ def test_denorm_y_non_normalised_is_identity():
     assert rw._denorm_y(12.3, num_lanes=4, normalised=False) == 12.3
 
 
-# ── Fix #2: execute_reward() is the real, timeout-protected execution path ──
-
 
 def test_execute_reward_enforces_timeout():
     def expensive(state):
@@ -119,8 +95,6 @@ def test_execute_reward_normal_call_still_works_with_compiled_fn():
     assert val == 5.0
 
 
-# ── Fix #6: dynamically-loaded reward module has no real Python builtins ────
-
 
 def test_load_reward_fn_strips_real_builtins():
     if not _HAS_WRAPPER:
@@ -140,8 +114,6 @@ def test_load_reward_fn_strips_real_builtins():
         os.remove(path)
 
 
-# ── Fix #4: AST validator rejects large constant Pow exponents ──────────────
-
 
 def test_validate_rejects_large_pow_exponent():
     code = 'def compute_reward(state):\n    return state["speed_ms"] ** 999999999\n'
@@ -154,6 +126,12 @@ def test_validate_allows_small_pow_exponent():
     code = 'def compute_reward(state):\n    return state["speed_ms"] ** 2\n'
     ok, _ = rs.validate_reward_code(code)
     assert ok is True
+
+
+def test_validate_allows_negative_constant_pow_exponent():
+    code = 'def compute_reward(state):\n    return state["speed_ms"] ** (-2)\n'
+    ok, err = rs.validate_reward_code(code)
+    assert ok is True, err
 
 
 def test_validate_rejects_oversized_source():
@@ -179,8 +157,6 @@ def test_execute_reward_rejects_non_finite():
         rs.execute_reward(code="", state={}, timeout_sec=0.05, compiled_fn=bad)
 
 
-# ── Fix #3: smoke-test enforces a timeout ────────────────────────────────────
-
 
 def test_smoke_test_execute_reward_enforces_timeout():
     """Smoke test path uses execute_reward(), which must time out runaway code."""
@@ -193,8 +169,6 @@ def test_smoke_test_execute_reward_enforces_timeout():
     err_l = err.lower()
     assert any(token in err_l for token in ("timeout", "timed out", "overflow", "too computationally"))
 
-
-# ── Fix #5: archive restore re-validates before writing to disk ─────────────
 
 
 def test_restore_rejects_corrupted_archive_entry():

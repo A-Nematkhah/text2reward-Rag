@@ -12,7 +12,7 @@ Usage:
 
 The evaluator runs the current reward_program.py by default.
 Use --generation N to evaluate with a specific archived reward program.
-Use --no-shaped to disable the shaped reward entirely.
+Use --no-shaped to use the native env reward only (behavioural stats still collected).
 """
 
 import argparse
@@ -105,7 +105,8 @@ def evaluate(
     Args:
         model_path: Path to a ``.zip`` SB3 checkpoint.
         n_episodes: Number of rollouts.
-        use_shaped: Wrap env with ``LLMRewardWrapper`` when True.
+        use_shaped: When True, step reward comes from ``LLMRewardWrapper``;
+            when False, native env reward is used but stats are still collected.
         render: Human render mode when True.
         deterministic: Greedy policy actions when True.
         save_path: Optional JSON path for aggregated results.
@@ -124,7 +125,7 @@ def evaluate(
     if use_shaped:
         log.info(f"[evaluate] Reward program: {reward_path}")
     else:
-        log.info("[evaluate] Shaped reward OFF — env reward only")
+        log.info("[evaluate] Shaped reward OFF — env reward only (stats wrapper active)")
 
     render_mode = "human" if render else None
     env = make_highway_env(

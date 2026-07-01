@@ -8,9 +8,7 @@ from typing import Any, Mapping, cast
 from txt2reward.archive.fitness import is_passive_driving
 from txt2reward.core.types import CritiqueMeta, FitnessMetrics
 
-# ── Structured failure mode detection (improvement #4) ───────────────────────
 
-# Known failure-mode tag names (used for retrieval in improvement #3)
 FAILURE_MODE_TAGS = frozenset(
     {
         "tailgating",

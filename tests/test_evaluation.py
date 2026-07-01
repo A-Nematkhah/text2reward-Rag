@@ -4,12 +4,21 @@ import os
 import tempfile
 
 import pytest
+from stable_baselines3.common.monitor import Monitor
 from txt2reward.archive.archive import RewardArchive
 from txt2reward.core.metrics import pool_ttc_p10_min
 from txt2reward.llm.validation import write_validated_reward_tempfile
+from txt2reward.reward.wrapper import LLMRewardWrapper
 from txt2reward.sandbox.sandbox import validate_reward_code
+from txt2reward.training.env_factory import make_highway_env
 
 from tests.helpers import passing_reward_code
+
+
+def _unwrap_wrapper(env):
+    while isinstance(env, Monitor):
+        env = env.env
+    return env
 
 
 def test_pool_ttc_metrics_uses_step_values():
@@ -53,3 +62,11 @@ def test_write_validated_reward_accepts_safe_code():
             assert "compute_reward" in f.read()
     finally:
         os.remove(path)
+
+
+def test_no_shaped_env_still_collects_stats_via_wrapper():
+    env = make_highway_env(use_shaped=False)
+    wrapper = _unwrap_wrapper(env)
+    assert isinstance(wrapper, LLMRewardWrapper)
+    assert wrapper.apply_shaped_reward is False
+    env.close()

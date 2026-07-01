@@ -11,9 +11,10 @@ import os
 import highway_env  # noqa: F401
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.vec_env import VecNormalize
 
 # Re-export for tests that import ENV_CONFIG from train
-from txt2reward.config.env import ENV_CONFIG  # noqa: F401
+from txt2reward.config.env import ENV_CONFIG, DEFAULT_VEHICLES_COUNT, SURVIVE_PHASE_VEHICLES_COUNT  # noqa: F401
 from txt2reward.config.paths import (
     ARCHIVE_FILE,
     LOG_FILE,
@@ -31,8 +32,16 @@ from txt2reward.config.training import (
     DEFAULT_WARMUP_EPISODES,
     EVOLVE_MAX_CRASH_RATE,
     PPO_BATCH_SIZE,
+    PPO_ENT_COEF,
+    PPO_GAE_LAMBDA,
+    PPO_GAMMA,
+    PPO_MAX_GRAD_NORM,
     PPO_N_EPOCHS,
     PPO_N_STEPS,
+    PPO_VF_COEF,
+    DEFAULT_VEC_NORMALIZE_REWARD,
+    VEC_NORMALIZE_CLIP_REWARD,
+    VEC_NORMALIZE_STATS_PATH,
 )
 from txt2reward.core.log import configure_logging, get_logger
 from txt2reward.training.callbacks import RewardEvolutionCallback
@@ -112,8 +121,35 @@ def main() -> None:
         action="store_true",
         help="Fall back to DummyVecEnv if SubprocVecEnv fails (single-process only).",
     )
+    parser.add_argument(
+        "--vehicles-count",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            f"Override highway vehicles_count (default {DEFAULT_VEHICLES_COUNT}; "
+            f"use {SURVIVE_PHASE_VEHICLES_COUNT} for easier survive-phase training)"
+        ),
+    )
+    parser.add_argument(
+        "--easy-survive-env",
+        action="store_true",
+        help=f"Shorthand for --vehicles-count {SURVIVE_PHASE_VEHICLES_COUNT}",
+    )
+
+    parser.add_argument(
+        "--no-vec-normalize",
+        action="store_true",
+        help="Disable VecNormalize reward scaling (not recommended for shaped rewards)",
+    )
 
     args = parser.parse_args()
+
+    if args.easy_survive_env and args.vehicles_count is not None:
+        parser.error("Use only one of --easy-survive-env or --vehicles-count")
+    vehicles_count = args.vehicles_count
+    if args.easy_survive_env:
+        vehicles_count = SURVIVE_PHASE_VEHICLES_COUNT
 
     # Resolve paths so subprocess workers see the same files regardless of CWD.
     args.reward_path = os.path.abspath(args.reward_path)
@@ -126,7 +162,7 @@ def main() -> None:
 
     # ── Fresh start: wipe any local state so nothing gets resumed ────────────
     if args.fresh:
-        targets = [args.log_file, args.archive_file, args.reward_path]
+        targets = [args.log_file, args.archive_file, args.reward_path, os.path.abspath(VEC_NORMALIZE_STATS_PATH)]
         for fname in targets:
             if os.path.exists(fname):
                 os.remove(fname)
@@ -181,10 +217,31 @@ def main() -> None:
 
     # ── Build environments ────────────────────────────────────────────────────
     env_fns = [
-        make_env(rank=i, reload_interval=args.reload_interval, reward_path=args.reward_path) for i in range(args.n_envs)
+        make_env(
+            rank=i,
+            reload_interval=args.reload_interval,
+            reward_path=args.reward_path,
+            vehicles_count=vehicles_count,
+        )
+        for i in range(args.n_envs)
     ]
 
     vec_env = build_vec_env(env_fns, allow_dummy_env=args.allow_dummy_env)
+
+    use_vec_norm = DEFAULT_VEC_NORMALIZE_REWARD and not args.no_vec_normalize
+    vec_norm_path = os.path.abspath(VEC_NORMALIZE_STATS_PATH)
+    if use_vec_norm:
+        if args.resume and os.path.exists(vec_norm_path):
+            vec_env = VecNormalize.load(vec_norm_path, vec_env)
+            log.info("[train] Loaded VecNormalize stats from %s", vec_norm_path)
+        else:
+            vec_env = VecNormalize(
+                vec_env,
+                norm_obs=False,
+                norm_reward=True,
+                clip_reward=VEC_NORMALIZE_CLIP_REWARD,
+            )
+            log.info("[train] VecNormalize enabled (norm_reward=True, clip=%s)", VEC_NORMALIZE_CLIP_REWARD)
 
     # ── Build or restore PPO model ────────────────────────────────────────────
     if args.resume:
@@ -199,6 +256,11 @@ def main() -> None:
             n_steps=PPO_N_STEPS,
             batch_size=PPO_BATCH_SIZE,
             n_epochs=PPO_N_EPOCHS,
+            gamma=PPO_GAMMA,
+            gae_lambda=PPO_GAE_LAMBDA,
+            ent_coef=PPO_ENT_COEF,
+            vf_coef=PPO_VF_COEF,
+            max_grad_norm=PPO_MAX_GRAD_NORM,
             tensorboard_log="./tb_logs/",
         )
 
@@ -217,11 +279,12 @@ def main() -> None:
 
     # ── Train ─────────────────────────────────────────────────────────────────
     log.info(
-        "\n[train] Starting — %s timesteps | %s envs | evolve every %s episodes | warmup %s episodes",
+        "\n[train] Starting — %s timesteps | %s envs | evolve every %s episodes | warmup %s episodes | vehicles %s",
         f"{args.timesteps:,}",
         args.n_envs,
         args.evolve_every,
         args.warmup_episodes,
+        vehicles_count if vehicles_count is not None else DEFAULT_VEHICLES_COUNT,
     )
 
     model.learn(
@@ -229,6 +292,10 @@ def main() -> None:
         reset_num_timesteps=args.resume is None,
         callback=[checkpoint_cb, evolution_cb],
     )
+
+    if use_vec_norm and isinstance(vec_env, VecNormalize):
+        vec_env.save(vec_norm_path)
+        log.info("[train] Saved VecNormalize stats to %s", vec_norm_path)
 
     # ── Final save ────────────────────────────────────────────────────────────
     model.save("ppo_highway_txt2reward")

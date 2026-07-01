@@ -74,3 +74,14 @@ def test_make_env_preserves_absolute_reward_path():
     assert os.path.isabs(wrapper.reward_path)
     assert wrapper.reward_path == reward_path
     env.close()
+
+
+def test_build_env_config_vehicles_count_override():
+    from txt2reward.config.env import (
+        DEFAULT_VEHICLES_COUNT,
+        SURVIVE_PHASE_VEHICLES_COUNT,
+        build_env_config,
+    )
+
+    assert build_env_config()["vehicles_count"] == DEFAULT_VEHICLES_COUNT
+    assert build_env_config(vehicles_count=SURVIVE_PHASE_VEHICLES_COUNT)["vehicles_count"] == 15

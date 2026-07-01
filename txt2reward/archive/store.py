@@ -12,6 +12,7 @@ from txt2reward.archive.curriculum import curriculum_guidance
 from txt2reward.archive.fitness import compute_fitness, is_passive_driving
 from txt2reward.archive.retrieval import (
     _format_entry,
+    all_entries_crash_rate_above,
     cached_effective_fitness,
     effective_fitness,
     is_crash_farming,
@@ -21,6 +22,7 @@ from txt2reward.archive.retrieval import (
     reward_code_skeleton_hash,
 )
 from txt2reward.config.fitness import (
+    ARCHIVE_ALL_CRASH_TOP_K_CEILING,
     ARCHIVE_FAILED_MAX_FITNESS,
     ARCHIVE_MIN_TOP_FITNESS,
     FITNESS_VERSION_DEFAULT,
@@ -139,7 +141,7 @@ class RewardArchive:
             "fitness": fitness,
             "fitness_version": FITNESS_VERSION_DEFAULT,
             "critique": critique,
-            "critique_meta": critique_meta,  # improvement #4
+            "critique_meta": critique_meta,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         self.entries.append(entry)
@@ -208,6 +210,8 @@ class RewardArchive:
             same_phase = [e for e in candidates if e.get("metrics", {}).get("curriculum_phase") == curriculum_phase]
             if len(same_phase) >= k:
                 candidates = same_phase
+        if all_entries_crash_rate_above(candidates, ARCHIVE_ALL_CRASH_TOP_K_CEILING):
+            return []
         return self._select_diverse_top(
             candidates,
             k=k,
@@ -451,16 +455,26 @@ class RewardArchive:
             )
 
         # ── A) Top performers ────────────────────────────────────────────────
-        top = self.get_top_k(k, fitness_cache=fitness_cache, curriculum_phase=curriculum_phase)
-        lines.append("=== A) TOP REWARD PROGRAMS (by fitness) ===\n")
-        for entry in top:
+        if all_entries_crash_rate_above(self.entries, ARCHIVE_ALL_CRASH_TOP_K_CEILING):
+            lines.append("=== A) TOP REWARD PROGRAMS (by fitness) ===\n")
             lines.append(
-                _format_entry(
-                    entry,
-                    show_code=True,
-                    fitness=cached_effective_fitness(entry, fitness_cache),
-                )
+                "(Suppressed: every archived generation had crash_rate > "
+                f"{ARCHIVE_ALL_CRASH_TOP_K_CEILING:.0%} — no reliable positive examples. "
+                "Do NOT copy archived rewards for speed/overtake scaling; fix survival first. "
+                "Use sections C/D and the bootstrap design principles.)\n"
             )
+            top: list[ArchiveEntry] = []
+        else:
+            top = self.get_top_k(k, fitness_cache=fitness_cache, curriculum_phase=curriculum_phase)
+            lines.append("=== A) TOP REWARD PROGRAMS (by fitness) ===\n")
+            for entry in top:
+                lines.append(
+                    _format_entry(
+                        entry,
+                        show_code=True,
+                        fitness=cached_effective_fitness(entry, fitness_cache),
+                    )
+                )
 
         # ── B) Most recent ───────────────────────────────────────────────────
         recent = self.get_recent_rewards(1)

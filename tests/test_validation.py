@@ -277,3 +277,26 @@ def test_crash_rewarding_function_fails_hard_check():
     ok, report, _ = evaluate_consistency(bad, bank=bank, max_violation_rate=1.0)
     assert not ok
     assert "hard safety violations" in report
+
+
+def test_bank_max_violation_rate_looser_in_survive_phase():
+    from txt2reward.config.validation import (
+        BANK_MAX_VIOLATION_RATE,
+        bank_max_violation_rate_for_phase,
+    )
+
+    assert bank_max_violation_rate_for_phase("survive") > BANK_MAX_VIOLATION_RATE
+    assert bank_max_violation_rate_for_phase("refine") == BANK_MAX_VIOLATION_RATE
+    assert bank_max_violation_rate_for_phase(None) == BANK_MAX_VIOLATION_RATE
+
+
+def test_smoke_gate_failure_counts_increment():
+    from txt2reward.llm.validation import (
+        record_smoke_gate_failure,
+        smoke_gate_failure_counts,
+    )
+
+    before = dict(smoke_gate_failure_counts())
+    record_smoke_gate_failure("stage_a_test_gate")
+    after = smoke_gate_failure_counts()
+    assert after.get("stage_a_test_gate", 0) >= before.get("stage_a_test_gate", 0) + 1

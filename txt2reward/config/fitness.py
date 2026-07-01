@@ -20,6 +20,9 @@ ARCHIVE_FAILED_MAX_FITNESS = 0.08
 CRASH_FARMING_CRASH_MIN = 0.90
 CRASH_FARMING_SPEED_MIN = 26.0  # m/s
 
+# Suppress top-k RAG positive examples when every archive entry exceeds this crash_rate.
+ARCHIVE_ALL_CRASH_TOP_K_CEILING = 0.50
+
 # Single source of truth for "is this agent safe enough that passive/cruising
 # behaviour should be penalised" across v6 gate, v7 penalty, and v8 hard clamp.
 PASSIVE_DRIVING_CRASH_CEILING = 0.30

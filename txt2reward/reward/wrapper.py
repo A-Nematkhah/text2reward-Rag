@@ -1,44 +1,4 @@
-"""
-reward_wrapper.py
-─────────────────
-Gym wrapper that:
-  1. Parses the full KinematicObservation on every step to extract state signals.
-  2. Computes the shaped reward using the dynamically-loaded reward_program.py.
-  3. Reloads reward_program.py every `reload_interval` steps.
-  4. When an episode ends, stores a rich summary in info["episode_stats"].
-
-Key change from weight-based system
-────────────────────────────────────
-  OLD: compute_shaped_reward(weights, speed_ms, lane, ...) — fixed formula
-  NEW: compute_reward(state)                               — fully dynamic
-
-The wrapper imports the generated reward function from reward_program.py using
-importlib so hot-swapping works without restarting the training process.
-
-SubprocVecEnv note
-──────────────────
-Each worker is a separate process. reward_program.py on disk is the shared
-state. The wrapper reloads the module every `reload_interval` steps.
-
-Observation layout (highway-v0, KinematicObservation, normalize=True):
-  Each row → [presence, x, y, vx, vy]
-  Row 0    → ego vehicle
-  Rows 1…N → surrounding vehicles
-
-State signals computed
-──────────────────────
-  speed_ms        ego speed [m/s]
-  front_dist      distance to front vehicle [m]
-  ttc             time-to-collision [s]
-  rel_vel_ms      v_front - v_ego [m/s]
-  lane            lane index
-  lane_changed    True if lane changed since last step
-  overtook        True if ego passed a trailing vehicle
-  accel_ms2       longitudinal acceleration [m/s²]
-  long_jerk       longitudinal jerk [m/s³]
-  lat_jerk        lateral jerk [m/s³]
-  nearby_vehicles count within density_radius metres
-"""
+"""Gym wrapper: parse observations, run compute_reward, collect episode_stats."""
 
 from __future__ import annotations
 
@@ -76,11 +36,7 @@ _IDX_Y = 2
 _IDX_VX = 3
 _IDX_VY = 4
 
-# ── Physical constants ────────────────────────────────────────────────────────
-# Vehicle.MAX_SPEED = 40.0 m/s (see highway_env.envs.common.observation.KinematicObservation).
-# So the correct de-normalisation factors are 2*40=80 for speed and 5*40=200 for
-# distance — NOT 40 and 100. (Previously these were halved, which silently
-# capped every speed/distance signal at half its true value.)
+# Physical de-normalisation (highway-env KinematicObservation, normalize=True).
 _SPEED_SCALE = HIGHWAY_SPEED_SCALE
 _LANE_WIDTH = 4.0
 _DT = 1.0 / 5.0
@@ -88,43 +44,12 @@ _PRESENCE_TH = 0.5
 _DIST_SCALE = HIGHWAY_DIST_SCALE
 _DIST_MAX = 200.0
 
-# ── Overtake-tracking constants ───────────────────────────────────────────────
-# Vehicles are tracked across steps by nearest-neighbour matching in
-# (relative longitudinal distance, relative speed) space, gated by maximum
-# plausible per-step jumps in each dimension. At policy_frequency=5 Hz a real
-# vehicle cannot teleport, so a match candidate whose dx or vx changed by more
-# than these bounds in one step is treated as a *different* vehicle rather
-# than the same one re-detected — this is what prevents identity swaps in
-# dense traffic (up to ~30 vehicles, ~10 visible in the observation).
-#   _TRACK_MAX_DX_JUMP : at 5 Hz, even a large relative speed (~40 m/s closing)
-#                        only covers 8 m per step, so an 8 m jump comfortably
-#                        bounds normal motion/IDM jitter while still rejecting
-#                        a match against a different, similarly-positioned car.
-#   _TRACK_MAX_VX_JUMP : relative speed cannot swing by more than a few m/s in
-#                        1/5 s under normal driving dynamics (no instantaneous
-#                        speed changes), so 6 m/s safely bounds real jitter
-#                        while rejecting a mismatched vehicle with a very
-#                        different relative speed.
-_TRACK_MAX_DX_JUMP = 8.0  # metres
-_TRACK_MAX_VX_JUMP = 6.0  # m/s
-# Only vehicles in the ego's lane or an immediately adjacent lane are
-# candidates for "being overtaken" — a car three lanes over is not something
-# the ego is meaningfully passing, even if it is technically ahead in x.
+# Overtake tracking: nearest-neighbour match with per-step jump gates.
+_TRACK_MAX_DX_JUMP = 8.0
+_TRACK_MAX_VX_JUMP = 6.0
 _OVERTAKE_LANE_RANGE = 1
-# A tracked vehicle that hasn't been seen (matched) for this many consecutive
-# steps is dropped from tracking, so stale tracks don't linger and falsely
-# match a much-later, unrelated detection at a similar (dx, vx).
 _TRACK_MAX_MISSES = 3
-# Hysteresis margin for re-arming a track's overtake flag. A vehicle must
-# clear back to dx > _OVERTAKE_REARM_MARGIN (not just dx > 0.0) before it is
-# considered to have genuinely returned ahead of the ego. Without this
-# margin, ordinary jitter for a vehicle riding alongside ego near dx=0
-# (e.g. a same-speed neighbour in an adjacent lane) crosses the dx<=0
-# boundary repeatedly, re-arming and re-firing a "new" overtake on every
-# crossing even though no real pass is occurring. The margin must exceed
-# plausible single-step jitter but stay well inside _TRACK_MAX_DX_JUMP so it
-# doesn't interfere with genuine re-merge-ahead detection.
-_OVERTAKE_REARM_MARGIN = 2.0  # metres
+_OVERTAKE_REARM_MARGIN = 2.0
 
 
 def _clip_shaped_reward(reward: float) -> float:
@@ -132,36 +57,8 @@ def _clip_shaped_reward(reward: float) -> float:
     return float(max(REWARD_STEP_CLIP_MIN, min(REWARD_STEP_CLIP_MAX, reward)))
 
 
-# ── Shared y/lateral de-normalization (SINGLE source of truth) ───────────────
-#
-# highway-env normalises the "y" feature into [-1, 1] using the range
-# [-LANE_WIDTH * num_lanes, LANE_WIDTH * num_lanes] (see
-# highway_env.envs.common.observation.KinematicObservation.normalize_obs,
-# which derives the range from AbstractLane.DEFAULT_WIDTH * len(side_lanes),
-# i.e. LANE_WIDTH * num_lanes for a one-way road). This is exactly the same
-# kind of range-based normalisation already documented above for vx/x
-# (_SPEED_SCALE / _DIST_SCALE).
-#
-# SECURITY/CORRECTNESS NOTE (fixes audit finding #1): there used to be TWO
-# different, independently-derived multipliers applied to the same raw y
-# value:
-#   - the ego's lane index used  y_raw * num_lanes            (factor 4)
-#   - another vehicle's dy_m used y_raw * LANE_WIDTH*(num_lanes-1)  (factor 12)
-# Both were derived from the SAME underlying normalised y feature, so using
-# two different factors meant the ego's own lateral position and other
-# vehicles' lateral offsets were silently measured on two different scales.
-# Every downstream signal that depends on lateral alignment (front_dist,
-# ttc, nearby_vehicles, and the overtake lane-window gate) inherited this
-# inconsistency. The fix is to de-normalise y ONCE, the same way, for both
-# the ego and every other vehicle, and derive the lane index from that
-# single metres value.
 def _denorm_y(y_raw: float, num_lanes: int, normalised: bool) -> float:
-    """Converts a raw 'y' observation value into metres of lateral offset.
-
-    Used for BOTH the ego's absolute lateral position and other vehicles'
-    relative dy -- they must use the identical formula since they come from
-    the same normalisation range.
-    """
+    """Lateral offset in metres (same formula for ego and other vehicles)."""
     return y_raw * _LANE_WIDTH * num_lanes if normalised else y_raw
 
 
@@ -226,21 +123,6 @@ def _load_reward_fn(path: str, *, validate: bool = True):
         for k, v in safe_ns.items():
             setattr(mod, k, v)
 
-        # SECURITY (fixes audit finding #6): explicitly strip real Python
-        # builtins from the module namespace before exec_module() runs.
-        # importlib's exec_module() calls exec() under the hood, and exec()
-        # auto-injects the REAL __builtins__ dict (open, eval, exec,
-        # __import__, ...) into the globals it's given if one isn't already
-        # present. The line above only sets approved helper names as plain
-        # module attributes -- it never sets mod.__builtins__ itself, so
-        # without this explicit assignment the generated code would still
-        # have full access to real builtins at runtime. AST validation
-        # (reward_sandbox.validate_reward_code) is the primary defense and
-        # already forbids names like `eval`/`exec`/`__import__`, but this is
-        # a deliberate second line of defense: if a reward program ever
-        # reaches this loader without having been (re-)validated -- e.g. a
-        # corrupted or pre-validation legacy archive entry -- real builtins
-        # must still not be reachable from inside compute_reward().
         mod.__dict__["__builtins__"] = {}
 
         spec.loader.exec_module(mod)
@@ -263,13 +145,7 @@ def _fallback_reward(state: dict) -> float:
 
 
 class LLMRewardWrapper(gym.Wrapper):
-    """
-    Gym wrapper that executes the dynamically generated reward function.
-
-    Backward-compatible with train.py: the constructor signature is unchanged
-    (except `weights_path` is replaced by `reward_path`, with a default that
-    matches the old WEIGHTS_FILE name for easy migration).
-    """
+    """Executes compute_reward from reward_program.py; optional shaped reward."""
 
     MAX_TRAJ_SAMPLES = 8
 
@@ -280,7 +156,7 @@ class LLMRewardWrapper(gym.Wrapper):
         num_lanes: int = 4,
         reward_path: str = REWARD_PROGRAM_PATH,
         reward_timeout_sec: float = REWARD_STEP_TIMEOUT_SEC,
-        # backward-compat stubs
+        apply_shaped_reward: bool = True,
         weights_path: str | None = None,
         llm_interval: int = 50,
     ):
@@ -289,6 +165,7 @@ class LLMRewardWrapper(gym.Wrapper):
         self.num_lanes = num_lanes
         self.reward_path = reward_path
         self.reward_timeout_sec = reward_timeout_sec
+        self.apply_shaped_reward = apply_shaped_reward
 
         self._reward_fn = _load_reward_fn(self.reward_path)
         self._global_step = 0
@@ -360,39 +237,26 @@ class LLMRewardWrapper(gym.Wrapper):
         # Build canonical state dict
         state = build_state(parsed, collided)
 
-        # Execute reward function in sandbox.
-        #
-        # SECURITY (fixes audit finding #2): this now actually goes through
-        # reward_sandbox.execute_reward(), which runs the call inside a
-        # thread with a hard timeout (self.reward_timeout_sec). Previously
-        # this called execute_reward.__wrapped__ -- a monkey-patched
-        # attribute that pointed at a plain, un-timeboxed direct call -- so
-        # the real sandboxed/timeout-protected execute_reward() was never
-        # actually invoked on the hot path, and an LLM-generated reward
-        # program with a runaway computation (e.g. a pathological exponent)
-        # could hang a worker process indefinitely.
-        #
-        # `compiled_fn=self._reward_fn` reuses the already-loaded function
-        # (loaded once per reload_interval steps by _load_reward_fn) so we
-        # still avoid recompiling the source on every single environment
-        # step -- only the function CALL itself is timeboxed.
-        try:
-            shaped_reward = execute_reward(
-                code="",
-                state=state,
-                timeout_sec=self.reward_timeout_sec,
-                compiled_fn=self._reward_fn,
-            )
-        except Exception as e:
-            # Fallback if execution fails or times out
-            if self._global_step % 1000 == 1:
-                log.warning(f"[wrapper] Reward execution error: {e}")
-            shaped_reward = _fallback_reward(state)
+        # Execute reward function in sandbox (skip when only collecting stats).
+        shaped_reward = 0.0
+        if self.apply_shaped_reward:
+            try:
+                shaped_reward = execute_reward(
+                    code="",
+                    state=state,
+                    timeout_sec=self.reward_timeout_sec,
+                    compiled_fn=self._reward_fn,
+                )
+            except Exception as e:
+                # Fallback if execution fails or times out
+                if self._global_step % 1000 == 1:
+                    log.warning(f"[wrapper] Reward execution error: {e}")
+                shaped_reward = _fallback_reward(state)
 
-        shaped_reward = _clip_shaped_reward(shaped_reward)
+            shaped_reward = _clip_shaped_reward(shaped_reward)
 
         # Debug logging
-        if os.environ.get("DEBUG_REWARD") and self._global_step % 1000 == 0:
+        if self.apply_shaped_reward and os.environ.get("DEBUG_REWARD") and self._global_step % 1000 == 0:
             log.debug(
                 f"[wrapper] step={self._global_step:6d} "
                 f"speed={state['speed_ms']:.1f} m/s  "
@@ -475,20 +339,9 @@ class LLMRewardWrapper(gym.Wrapper):
                 "trajectory_samples": list(self._ep_traj),
             }
 
-        return obs, shaped_reward, terminated, truncated, info
+        step_reward = shaped_reward if self.apply_shaped_reward else float(env_reward)
 
-
-# NOTE (fixes audit finding #2): there used to be a monkey-patch here
-# (`execute_reward.__wrapped__ = _direct_execute`) that silently replaced
-# the timeout-protected execute_reward() with a plain, un-timeboxed direct
-# call, so the per-step hot path above never actually went through the
-# sandbox's timeout guard. That patch and its `_direct_execute` helper have
-# been removed -- the step() method now calls reward_sandbox.execute_reward()
-# directly (with compiled_fn=self._reward_fn so the source isn't recompiled
-# every step), which is the single, real execution path with a hard timeout.
-
-
-# ── Overtake tracking: nearest-neighbour vehicle identity across steps ────────
+        return obs, step_reward, terminated, truncated, info
 
 
 def _match_track(

@@ -7,7 +7,11 @@ import highway_env  # noqa: F401
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
-from txt2reward.config.env import ENV_CONFIG
+from txt2reward.config.env import (
+    DEFAULT_VEHICLES_COUNT,
+    SURVIVE_PHASE_VEHICLES_COUNT,
+    build_env_config,
+)
 from txt2reward.config.paths import REWARD_PROGRAM_PATH
 from txt2reward.config.training import DEFAULT_RELOAD_INTERVAL
 from txt2reward.core.log import get_logger
@@ -23,26 +27,32 @@ def make_highway_env(
     reload_interval: int = DEFAULT_RELOAD_INTERVAL,
     reward_path: str = REWARD_PROGRAM_PATH,
     monitor: bool = True,
+    vehicles_count: int | None = None,
 ) -> gym.Env:
     """Create a single highway-v0 env with optional shaped reward and Monitor."""
-    config = dict(ENV_CONFIG)
+    config = build_env_config(vehicles_count=vehicles_count)
     kwargs: dict = {"config": config}
     if render_mode is not None:
         kwargs["render_mode"] = render_mode
     env = gym.make("highway-v0", **kwargs)
-    if use_shaped:
-        env = LLMRewardWrapper(
-            env,
-            reload_interval=reload_interval,
-            num_lanes=ENV_CONFIG["lanes_count"],
-            reward_path=reward_path,
-        )
+    env = LLMRewardWrapper(
+        env,
+        reload_interval=reload_interval,
+        num_lanes=config["lanes_count"],
+        reward_path=reward_path,
+        apply_shaped_reward=use_shaped,
+    )
     if monitor:
         env = Monitor(env)
     return env
 
 
-def make_env(rank: int = 0, reload_interval: int = DEFAULT_RELOAD_INTERVAL, reward_path: str = REWARD_PROGRAM_PATH):
+def make_env(
+    rank: int = 0,
+    reload_interval: int = DEFAULT_RELOAD_INTERVAL,
+    reward_path: str = REWARD_PROGRAM_PATH,
+    vehicles_count: int | None = None,
+):
     """Factory for SubprocVecEnv workers (rank is unused; kept for SB3 convention)."""
 
     def _init():
@@ -51,6 +61,7 @@ def make_env(rank: int = 0, reload_interval: int = DEFAULT_RELOAD_INTERVAL, rewa
             reward_path=reward_path,
             use_shaped=True,
             monitor=True,
+            vehicles_count=vehicles_count,
         )
 
     return _init

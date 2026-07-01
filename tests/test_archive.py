@@ -261,3 +261,34 @@ def test_get_failed_rewards_round_robins_across_buckets(tmp_path):
     gens = {e["generation"] for e in result}
     assert len(gens) == 2
     assert not gens.issubset({0, 1})
+
+
+def test_get_top_k_empty_when_all_entries_high_crash(tmp_path):
+    archive = RewardArchive(str(tmp_path / "archive.json"))
+    for i, cr in enumerate((0.55, 0.80, 1.0)):
+        archive.entries.append(
+            archive_entry(
+                i,
+                f"def compute_reward(state):\n    return state['speed_ms'] * {i + 1}.0\n",
+                base_metrics(crash_rate=cr, mean_speed=28.0),
+                0.002,
+            )
+        )
+    assert archive.get_top_k(3) == []
+
+
+def test_format_for_llm_suppresses_top_k_when_all_high_crash(tmp_path):
+    archive = RewardArchive(str(tmp_path / "archive.json"))
+    for i, cr in enumerate((0.60, 0.90, 1.0)):
+        archive.entries.append(
+            archive_entry(
+                i,
+                f"def compute_reward(state):\n    return state['speed_ms'] * {i + 1}.0\n",
+                base_metrics(crash_rate=cr, mean_speed=27.0),
+                0.002,
+            )
+        )
+    text = archive.format_for_llm(k=2)
+    assert "Suppressed" in text
+    assert "TOP REWARD PROGRAMS" in text
+    assert "Reward Code:" not in text.split("=== B)")[0]

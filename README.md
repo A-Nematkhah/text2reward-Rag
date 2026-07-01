@@ -116,8 +116,8 @@ text2reward-Rag/
 │   └── evaluation/          # Model evaluation pipeline
 ├── scripts/                 # Maintenance utilities (see scripts/README.md)
 ├── examples/                # Usage pointers (CLI workflows)
-├── tests/                   # Pytest suite (115 tests)
-├── docs/                    # Layout and design notes
+├── tests/                   # Pytest suite
+├── docs/                    # structure.md
 ├── requirements.txt         # Runtime dependencies
 ├── requirements-dev.txt     # pytest (includes -r requirements.txt)
 └── LICENSE                  # MIT
@@ -189,6 +189,9 @@ python evaluate.py --model ppo_highway_txt2reward.zip --generation 2
 | `--evolve-every` | `100` | Generate a new reward program every N episodes (after warmup) |
 | `--warmup-episodes` | `80` | Episodes before the first LLM reward generation |
 | `--evolve-max-crash-rate` | `0.70` | Freeze LLM evolution while window crash_rate ≥ this value |
+| `--no-vec-normalize` | off | Disable reward normalisation (VecNormalize; on by default) |
+| `--easy-survive-env` | off | Use `vehicles_count=15` for easier survive-phase training |
+| `--vehicles-count` | `30` | Override highway traffic density |
 | `--goal` | *(driving goal)* | Natural-language goal sent to the LLM |
 | `--reward-path` | `reward_program.py` | Output path for the generated reward program |
 | `--archive-file` | `reward_archive.json` | Path to the reward archive |

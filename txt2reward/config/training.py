@@ -41,3 +41,13 @@ DEFAULT_PLOT_DIR = "plots"
 PPO_N_STEPS = 512
 PPO_BATCH_SIZE = 64
 PPO_N_EPOCHS = 5
+PPO_GAMMA = 0.99
+PPO_GAE_LAMBDA = 0.95
+PPO_ENT_COEF = 0.02
+PPO_VF_COEF = 0.5
+PPO_MAX_GRAD_NORM = 0.5
+
+# VecNormalize: stabilises critic when shaped rewards have high return variance.
+DEFAULT_VEC_NORMALIZE_REWARD = True
+VEC_NORMALIZE_CLIP_REWARD = 10.0
+VEC_NORMALIZE_STATS_PATH = "vec_normalize.pkl"

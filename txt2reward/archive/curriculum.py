@@ -39,7 +39,10 @@ def infer_curriculum_phase(metrics: CoreMetrics | FitnessMetrics | Mapping[str, 
 CURRICULUM_GUIDANCE: dict[CurriculumPhase, str] = {
     "survive": (
         "Agent crashes too often. Prioritise survival: strong collision penalty "
-        "(-70 to -100), stronger TTC/tailgate penalties, moderate speed reward."
+        "(-70 to -100), continuous TTC/tailgate penalties scaled with speed, "
+        "moderate speed reward (coeff 0.04–0.08, cap ≤ 2.0). Defer aggressive "
+        "overtake taxes until crash_rate drops — keep per-step terms inside "
+        "COEFFICIENT BOUNDS."
     ),
     "speed": (
         "Crashes are improving but speed is low OR still elevated. Balance safety "

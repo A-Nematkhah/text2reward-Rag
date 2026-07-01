@@ -1,6 +1,7 @@
 """LLM prompt templates for reward generation and critique."""
 
 from txt2reward.config.llm import LLM_MODEL
+from txt2reward.config.validation import SMOKE_COLLISION_SEVERITY_MAX
 
 MODEL = LLM_MODEL
 
@@ -25,8 +26,13 @@ def compute_reward(state):
     else:
         no_overtake_tax = 0.0
     static_passive = -0.50 if open_road and not state["overtook"] and not state["lane_changed"] else 0.0
-    ttc_penalty = -4.0 if state["ttc"] < 1.0 else -2.0 if state["ttc"] < 3.0 else 0.0
-    tailgate_penalty = -1.8 if state["front_dist"] < 20.0 and state["ttc"] < 4.0 else 0.0
+    ttc_penalty = (
+        -5.0 if state["ttc"] < 1.0
+        else -2.5 if state["ttc"] < 3.0
+        else -1.0 if state["ttc"] < 5.0
+        else 0.0
+    )
+    tailgate_penalty = -2.2 if state["front_dist"] < 22.0 and state["ttc"] < 4.5 else 0.0
     overtake_bonus = 3.0 if state["overtook"] else 0.0
     harsh_jerk = max(0.0, abs(state["long_jerk"]) - 2.0) + max(0.0, abs(state["lat_jerk"]) - 2.0)
     harsh_accel = max(0.0, abs(state["accel_ms2"]) - 2.5)
@@ -68,6 +74,21 @@ CRITICAL: The only valid state keys are EXACTLY the ones listed above.
   * Use state["overtook"]  ← correct (past tense, with k)
   * NEVER use state["overtake"]  ← this key does NOT exist and will crash
 
+COMMON KEY TYPO (instant smoke-test / runtime rejection):
+  WRONG — do NOT write any of these (KeyError at runtime):
+      if state["overtake"]:
+          bonus = 3.0
+      overtake_bonus = 2.0 if state["overtake"] else 0.0
+      if not state["overtake"] and open_road:
+          tax = -1.0
+  RIGHT — the flag is named overtook (past tense, ends with k):
+      if state["overtook"]:
+          bonus = 3.0
+      overtake_bonus = 2.0 if state["overtook"] else 0.0
+      if not state["overtook"] and open_road:
+          tax = -1.0
+  Mnemonic: you overtook another vehicle this step → state["overtook"], not state["overtake"].
+
 Safe math available (no imports, just use by name):
   min, max, abs, round, float, int, bool
   sqrt, exp, log, sin, cos, tan, atan, atan2
@@ -95,18 +116,20 @@ HARD RULES (violation = sandbox rejection):
     * Only approved math: sqrt, exp, log, sin, cos, tan, atan2, floor, ceil, clip, pi
     * Must return a float value
     * Single local variables allowed; no nested functions
+    * STATE KEY overtake flag: ONLY state["overtook"] exists. state["overtake"]
+      is NOT a valid key — using it causes KeyError and immediate rejection.
+      Wrong: overtake_bonus = 3.0 if state["overtake"] else 0.0
+      Right: overtake_bonus = 3.0 if state["overtook"] else 0.0
 
 DESIGN PRINCIPLES:
-    * SCALE DISCIPLINE (critical -- violating this causes flat speed
-      gradients across generations): no penalty coefficient (jerk, accel,
-      cruise_tax, no_overtake_tax, tailgate, lane-change) may exceed
-      3-5x the speed_reward coefficient. If speed_reward uses coefficient
-      C, no single penalty term's peak magnitude should exceed 5*C times
-      a typical per-step activation. Compounding this ratio generation
-      over generation (raising penalties without raising speed_reward
-      proportionally) causes the agent to have no economic incentive to
-      accelerate -- this has happened before in this project's evolution
-      history and must not repeat.
+    * COEFFICIENT BOUNDS (absolute — behaviour gates enforce ranking, not ratios):
+      speed coefficient 0.04–0.10, per-step speed cap ≤ 3.0;
+      collision return ≤ {collision_max:.0f} (typical -60 to -100);
+      jerk/accel penalty coeffs 0.05–0.25 (threshold-based only);
+      cruise / no_overtake / tailgate taxes 0.3–3.5 per step;
+      overtake bonus 1.0–4.0; lane-change-without-overtake -0.3 to -0.6.
+      Do NOT inflate every penalty generation-over-generation — keep magnitudes
+      inside these bands so PPO value learning stays stable.
     * ACCEL/JERK PENALTIES MUST BE THRESHOLD-BASED, NOT ABSOLUTE: only
       penalise accel_ms2 / long_jerk / lat_jerk magnitude ABOVE a harsh
       threshold (e.g. max(0, abs(accel_ms2) - 2.5)), never the raw
@@ -119,7 +142,8 @@ DESIGN PRINCIPLES:
       clip((target_speed - speed) / target_speed, 0, 1) or similar, so
       the agent always has a gradient to improve, not a flat region
       between thresholds.
-    * Collision penalty MUST dominate (-60 to -100). A typical episode is ~40 steps;
+    * Collision penalty MUST dominate (collided-state reward <= {collision_max:.0f};
+      typical values -60 to -100). A typical episode is ~40 steps;
       per-step speed reward must NOT make crashing net-profitable. Rule of thumb:
       40 steps × max per-step reward < |collision penalty|.
     * Speed reward: moderate coefficient (0.06–0.10), cap ≤ 3.0 — enough to prefer
@@ -192,6 +216,7 @@ Generate an improved compute_reward(state) function that achieves the goal above
 - Do NOT replicate "safe but slow" rewards (0% crash, speed ~20 m/s, no overtakes).
   The fitness function now penalises this via a passive-driving gate.
 - Prioritise: (1) no collisions, (2) speed >= 24 m/s when road is clear, (3) active overtaking.
+- Overtake flag: write state["overtook"] only — never state["overtake"] (invalid key).
 Return ONLY the Python function source. No explanation, no markdown.
 """
 
@@ -238,8 +263,13 @@ The reward function you generated failed validation with this error:
   {error}
 
 Common causes:
-  * Using a state key that does not exist, e.g. state["overtake"] — the correct
-    key is state["overtook"] (past tense, with k). Other valid keys are:
+  * Using a state key that does not exist — especially the overtake typo:
+      REJECTED:  if state["overtake"]:  /  state["overtake"]
+      CORRECT:   if state["overtook"]: /  state["overtook"]
+    The key is overtook (past tense, with k). state["overtake"] will always
+    raise KeyError on the first trajectory-bank step. Search your code for
+    the substring "overtake" inside state[...] and replace every occurrence
+    with "overtook". Other valid keys are:
     speed_ms, front_dist, ttc, rel_vel_ms, lane, overtook, lane_changed,
     collided, nearby_vehicles, accel_ms2, long_jerk, lat_jerk.
     DO NOT invent new key names.

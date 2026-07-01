@@ -241,6 +241,7 @@ def test_passive_cruising_beats_at_same_crash_when_active():
 def test_safe_overtake_ratio():
     assert safe_overtake_ratio({"total_lane_changes": 10, "total_overtakes": 5}) == 0.5
     assert safe_overtake_ratio({"total_lane_changes": 0, "total_overtakes": 0}) == 0.0
+    assert safe_overtake_ratio({"total_lane_changes": 0, "total_overtakes": 3}) == 0.0
 
 
 def test_near_miss_rate_from_ttc_vals():

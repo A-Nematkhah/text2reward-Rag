@@ -1,46 +1,4 @@
-"""
-reward_sandbox.py
-─────────────────
-Secure sandbox for executing LLM-generated reward functions.
-
-Security model
-──────────────
-Generated reward code is executed inside a heavily restricted namespace:
-  • No import statements allowed (AST check)
-  • No access to builtins (open, exec, eval, __import__, etc.)
-  • No filesystem or network access
-  • Only a whitelist of safe math operations and state variables
-  • AST-level validation before any execution
-  • Timeout via a bounded thread pool (see ``run_callable_with_timeout``)
-
-State object contract
-─────────────────────
-The generated function receives exactly one dict argument called `state`:
-  state = {
-    "speed_ms"      : float   — ego speed in m/s
-    "front_dist"    : float   — distance to front vehicle [m]
-    "ttc"           : float   — time-to-collision [s], capped at 30
-    "rel_vel_ms"    : float   — v_front - v_ego [m/s]
-    "lane"          : int     — current lane index (0 = rightmost)
-    "overtook"      : bool    — completed an overtake this step
-    "lane_changed"  : bool    — lane changed since last step
-    "collided"      : bool    — collision detected this step
-    "nearby_vehicles": int    — vehicles within ~30 m
-    "accel_ms2"     : float   — longitudinal acceleration [m/s²]
-    "long_jerk"     : float   — longitudinal jerk [m/s³]
-    "lat_jerk"      : float   — lateral jerk [m/s³]
-  }
-
-The function must return a single float.
-
-Usage
-─────
-  from txt2reward.sandbox.sandbox import validate_reward_code, execute_reward
-
-  ok, err = validate_reward_code(code_str)
-  if ok:
-      reward = execute_reward(code_str, state_dict)
-"""
+"""AST validation and restricted execution for LLM-generated reward functions."""
 
 from __future__ import annotations
 
@@ -182,17 +140,19 @@ _ALLOWED_CALLS = frozenset(
     }
 )
 
-# ── DoS guard: maximum allowed constant exponent in a ** (Pow) operation ──────
-# Reward-shaping formulas have no legitimate need for an exponent above ~10
-# (e.g. squaring/cubing jerk terms, soft polynomial penalties). Without this
-# guard, AST validation alone allows a syntactically valid expression like
-# `x ** 999999999` straight through -- evaluating that on a float can take an
-# arbitrarily long time / produce inf, which is a CPU-DoS vector against the
-# worker process executing the reward function every environment step. This
-# only catches a *constant* exponent (the common, simple attack and the one
-# called out in the audit); a non-constant exponent (e.g. `x ** y`) is still
-# allowed since both operands are themselves bounded, validated expressions.
+# Max allowed constant exponent in Pow (DoS guard).
 _MAX_POW_EXPONENT = 10
+
+
+def _constant_numeric_value(node: ast.AST) -> float | None:
+    """Extract a numeric literal, including unary minus (e.g. -2)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner = _constant_numeric_value(node.operand)
+        if inner is not None:
+            return -inner
+    return None
 
 
 # ── Forbidden names (explicit) ────────────────────────────────────────────────
@@ -358,10 +318,11 @@ def validate_reward_code(code: str) -> tuple[bool, str]:
         # DoS guard: reject x ** <large constant>
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
             exponent_node = node.right
-            if isinstance(exponent_node, ast.Constant) and isinstance(exponent_node.value, (int, float)):
-                if abs(exponent_node.value) > _MAX_POW_EXPONENT:
+            exp_val = _constant_numeric_value(exponent_node)
+            if exp_val is not None:
+                if abs(exp_val) > _MAX_POW_EXPONENT:
                     return False, (
-                        f"Exponent too large in power operation: {exponent_node.value} "
+                        f"Exponent too large in power operation: {exp_val} "
                         f"(max allowed magnitude is {_MAX_POW_EXPONENT}) -- this could "
                         "cause a computationally expensive or numerically unstable result"
                     )
@@ -461,16 +422,7 @@ def execute_reward(
                   Ignored when `compiled_fn` is provided.
     state       : the state dict passed to compute_reward(state)
     timeout_sec : maximum execution time (default 100 ms)
-    compiled_fn : optional, an already-loaded compute_reward callable (e.g.
-                  from reward_wrapper._load_reward_fn). When provided, the
-                  source is NOT recompiled/re-exec'd on every call -- only
-                  the function call itself runs inside the timeout-guarded
-                  thread. This is what the per-step hot path in
-                  reward_wrapper.py uses: it lets every reward evaluation
-                  go through this single, timeout-protected entry point
-                  (fixing audit finding #2, where the per-step path used to
-                  bypass this function entirely via a monkey-patch) without
-                  paying a full compile+exec cost on every environment step.
+    compiled_fn : optional pre-loaded compute_reward (avoids recompile per step).
 
     Returns the float reward value.
 
