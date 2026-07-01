@@ -10,38 +10,40 @@ def compute_reward(state):
     if state["collided"]:
         return -80.0
     speed = state["speed_ms"]
-    open_road = state["front_dist"] > 35.0 and state["ttc"] > 5.0
-    clear_road = state["front_dist"] > 40.0 and state["ttc"] > 5.0
-    speed_reward = clip(speed * 0.09, 0.0, 3.0)
-    slow_penalty = -0.5 if clear_road and speed < 22.0 else 0.0
-    passive_band_tax = -0.65 if open_road and not state["overtook"] and speed > 18.0 and speed <= 22.0 else 0.0
-    static_passive_tax = -0.35 if open_road and not state["overtook"] and not state["lane_changed"] else 0.0
-    cruise_tax = -1.8 if open_road and not state["overtook"] and speed > 22.0 else 0.0
-    no_overtake_tax = (
-        -0.85
-        if open_road and not state["overtook"] and not state["lane_changed"]
-        else (-0.4 if open_road and not state["overtook"] else 0.0)
+    target_speed = 28.0
+    open_road = state["front_dist"] > 41.0 and state["ttc"] > 6.0
+    speed_reward = clip(speed * 0.09, 0.0, 2.5)
+    speed_gap = clip((target_speed - speed) / target_speed, 0.0, 1.0)
+    cruise_tax = -2.0 * speed_gap if open_road and not state["overtook"] else 0.0
+    above_target_passive = (
+        -3.5 * clip((speed - 22.0) / 8.0, 0.0, 1.0)
+        if open_road and not state["overtook"] and speed > 22.0
+        else 0.0
     )
+    if open_road and not state["overtook"]:
+        no_overtake_tax = -0.85 * speed_gap if state["lane_changed"] else -1.2 * speed_gap
+    else:
+        no_overtake_tax = 0.0
+    static_passive = -0.50 if open_road and not state["overtook"] and not state["lane_changed"] else 0.0
     ttc_penalty = -4.0 if state["ttc"] < 1.0 else -2.0 if state["ttc"] < 3.0 else 0.0
     tailgate_penalty = -1.8 if state["front_dist"] < 20.0 and state["ttc"] < 4.0 else 0.0
     overtake_bonus = 3.0 if state["overtook"] else 0.0
-    jerk_penalty = -0.45 * (abs(state["long_jerk"]) + abs(state["lat_jerk"]))
-    accel_penalty = -0.20 * abs(state["accel_ms2"])
-    gap_bonus = 0.003 * clip(state["front_dist"] - 25.0, 0.0, 10.0) if speed >= 22.0 else 0.0
+    harsh_jerk = max(0.0, abs(state["long_jerk"]) - 2.0) + max(0.0, abs(state["lat_jerk"]) - 2.0)
+    harsh_accel = max(0.0, abs(state["accel_ms2"]) - 2.5)
+    jerk_penalty = -0.90 * harsh_jerk
+    accel_penalty = -0.50 * harsh_accel
     lc_penalty = -0.55 if state["lane_changed"] and not state["overtook"] else 0.0
     return (
         speed_reward
-        + slow_penalty
-        + passive_band_tax
-        + static_passive_tax
         + cruise_tax
+        + above_target_passive
         + no_overtake_tax
+        + static_passive
         + ttc_penalty
         + tailgate_penalty
         + overtake_bonus
         + jerk_penalty
         + accel_penalty
-        + gap_bonus
         + lc_penalty
     )
 """
@@ -95,6 +97,28 @@ HARD RULES (violation = sandbox rejection):
     * Single local variables allowed; no nested functions
 
 DESIGN PRINCIPLES:
+    * SCALE DISCIPLINE (critical -- violating this causes flat speed
+      gradients across generations): no penalty coefficient (jerk, accel,
+      cruise_tax, no_overtake_tax, tailgate, lane-change) may exceed
+      3-5x the speed_reward coefficient. If speed_reward uses coefficient
+      C, no single penalty term's peak magnitude should exceed 5*C times
+      a typical per-step activation. Compounding this ratio generation
+      over generation (raising penalties without raising speed_reward
+      proportionally) causes the agent to have no economic incentive to
+      accelerate -- this has happened before in this project's evolution
+      history and must not repeat.
+    * ACCEL/JERK PENALTIES MUST BE THRESHOLD-BASED, NOT ABSOLUTE: only
+      penalise accel_ms2 / long_jerk / lat_jerk magnitude ABOVE a harsh
+      threshold (e.g. max(0, abs(accel_ms2) - 2.5)), never the raw
+      absolute value. Penalising every normal speed change makes
+      accelerating toward a higher target speed net-negative, and the
+      agent's locally-optimal policy becomes "never accelerate".
+    * ALL SPEED-RELATED THRESHOLDS MUST BE CONTINUOUS FUNCTIONS OF THE
+      SPEED GAP, NOT BINARY: never write "if speed > X: return -Y" as a
+      fixed-magnitude tax. Instead scale the penalty with
+      clip((target_speed - speed) / target_speed, 0, 1) or similar, so
+      the agent always has a gradient to improve, not a flat region
+      between thresholds.
     * Collision penalty MUST dominate (-60 to -100). A typical episode is ~40 steps;
       per-step speed reward must NOT make crashing net-profitable. Rule of thumb:
       40 steps × max per-step reward < |collision penalty|.

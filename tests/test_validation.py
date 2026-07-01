@@ -7,7 +7,7 @@ from txt2reward.llm.designer import (
     _full_validation_pipeline,
 )
 from txt2reward.llm.prompts import DEFAULT_BOOTSTRAP_REWARD_BODY as BOOTSTRAP
-from txt2reward.llm.validation import _smoke_test_reward_code
+from txt2reward.llm.validation import _smoke_test_reward_code, validate_reward_for_use
 from txt2reward.sandbox.sandbox import compile_reward_function, execute_reward, validate_reward_code
 from txt2reward.trajectory.bank import (
     BANK_MAX_VIOLATION_RATE,
@@ -45,6 +45,30 @@ _WEAK_COLLISION_SMOKE = (
     "        return -30.0\n"
     "    return clip(state['speed_ms'] * 0.15, 0.0, 5.0)\n"
 )
+
+_BINARY_CRUISE_TAX = """
+def compute_reward(state):
+    if state["collided"]:
+        return -80.0
+    speed = state["speed_ms"]
+    r = clip(speed * 0.09, 0.0, 3.0)
+    if state["front_dist"] > 35.0 and state["ttc"] > 5.0 and not state["overtook"]:
+        if speed > 22.0:
+            r += -1.8
+        if not state["lane_changed"]:
+            r += -0.85
+    return r
+"""
+
+_ABSOLUTE_ACCEL_TRAP = """
+def compute_reward(state):
+    if state["collided"]:
+        return -80.0
+    r = clip(state["speed_ms"] * 0.09, 0.0, 3.0)
+    r += -2.0 * abs(state["accel_ms2"])
+    r += -1.5 * (abs(state["long_jerk"]) + abs(state["lat_jerk"]))
+    return r
+"""
 
 
 def _episodic_fast_crash_total(reward_fn, *, n_pre_crash: int = 39) -> float:
@@ -183,6 +207,26 @@ def test_smoke_test_uses_execute_reward_path():
         "    return float(state['speed_ms']) * 0.09\n"
     )
     ok, err = _smoke_test_reward_code(code)
+    assert ok, err
+
+
+def test_speed_gradient_gate_rejects_binary_cruise_tax():
+    ok, err = _smoke_test_reward_code(_BINARY_CRUISE_TAX)
+    assert not ok
+    assert "speed gradient" in err.lower()
+
+
+def test_acceleration_roi_gate_rejects_absolute_accel_penalty():
+    ok, err = _smoke_test_reward_code(_ABSOLUTE_ACCEL_TRAP)
+    assert not ok
+    assert "acceleration roi" in err.lower()
+
+
+def test_gen27_reward_passes_full_validation():
+    from pathlib import Path
+
+    code = Path("reward_program.py").read_text(encoding="utf-8")
+    ok, err = validate_reward_for_use(code)
     assert ok, err
 
 

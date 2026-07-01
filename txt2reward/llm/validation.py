@@ -114,6 +114,25 @@ _SAMPLE_STATE_COLLIDED: dict = {
     "lat_jerk": 0.5,
 }
 
+_SPEED_GRADIENT_POINTS = (20.0, 25.0, 30.0)
+
+
+def _speed_gradient_state(speed_ms: float) -> dict:
+    return {
+        "speed_ms": speed_ms,
+        "front_dist": 40.0,
+        "ttc": 12.0,
+        "rel_vel_ms": 0.0,
+        "lane": 1,
+        "overtook": False,
+        "lane_changed": False,
+        "collided": False,
+        "nearby_vehicles": 1,
+        "accel_ms2": 0.0,
+        "long_jerk": 0.0,
+        "lat_jerk": 0.0,
+    }
+
 
 def _smoke_sample_key_error(name: str, exc: KeyError) -> tuple[bool, str]:
     key = str(exc)
@@ -365,6 +384,91 @@ def _smoke_test_reward_code(
             f"scored {fast_episode_total:.2f}, but a 40-step cautious safe episode "
             f"scored {cautious_episode:.2f}. Crashing must NOT be net-profitable — "
             f"increase |collision penalty| or reduce per-step speed bonuses."
+        )
+
+    # ── Gate 2d: Speed Gradient Gate ──────────────────────────────────────
+    gradient_rewards = []
+    try:
+        for spd in _SPEED_GRADIENT_POINTS:
+            r = execute_reward(
+                "",
+                _speed_gradient_state(spd),
+                timeout_sec=SMOKE_TEST_TIMEOUT_SEC,
+                compiled_fn=reward_fn,
+            )
+            gradient_rewards.append(r)
+    except Exception as exc:
+        return False, f"Runtime error during speed-gradient gate: {type(exc).__name__}: {exc}"
+
+    for i in range(len(gradient_rewards) - 1):
+        lo_speed, hi_speed = _SPEED_GRADIENT_POINTS[i], _SPEED_GRADIENT_POINTS[i + 1]
+        lo_r, hi_r = gradient_rewards[i], gradient_rewards[i + 1]
+        if hi_r <= lo_r:
+            return False, (
+                f"Speed Gradient Gate Violation: reward at {hi_speed:.0f} m/s "
+                f"({hi_r:.2f}) must be strictly greater than reward at "
+                f"{lo_speed:.0f} m/s ({lo_r:.2f}) under identical safe "
+                f"conditions (front_dist=40, ttc=12, no overtake/lane_change/"
+                f"collision). A flat or non-monotonic region here means the "
+                f"reward function uses a fixed-magnitude binary threshold "
+                f"(e.g. 'speed > X -> -15') instead of a continuous function "
+                f"of speed, so the agent has no gradient to accelerate past "
+                f"whatever local plateau it reaches."
+            )
+
+    # ── Gate 2e: Acceleration ROI Gate ────────────────────────────────────
+    # Ramp 20 -> 28 m/s over 8 steps (realistic accel/jerk), then cruise at
+    # 28 for the remaining 12 steps of a 20-step window, vs staying flat at
+    # 20 m/s for the same 20 steps. The ramping trajectory must score
+    # strictly higher -- otherwise per-step accel/jerk penalties outweigh
+    # the cumulative speed benefit and "never accelerate" becomes the
+    # agent's locally-optimal policy.
+    ramp_total = 0.0
+    flat_total = 0.0
+    try:
+        speed = 20.0
+        target = 28.0
+        accel_per_step = (target - speed) / 8.0
+        for t in range(20):
+            if t < 8:
+                speed += accel_per_step
+                accel = accel_per_step
+                jerk = accel_per_step * 0.3
+            else:
+                accel = 0.0
+                jerk = 0.0
+            ramp_state = {
+                "speed_ms": speed,
+                "front_dist": 40.0,
+                "ttc": 12.0,
+                "rel_vel_ms": 0.0,
+                "lane": 1,
+                "overtook": False,
+                "lane_changed": False,
+                "collided": False,
+                "nearby_vehicles": 1,
+                "accel_ms2": accel,
+                "long_jerk": jerk,
+                "lat_jerk": 0.0,
+            }
+            ramp_total += execute_reward(
+                "", ramp_state, timeout_sec=SMOKE_TEST_TIMEOUT_SEC, compiled_fn=reward_fn
+            )
+            flat_total += execute_reward(
+                "", _speed_gradient_state(20.0), timeout_sec=SMOKE_TEST_TIMEOUT_SEC, compiled_fn=reward_fn
+            )
+    except Exception as exc:
+        return False, f"Runtime error during acceleration-ROI gate: {type(exc).__name__}: {exc}"
+
+    if ramp_total <= flat_total:
+        return False, (
+            f"Acceleration ROI Gate Violation: ramping from 20 to 28 m/s over "
+            f"8 steps then cruising scored {ramp_total:.2f} total reward over "
+            f"20 steps, but staying flat at 20 m/s scored {flat_total:.2f}. "
+            f"Accel/jerk penalties are outweighing the speed benefit -- the "
+            f"agent's optimal policy becomes 'never accelerate'. Reduce the "
+            f"accel/jerk penalty magnitude, or only penalise HARSH accel/jerk "
+            f"(e.g. abs(accel_ms2) > 2.5) rather than every normal speed change."
         )
 
     return True, ""
